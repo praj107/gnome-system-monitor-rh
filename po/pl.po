@@ -16,8 +16,8 @@ msgstr ""
 "Project-Id-Version: gnome-system-monitor\n"
 "Report-Msgid-Bugs-To: https://gitlab.gnome.org/GNOME/gnome-system-monitor/"
 "issues\n"
-"POT-Creation-Date: 2026-03-06 05:41+0000\n"
-"PO-Revision-Date: 2026-03-28 13:54+0100\n"
+"POT-Creation-Date: 2026-04-27 05:21+0000\n"
+"PO-Revision-Date: 2026-06-18 21:10+0200\n"
 "Last-Translator: Victoria Niedzielska <victorian@gnome.org>\n"
 "Language-Team: Polish <https://l10n.gnome.org/teams/pl/>\n"
 "Language: pl\n"
@@ -153,7 +153,7 @@ msgstr "Przełączenie na systemy plików"
 #: data/shortcuts-dialog.ui:118
 msgctxt "shortcuts dialog"
 msgid "App"
-msgstr "Program"
+msgstr "Aplikacja"
 
 #: data/shortcuts-dialog.ui:122
 msgctxt "shortcuts dialog"
@@ -200,20 +200,20 @@ msgstr "Menu główne"
 
 #: data/interface.ui:44
 msgid "Search processes and users"
-msgstr "Wyszukiwanie procesów i osób"
+msgstr "Wyszukiwanie procesów i użytkowników"
 
 #: data/interface.ui:58
 msgid "_Resources"
 msgstr "_Zasoby"
 
 #: data/interface.ui:103 data/preferences.ui:50 data/procproperties.ui:111
-#: src/interface.cpp:272 src/proctable.cpp:345
+#: src/interface.cpp:272 src/proctable.cpp:349
 #, no-c-format
 msgid "CPU"
 msgstr "Procesor"
 
 #: data/interface.ui:134 data/procproperties.ui:127 src/interface.cpp:311
-#: src/proctable.cpp:352
+#: src/proctable.cpp:356
 msgid "Memory"
 msgstr "Pamięć"
 
@@ -382,7 +382,7 @@ msgstr "_Skróty klawiszowe"
 
 #: data/menus.ui:25 data/menus.ui:80
 msgid "_About System Monitor"
-msgstr "_O programie"
+msgstr "_O aplikacji"
 
 #: data/menus.ui:33
 msgid "_Refresh"
@@ -491,7 +491,7 @@ msgstr "Usunięcie procesu"
 
 #: data/org.gnome.gnome-system-monitor.policy.in.in:12
 msgid "Privileges are required to control other users’ processes"
-msgstr "Wymagane są uprawnienia, aby kontrolować procesy innych osób"
+msgstr "Wymagane są uprawnienia, aby kontrolować procesy innych użytkowników"
 
 #: data/org.gnome.gnome-system-monitor.policy.in.in:22
 msgid "Renice process"
@@ -520,8 +520,8 @@ msgid ""
 "applications, force stop processes not responding, and change the state or "
 "priority of existing processes."
 msgstr ""
-"Monitor systemu umożliwia wykrywanie, które programy używają procesora lub "
-"pamięci komputera, zarządzanie uruchomionymi programami, wymuszanie "
+"Monitor systemu umożliwia wykrywanie, które aplikacje używają procesora lub "
+"pamięci komputera, zarządzanie uruchomionymi aplikacjami, wymuszanie "
 "zatrzymania nieodpowiadających procesów i zmienianie stanu lub priorytetu "
 "istniejących procesów."
 
@@ -642,19 +642,19 @@ msgstr "Szczegóły"
 msgid "Process ID"
 msgstr "Identyfikator procesu"
 
-#: data/procproperties.ui:37 src/proctable.cpp:338
+#: data/procproperties.ui:37 src/proctable.cpp:342
 msgid "User"
-msgstr "Osoba"
+msgstr "Użytkownik"
 
-#: data/procproperties.ui:55 data/procproperties.ui:90 src/proctable.cpp:339
+#: data/procproperties.ui:55 data/procproperties.ui:90 src/proctable.cpp:343
 msgid "Status"
 msgstr "Stan"
 
-#: data/procproperties.ui:58 src/proctable.cpp:347
+#: data/procproperties.ui:58 src/proctable.cpp:351
 msgid "Started"
 msgstr "Uruchomiono"
 
-#: data/procproperties.ui:74 src/proctable.cpp:366
+#: data/procproperties.ui:74 src/proctable.cpp:370
 msgid "Priority"
 msgstr "Priorytet"
 
@@ -662,40 +662,40 @@ msgstr "Priorytet"
 msgid "Usage"
 msgstr "Użycie"
 
-#: data/procproperties.ui:143 src/proctable.cpp:346
+#: data/procproperties.ui:143 src/proctable.cpp:350
 msgid "CPU Time"
 msgstr "Czas procesora"
 
-#: data/procproperties.ui:159 src/proctable.cpp:340
+#: data/procproperties.ui:159 src/proctable.cpp:344
 msgid "Virtual Memory"
 msgstr "Pamięć wirtualna"
 
-#: data/procproperties.ui:175 src/proctable.cpp:341
+#: data/procproperties.ui:175 src/proctable.cpp:345
 msgid "Resident Memory"
 msgstr "Pamięć rezydentna"
 
-#: data/procproperties.ui:191 src/proctable.cpp:342
+#: data/procproperties.ui:191 src/proctable.cpp:346
 msgid "Writable Memory"
 msgstr "Pamięć zapisywalna"
 
-#: data/procproperties.ui:207 src/proctable.cpp:343
+#: data/procproperties.ui:207 src/proctable.cpp:347
 msgid "Shared Memory"
 msgstr "Pamięć współdzielona"
 
-#: data/procproperties.ui:227 src/proctable.cpp:350
+#: data/procproperties.ui:227 src/proctable.cpp:354
 msgid "Security Context"
 msgstr "Kontekst bezpieczeństwa"
 
-#: data/procproperties.ui:237 src/proctable.cpp:351
+#: data/procproperties.ui:237 src/proctable.cpp:355
 msgid "Command Line"
 msgstr "Wiersz poleceń"
 
 #. xgettext: combined noun, the function the process is waiting in, see wchan ps(1)
-#: data/procproperties.ui:247 src/proctable.cpp:354
+#: data/procproperties.ui:247 src/proctable.cpp:358
 msgid "Waiting Channel"
 msgstr "Kanał oczekujący"
 
-#: data/procproperties.ui:257 src/proctable.cpp:355
+#: data/procproperties.ui:257 src/proctable.cpp:359
 msgid "Control Group"
 msgstr "Grupa kontrolna"
 
@@ -762,6 +762,18 @@ msgstr "Koligacja nieobsługiwana"
 #, c-format
 msgid "Priority failed on %i: %s"
 msgstr "Niepowodzenie priorytetu %i: %s"
+
+#: src/actions/gsm-actions.c:98
+msgid "Kill helper failed"
+msgstr "Niepowodzenie pomocnika zabijania"
+
+#: src/actions/gsm-actions.c:236
+msgid "Affinity helper failed"
+msgstr "Niepowodzenie pomocnika koligacji"
+
+#: src/actions/gsm-actions.c:325
+msgid "Priority helper failed"
+msgstr "Niepowodzenie pomocnika priorytetów"
 
 #: src/application.cpp:394
 msgid "A simple process and system monitor."
@@ -1183,11 +1195,11 @@ msgstr "Wyświetlanie kolumny nazwy po uruchomieniu"
 
 #: src/org.gnome.gnome-system-monitor.gschema.xml.in:305
 msgid "Width of process “User” column"
-msgstr "Szerokość kolumny osoby procesu"
+msgstr "Szerokość kolumny użytkownika procesu"
 
 #: src/org.gnome.gnome-system-monitor.gschema.xml.in:312
 msgid "Show process “User” column on startup"
-msgstr "Wyświetlanie kolumny osoby procesu po uruchomieniu"
+msgstr "Wyświetlanie kolumny użytkownika procesu po uruchomieniu"
 
 #: src/org.gnome.gnome-system-monitor.gschema.xml.in:319
 msgid "Width of process “Status” column"
@@ -1475,7 +1487,7 @@ msgstr "Kolumna sortowania otwartych plików"
 msgid "Open files sort order"
 msgstr "Porządek sortowania otwartych plików"
 
-#: src/prefsdialog.cpp:86 src/prefsdialog.cpp:137
+#: src/prefsdialog.cpp:90 src/prefsdialog.cpp:153
 msgid "Icon"
 msgstr "Ikona"
 
@@ -1582,60 +1594,60 @@ msgstr[0] "Zmiana priorytetu zaznaczonego procesu"
 msgstr[1] "Zmiana priorytetu %d zaznaczonych procesów"
 msgstr[2] "Zmiana priorytetu %d zaznaczonych procesów"
 
-#: src/proctable.cpp:129
+#: src/proctable.cpp:133
 msgid "_End Process…"
 msgid_plural "_End Processes…"
 msgstr[0] "Za_kończ proces…"
 msgstr[1] "Za_kończ procesy…"
 msgstr[2] "Za_kończ procesy…"
 
-#: src/proctable.cpp:337
+#: src/proctable.cpp:341
 msgid "Name"
 msgstr "Nazwa"
 
-#: src/proctable.cpp:344
+#: src/proctable.cpp:348
 msgid "X Server Memory"
 msgstr "Pamięć serwera X"
 
-#: src/proctable.cpp:348
+#: src/proctable.cpp:352
 msgid "Nice"
 msgstr "Nice"
 
-#: src/proctable.cpp:349
+#: src/proctable.cpp:353
 msgid "ID"
 msgstr "Identyfikator"
 
-#: src/proctable.cpp:356
+#: src/proctable.cpp:360
 msgid "Unit"
 msgstr "Jednostka"
 
-#: src/proctable.cpp:357
+#: src/proctable.cpp:361
 msgid "Session"
 msgstr "Sesja"
 
 #. TRANSLATORS: Seat = i.e. the physical seat the session of the process belongs to, only
 #. for multi-seat environments. See http://en.wikipedia.org/wiki/Multiseat_configuration
-#: src/proctable.cpp:360
+#: src/proctable.cpp:364
 msgid "Seat"
 msgstr "Stanowisko"
 
-#: src/proctable.cpp:361
+#: src/proctable.cpp:365
 msgid "Owner"
 msgstr "Właściciel"
 
-#: src/proctable.cpp:362
+#: src/proctable.cpp:366
 msgid "Disk Read Total"
 msgstr "Łącznie odczytów z dysku"
 
-#: src/proctable.cpp:363
+#: src/proctable.cpp:367
 msgid "Disk Write Total"
 msgstr "Łącznie zapisów na dysku"
 
-#: src/proctable.cpp:364
+#: src/proctable.cpp:368
 msgid "Disk Read"
 msgstr "Odczyty z dysku"
 
-#: src/proctable.cpp:365
+#: src/proctable.cpp:369
 msgid "Disk Write"
 msgstr "Zapisy na dysku"
 
@@ -1729,7 +1741,7 @@ msgid "Very Low Priority"
 msgstr "Bardzo niski priorytet"
 
 #. xgettext: rate, 10MiB/s or 10Mbit/s
-#: src/util.cpp:742
+#: src/util.cpp:690
 #, c-format
 msgid "%s/s"
 msgstr "%s/s"
