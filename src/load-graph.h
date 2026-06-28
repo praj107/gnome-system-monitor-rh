@@ -14,7 +14,8 @@ enum
   LOAD_GRAPH_CPU,
   LOAD_GRAPH_MEM,
   LOAD_GRAPH_NET,
-  LOAD_GRAPH_DISK
+  LOAD_GRAPH_DISK,
+  LOAD_GRAPH_GPU
 };
 
 enum
@@ -37,6 +38,8 @@ struct LoadGraphLabels
   GtkLabel *disk_read_total;
   GtkLabel *disk_write;
   GtkLabel *disk_write_total;
+  GtkLabel *gpu_util;
+  GtkLabel *gpu_mem;
 };
 
 struct LoadGraph
@@ -102,6 +105,11 @@ struct LoadGraph
     guint64 max;
     std::vector<unsigned> values;
   } disk;
+
+  struct GPU
+  {
+    gchar *nvidia_smi_path;
+  } gpu;
   /* }; */
 };
 

@@ -141,6 +141,8 @@ cb_cpu_color_changed (GsmColorButton *cp,
         }
     }
 
+  g_variant_unref (cpu_colors_var);
+
   /* Just set the value and let the changed::cpu-colors signal callback do the rest. */
   settings->set_value (GSM_SETTING_CPU_COLORS, Glib::wrap (g_variant_builder_end (&builder)));
 }
@@ -215,8 +217,26 @@ cb_disk_write_color_changed (GsmColorButton *cp,
 }
 
 static void
+cb_gpu_util_color_changed (GsmColorButton *cp,
+                           gpointer        data)
+{
+  GsmApplication *app = (GsmApplication *) data;
+
+  change_settings_color (*app->settings.operator-> (), GSM_SETTING_GPU_UTIL_COLOR, cp);
+}
+
+static void
+cb_gpu_mem_color_changed (GsmColorButton *cp,
+                          gpointer        data)
+{
+  GsmApplication *app = (GsmApplication *) data;
+
+  change_settings_color (*app->settings.operator-> (), GSM_SETTING_GPU_MEM_COLOR, cp);
+}
+
+static void
 create_sys_view (GsmApplication *app,
-                 GtkBuilder     *builder)
+                  GtkBuilder     *builder)
 {
   GtkBox *cpu_graph_box, *mem_graph_box, *net_graph_box, *disk_graph_box;
   GtkExpander *cpu_expander, *mem_expander, *net_expander, *disk_expander;
@@ -224,7 +244,7 @@ create_sys_view (GsmApplication *app,
   GtkGrid *table;
   GsmColorButton *color_picker;
 
-  LoadGraph *cpu_graph, *mem_graph, *net_graph, *disk_graph;
+  LoadGraph *cpu_graph, *mem_graph, *net_graph, *disk_graph, *gpu_graph;
 
   gint i;
   gchar *title_text;
@@ -250,6 +270,15 @@ create_sys_view (GsmApplication *app,
   gint cols = 4 + app->config.num_cpus / 32;
   gint rows = (app->config.num_cpus + cols - 1) / cols;
 
+  int max_cpu_label_width = 0;
+  if (app->config.num_cpus >= 10)
+    for (i = 0; i < app->config.num_cpus; i++)
+      {
+        int w = static_cast<int> (get_cpu_core_label (i, app->config.num_cpus).length ());
+        if (w > max_cpu_label_width)
+          max_cpu_label_width = w;
+      }
+
   for (i = 0; i < app->config.num_cpus; i++)
     {
       GtkBox *temp_hbox;
@@ -268,14 +297,11 @@ create_sys_view (GsmApplication *app,
       gtk_box_append (temp_hbox, GTK_WIDGET (color_picker));
       gtk_widget_set_size_request (GTK_WIDGET (color_picker), 32, -1);
 
-      if (app->config.num_cpus == 1)
-        label_text = g_strdup (_("CPU"));
-      else
-        label_text = g_strdup_printf (_("CPU%d"), i + 1);
+      label_text = g_strdup (get_cpu_core_label (i, app->config.num_cpus).c_str ());
       title_text = g_strdup_printf (title_template, label_text);
       label = GTK_LABEL (gtk_label_new (label_text));
       if (app->config.num_cpus >= 10)
-        gtk_label_set_width_chars (label, log10 (app->config.num_cpus) + 1 + 4);
+        gtk_label_set_width_chars (label, max_cpu_label_width);
       gsm_color_button_set_title (color_picker, title_text);
       g_free (title_text);
       gtk_box_append (temp_hbox, GTK_WIDGET (label));
@@ -438,6 +464,89 @@ create_sys_view (GsmApplication *app,
   gtk_widget_set_halign (GTK_WIDGET (load_graph_get_labels (disk_graph)->disk_write), GTK_ALIGN_START);
 
   app->disk_graph = disk_graph;
+
+  /* The GPU box */
+  gchar *nvidia_smi = g_find_program_in_path ("nvidia-smi");
+  if (nvidia_smi)
+    {
+      GtkBox *gpu_graph_box;
+      GtkExpander *gpu_expander;
+      GtkGrid *gpu_table;
+      GtkBox *gpu_header;
+      GtkLabel *gpu_label;
+      PangoAttrList *attrs;
+
+      gpu_expander = GTK_EXPANDER (gtk_expander_new (NULL));
+      g_object_bind_property (gpu_expander, "expanded", gpu_expander, "vexpand", G_BINDING_DEFAULT);
+      g_settings_bind (app->settings->gobj (), GSM_SETTING_RESOURCES_GPU_EXPANDED, G_OBJECT (gpu_expander), "expanded", G_SETTINGS_BIND_DEFAULT);
+
+      gpu_graph = new LoadGraph (LOAD_GRAPH_GPU);
+      gtk_widget_set_size_request (GTK_WIDGET (load_graph_get_widget (gpu_graph)), -1, 70);
+
+      gpu_graph_box = GTK_BOX (gtk_box_new (GTK_ORIENTATION_VERTICAL, 6));
+      gtk_box_prepend (gpu_graph_box, GTK_WIDGET (load_graph_get_widget (gpu_graph)));
+
+      gpu_table = GTK_GRID (gtk_grid_new ());
+      gtk_grid_set_column_spacing (gpu_table, 6);
+      gtk_grid_set_row_spacing (gpu_table, 1);
+      gtk_grid_set_row_homogeneous (gpu_table, TRUE);
+      gtk_widget_set_margin_start (GTK_WIDGET (gpu_table), 54);
+      gtk_widget_set_hexpand (GTK_WIDGET (gpu_table), TRUE);
+
+      color_picker = gsm_color_button_new (&gpu_graph->colors.at (0), GSMCP_TYPE_CPU);
+      gtk_widget_set_valign (GTK_WIDGET (color_picker), GTK_ALIGN_CENTER);
+      g_signal_connect (G_OBJECT (color_picker), "color-set",
+                        G_CALLBACK (cb_gpu_util_color_changed), app);
+      title_text = g_strdup_printf (title_template, _("GPU Utilization"));
+      gsm_color_button_set_title (color_picker, title_text);
+      g_free (title_text);
+      gtk_grid_attach (gpu_table, GTK_WIDGET (color_picker), 0, 0, 1, 1);
+
+      label = GTK_LABEL (gtk_label_new (_("GPU Utilization")));
+      gtk_widget_set_halign (GTK_WIDGET (label), GTK_ALIGN_START);
+      gtk_grid_attach (gpu_table, GTK_WIDGET (label), 1, 0, 1, 1);
+      gtk_grid_attach (gpu_table, GTK_WIDGET (load_graph_get_labels (gpu_graph)->gpu_util), 2, 0, 1, 1);
+
+      color_picker = gsm_color_button_new (&gpu_graph->colors.at (1), GSMCP_TYPE_CPU);
+      gtk_widget_set_valign (GTK_WIDGET (color_picker), GTK_ALIGN_CENTER);
+      g_signal_connect (G_OBJECT (color_picker), "color-set",
+                        G_CALLBACK (cb_gpu_mem_color_changed), app);
+      title_text = g_strdup_printf (title_template, _("GPU Memory"));
+      gsm_color_button_set_title (color_picker, title_text);
+      g_free (title_text);
+      gtk_grid_attach (gpu_table, GTK_WIDGET (color_picker), 0, 1, 1, 1);
+
+      label = GTK_LABEL (gtk_label_new (_("GPU Memory")));
+      gtk_widget_set_halign (GTK_WIDGET (label), GTK_ALIGN_START);
+      gtk_grid_attach (gpu_table, GTK_WIDGET (label), 1, 1, 1, 1);
+      gtk_grid_attach (gpu_table, GTK_WIDGET (load_graph_get_labels (gpu_graph)->gpu_mem), 2, 1, 1, 1);
+
+      gtk_box_append (gpu_graph_box, GTK_WIDGET (gpu_table));
+
+      gtk_expander_set_child (gpu_expander, GTK_WIDGET (gpu_graph_box));
+
+      gpu_header = GTK_BOX (gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0));
+      gtk_widget_set_margin_start (GTK_WIDGET (gpu_header), 6);
+      gpu_label = GTK_LABEL (gtk_label_new (_("GPU")));
+      gtk_widget_set_halign (GTK_WIDGET (gpu_label), GTK_ALIGN_START);
+      attrs = pango_attr_list_new ();
+      pango_attr_list_insert (attrs, pango_attr_weight_new (PANGO_WEIGHT_BOLD));
+      gtk_label_set_attributes (gpu_label, attrs);
+      pango_attr_list_unref (attrs);
+      gtk_box_append (gpu_header, GTK_WIDGET (gpu_label));
+      gtk_expander_set_label_widget (gpu_expander, GTK_WIDGET (gpu_header));
+
+      GtkBox *res_box = GTK_BOX (gtk_builder_get_object (builder, "res_box"));
+      gtk_box_append (res_box, GTK_WIDGET (gpu_expander));
+
+      app->gpu_graph = gpu_graph;
+      g_free (nvidia_smi);
+    }
+  else
+    {
+      app->gpu_graph = NULL;
+    }
+
   g_free (title_template);
 }
 
@@ -744,6 +853,8 @@ update_page_activities (GsmApplication *app)
       load_graph_start (app->mem_graph);
       load_graph_start (app->net_graph);
       load_graph_start (app->disk_graph);
+      if (app->gpu_graph)
+        load_graph_start (app->gpu_graph);
     }
   else
     {
@@ -751,6 +862,8 @@ update_page_activities (GsmApplication *app)
       load_graph_stop (app->mem_graph);
       load_graph_stop (app->net_graph);
       load_graph_stop (app->disk_graph);
+      if (app->gpu_graph)
+        load_graph_stop (app->gpu_graph);
     }
 }
 
@@ -817,6 +930,8 @@ cb_main_window_suspended (GtkWindow      *window,
           load_graph_stop (app->mem_graph);
           load_graph_stop (app->net_graph);
           load_graph_stop (app->disk_graph);
+          if (app->gpu_graph)
+            load_graph_stop (app->gpu_graph);
         }
     }
   else
@@ -832,6 +947,8 @@ cb_main_window_suspended (GtkWindow      *window,
           load_graph_start (app->mem_graph);
           load_graph_start (app->net_graph);
           load_graph_start (app->disk_graph);
+          if (app->gpu_graph)
+            load_graph_start (app->gpu_graph);
         }
     }
 }

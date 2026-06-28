@@ -30,7 +30,10 @@ struct MutableProcInfo
     disk_write_bytes_current (0ULL),
     status (0U),
     pcpu (0),
-    nice (0)
+    nice (0),
+    num_threads (0U),
+    gpu_percent (0.0),
+    gpu_mem (0UL)
   {
   }
 
@@ -57,6 +60,9 @@ struct MutableProcInfo
   guint status;
   gdouble pcpu;
   gint nice;
+  guint num_threads;
+  gdouble gpu_percent;
+  gulong gpu_mem;
   std::string cgroup_name;
 
   std::string unit;
@@ -64,6 +70,7 @@ struct MutableProcInfo
   std::string seat;
 
   std::string owner;
+  std::string process_type;
 };
 
 

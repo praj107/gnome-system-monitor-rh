@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <random>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -745,4 +747,217 @@ make_tnum_attr_list (void)
   pango_attr_list_insert (attrs, pango_attr_font_features_new ("tnum=1"));
 
   return attrs;
+}
+
+std::string
+get_cpu_core_label (int cpu_index,
+                    int total_cpus)
+{
+  static std::vector<std::string> labels;
+  static int cached_total = 0;
+
+  if (total_cpus == 1)
+    return _("CPU");
+
+  if (!labels.empty () && cached_total == total_cpus)
+    return labels[cpu_index];
+
+  labels.clear ();
+  cached_total = total_cpus;
+
+  bool detected = false;
+
+#ifdef __linux__
+  // 1. Intel hybrid: core_type
+  {
+    std::vector<std::string> core_types;
+    core_types.reserve (total_cpus);
+    bool all_exist = true;
+    for (int i = 0; i < total_cpus; ++i)
+      {
+        char path[256];
+        std::snprintf (path, sizeof (path), "/sys/devices/system/cpu/cpu%d/topology/core_type", i);
+        std::ifstream f (path);
+        std::string type;
+        if (f >> type)
+          core_types.push_back (type);
+        else
+          {
+            all_exist = false;
+            break;
+          }
+      }
+
+    if (all_exist && !core_types.empty ())
+      {
+        bool has_atom = false;
+        bool has_core = false;
+        for (const auto &t : core_types)
+          {
+            if (t == "Intel_atom")
+              has_atom = true;
+            else if (t == "Intel_core")
+              has_core = true;
+          }
+
+        if (has_atom || has_core)
+          {
+            int p_count = 0;
+            int e_count = 0;
+            for (int i = 0; i < total_cpus; ++i)
+              {
+                if (core_types[i] == "Intel_core")
+                  labels.push_back (make_string (g_strdup_printf (_("P%d"), ++p_count)));
+                else if (core_types[i] == "Intel_atom")
+                  labels.push_back (make_string (g_strdup_printf (_("E%d"), ++e_count)));
+                else
+                  labels.push_back (make_string (g_strdup_printf (_("CPU%d"), i + 1)));
+              }
+            detected = true;
+          }
+      }
+  }
+
+  // 2. AMD multiple dies or clusters
+  if (!detected)
+    {
+      std::vector<int> die_ids;
+      die_ids.reserve (total_cpus);
+      bool all_exist = true;
+      for (int i = 0; i < total_cpus; ++i)
+        {
+          char path[256];
+          std::snprintf (path, sizeof (path), "/sys/devices/system/cpu/cpu%d/topology/die_id", i);
+          std::ifstream f (path);
+          int die_id = -1;
+          if (f >> die_id)
+            die_ids.push_back (die_id);
+          else
+            {
+              all_exist = false;
+              break;
+            }
+        }
+
+      if (!all_exist)
+        {
+          die_ids.clear ();
+          all_exist = true;
+          for (int i = 0; i < total_cpus; ++i)
+            {
+              char path[256];
+              std::snprintf (path, sizeof (path), "/sys/devices/system/cpu/cpu%d/topology/cluster_id", i);
+              std::ifstream f (path);
+              int cluster_id = -1;
+              if (f >> cluster_id)
+                die_ids.push_back (cluster_id);
+              else
+                {
+                  all_exist = false;
+                  break;
+                }
+            }
+        }
+
+      if (all_exist && !die_ids.empty ())
+        {
+          bool multiple = false;
+          int first = die_ids[0];
+          for (int id : die_ids)
+            if (id != first)
+              {
+                multiple = true;
+                break;
+              }
+
+          if (multiple)
+            {
+              for (int i = 0; i < total_cpus; ++i)
+                labels.push_back (make_string (g_strdup_printf (_("CPU%d (CCD%d)"), i + 1, die_ids[i])));
+              detected = true;
+            }
+        }
+    }
+
+  // 3. Frequency-based heuristic for Intel hybrid fallback
+  if (!detected)
+    {
+      std::vector<unsigned long> freqs;
+      freqs.reserve (total_cpus);
+      bool all_exist = true;
+      for (int i = 0; i < total_cpus; ++i)
+        {
+          char path[256];
+          unsigned long freq = 0;
+          std::snprintf (path, sizeof (path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", i);
+          std::ifstream f (path);
+          if (f >> freq)
+            {
+              freqs.push_back (freq);
+            }
+          else
+            {
+              std::snprintf (path, sizeof (path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+              std::ifstream f2 (path);
+              if (f2 >> freq)
+                freqs.push_back (freq);
+              else
+                {
+                  all_exist = false;
+                  break;
+                }
+            }
+        }
+
+      if (all_exist && !freqs.empty ())
+        {
+          std::set<unsigned long> unique_freqs (freqs.begin (), freqs.end ());
+          if (unique_freqs.size () == 2)
+            {
+              auto it = unique_freqs.begin ();
+              unsigned long low = *it;
+              unsigned long high = *++it;
+              if (high >= low * 1.2)
+                {
+                  int p_count = 0;
+                  int e_count = 0;
+                  for (int i = 0; i < total_cpus; ++i)
+                    {
+                      if (freqs[i] == high)
+                        labels.push_back (make_string (g_strdup_printf (_("P%d"), ++p_count)));
+                      else
+                        labels.push_back (make_string (g_strdup_printf (_("E%d"), ++e_count)));
+                    }
+                  detected = true;
+                }
+            }
+          else if (unique_freqs.size () > 2)
+            {
+              unsigned long high = *unique_freqs.rbegin ();
+              unsigned long low = *unique_freqs.begin ();
+              if (high >= low * 1.3)
+                {
+                  int p_count = 0;
+                  int e_count = 0;
+                  for (int i = 0; i < total_cpus; ++i)
+                    {
+                      if (freqs[i] == high)
+                        labels.push_back (make_string (g_strdup_printf (_("P%d"), ++p_count)));
+                      else
+                        labels.push_back (make_string (g_strdup_printf (_("E%d"), ++e_count)));
+                    }
+                  detected = true;
+                }
+            }
+        }
+    }
+#endif /* __linux__ */
+
+  if (!detected)
+    {
+      for (int i = 0; i < total_cpus; ++i)
+        labels.push_back (make_string (g_strdup_printf (_("CPU%d"), i + 1)));
+    }
+
+  return labels[cpu_index];
 }

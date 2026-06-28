@@ -41,6 +41,7 @@
 
 #include <set>
 #include <list>
+#include <map>
 
 #include "application.h"
 #include "proctable.h"
@@ -367,7 +368,10 @@ proctable_new (GsmApplication * const app)
     N_("Disk Write Total"),
     N_("Disk Read"),
     N_("Disk Write"),
+    N_("GPU"),
+    N_("GPU Memory"),
     N_("Priority"),
+    N_("Threads"),
     NULL,
     "POINTER"
   };
@@ -401,7 +405,10 @@ proctable_new (GsmApplication * const app)
                               G_TYPE_UINT64,        /* Disk write total*/
                               G_TYPE_UINT64,        /* Disk read    */
                               G_TYPE_UINT64,        /* Disk write   */
+                              G_TYPE_DOUBLE,        /* GPU %        */
+                              G_TYPE_ULONG,         /* GPU Memory   */
                               G_TYPE_STRING,        /* Priority     */
+                              G_TYPE_UINT,          /* Threads      */
                               GDK_TYPE_TEXTURE,     /* Icon         */
                               G_TYPE_POINTER,       /* ProcInfo     */
                               G_TYPE_STRING         /* Sexy tooltip */
@@ -445,7 +452,7 @@ proctable_new (GsmApplication * const app)
 
   gtk_tree_view_column_set_expand (column, TRUE);
 
-  for (i = COL_USER; i <= COL_PRIORITY; i++)
+  for (i = COL_USER; i <= COL_THREADS; i++)
     {
       GtkWidget *box;
       GtkWidget *title_label;
@@ -474,6 +481,8 @@ proctable_new (GsmApplication * const app)
         case COL_DISK_WRITE_TOTAL:
         case COL_DISK_READ_CURRENT:
         case COL_DISK_WRITE_CURRENT:
+        case COL_GPU:
+        case COL_GPU_MEM:
           /* Insert a ‘total’ label */
           box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
           title_label = gtk_label_new (_(titles[i]));
@@ -500,6 +509,7 @@ proctable_new (GsmApplication * const app)
           case COL_MEMRES:
           case COL_MEMSHARED:
           case COL_MEM:
+          case COL_GPU_MEM:
             gtk_tree_view_column_set_cell_data_func (col, cell,
                                                      &procman::size_na_cell_data_func,
                                                      GUINT_TO_POINTER (i),
@@ -507,6 +517,7 @@ proctable_new (GsmApplication * const app)
             break;
 
           case COL_CPU:
+          case COL_GPU:
             gtk_tree_view_column_set_cell_data_func (col, cell,
                                                      &procman::percentage_cell_data_func,
                                                      GUINT_TO_POINTER (i),
@@ -579,7 +590,10 @@ proctable_new (GsmApplication * const app)
           case COL_DISK_WRITE_CURRENT:
           case COL_START_TIME:
           case COL_NICE:
+          case COL_THREADS:
           case COL_WCHAN:
+          case COL_GPU:
+          case COL_GPU_MEM:
             attrs = make_tnum_attr_list ();
             g_object_set (cell, "attributes", attrs, NULL);
             g_clear_pointer (&attrs, pango_attr_list_unref);
@@ -603,6 +617,9 @@ proctable_new (GsmApplication * const app)
           case COL_DISK_READ_CURRENT:
           case COL_DISK_WRITE_CURRENT:
           case COL_START_TIME:
+          case COL_THREADS:
+          case COL_GPU:
+          case COL_GPU_MEM:
             gtk_tree_sortable_set_sort_func (GTK_TREE_SORTABLE (model_sort), i,
                                              procman::number_compare_func,
                                              GUINT_TO_POINTER (i),
@@ -627,6 +644,9 @@ proctable_new (GsmApplication * const app)
           case COL_MEMSHARED:
           case COL_CPU:
           case COL_NICE:
+          case COL_THREADS:
+          case COL_GPU:
+          case COL_GPU_MEM:
           case COL_PID:
           case COL_DISK_READ_TOTAL:
           case COL_DISK_WRITE_TOTAL:
@@ -793,6 +813,9 @@ update_info_mutable_cols (ProcInfo *info)
   tree_store_update (model, &info->node, COL_SESSION, info->session.c_str ());
   tree_store_update (model, &info->node, COL_SEAT, info->seat.c_str ());
   tree_store_update (model, &info->node, COL_OWNER, info->owner.c_str ());
+  tree_store_update (model, &info->node, COL_THREADS, info->num_threads);
+  tree_store_update (model, &info->node, COL_GPU, info->gpu_percent);
+  tree_store_update (model, &info->node, COL_GPU_MEM, info->gpu_mem);
 }
 
 static void
@@ -915,6 +938,117 @@ get_proc_kernel_wchan (glibtop_proc_kernel&obj)
   return buf;
 }
 
+static guint
+get_process_thread_count (pid_t pid)
+{
+  gchar *status_path = g_strdup_printf ("/proc/%d/status", pid);
+  gchar *contents = NULL;
+  gsize length = 0;
+  guint threads = 1;
+
+  if (g_file_get_contents (status_path, &contents, &length, NULL))
+    {
+      gchar **lines = g_strsplit (contents, "\n", -1);
+      for (gint i = 0; lines[i] != NULL; i++)
+        {
+          if (g_str_has_prefix (lines[i], "Threads:"))
+            {
+              threads = atoi (lines[i] + strlen ("Threads:"));
+              break;
+            }
+        }
+      g_strfreev (lines);
+      g_free (contents);
+    }
+
+  g_free (status_path);
+  return threads;
+}
+
+static std::string
+get_process_type (ProcInfo *info)
+{
+#ifdef __linux__
+  if (info->ppid == 2 || (info->name.length () > 0 && info->name[0] == '[' && info->name.back () == ']'))
+    return _("Kernel Thread");
+#endif
+
+  if (info->uid < 1000)
+    return _("System");
+
+  return _("User");
+}
+
+static std::map<pid_t, std::pair<gdouble, gulong>> gpu_process_usage;
+
+static gchar *
+get_nvidia_smi_path (void)
+{
+  static gchar *path = NULL;
+  if (!path)
+    path = g_find_program_in_path ("nvidia-smi");
+  return path;
+}
+
+static void
+update_gpu_process_usage (std::map<pid_t, std::pair<gdouble, gulong>> &usage)
+{
+  gchar *nvidia_smi = get_nvidia_smi_path ();
+  if (!nvidia_smi)
+    return;
+
+  usage.clear ();
+
+  gchar *stdout_str = NULL;
+  gchar *stderr_str = NULL;
+  gint exit_status = 0;
+  GError *error = NULL;
+
+  gchar *command = g_strdup_printf ("%s --query-compute-apps=pid,used_gpu_memory,utilization.gpu --format=csv,noheader,nounits",
+                                    nvidia_smi);
+
+  if (!g_spawn_command_line_sync (command, &stdout_str, &stderr_str, &exit_status, &error))
+    {
+      g_clear_error (&error);
+      g_free (command);
+      return;
+    }
+  g_free (command);
+
+  if (exit_status != 0)
+    {
+      g_free (stdout_str);
+      g_free (stderr_str);
+      return;
+    }
+
+  gchar **lines = g_strsplit (stdout_str, "\n", -1);
+  for (guint i = 0; lines && lines[i]; i++)
+    {
+      if (lines[i][0] == '\0')
+        continue;
+
+      gchar **parts = g_strsplit_set (lines[i], ",", -1);
+      guint len = g_strv_length (parts);
+      if (len >= 2)
+        {
+          pid_t pid = (pid_t) g_ascii_strtoll (g_strstrip (parts[0]), NULL, 10);
+          gulong mem = (gulong) g_ascii_strtoull (g_strstrip (parts[1]), NULL, 10);
+          mem *= 1024ULL * 1024ULL; // MiB -> bytes
+          gdouble percent = 0.0;
+          if (len >= 3)
+            percent = g_strtod (g_strstrip (parts[2]), NULL);
+
+          usage[pid] = std::make_pair (percent, mem);
+        }
+      g_strfreev (parts);
+    }
+
+  g_strfreev (lines);
+  g_free (stdout_str);
+  g_free (stderr_str);
+}
+
 static void
 update_info (GsmApplication *app,
              ProcInfo       *info)
@@ -974,6 +1108,21 @@ update_info (GsmApplication *app,
 
   gsm_proc_info_load_cgroups (info);
   gsm_proc_info_load_systemd (info);
+
+  info->num_threads = get_process_thread_count (info->pid);
+  info->process_type = get_process_type (info);
+
+  auto gpu_it = gpu_process_usage.find (info->pid);
+  if (gpu_it != gpu_process_usage.end ())
+    {
+      info->gpu_percent = gpu_it->second.first;
+      info->gpu_mem = gpu_it->second.second;
+    }
+  else
+    {
+      info->gpu_percent = 0.0;
+      info->gpu_mem = 0;
+    }
 }
 
 
@@ -992,6 +1141,8 @@ proctable_refresh_summary_headers(GsmApplication * app)
   uint64_t total_disk_write_bytes_total = 0;
   uint64_t total_disk_read_bytes_current = 0;
   uint64_t total_disk_write_bytes_current = 0;
+  double total_gpu = 0;
+  uint64_t total_gpu_mem = 0;
   std::function<void(GtkTreeIter&)> calc_summary;
   GtkTreeView *treeview = GTK_TREE_VIEW (app->tree);
   GtkTreeModel *model = GTK_TREE_MODEL(
@@ -1047,6 +1198,8 @@ proctable_refresh_summary_headers(GsmApplication * app)
                   &total_disk_write_bytes_total,
                   &total_disk_read_bytes_current,
                   &total_disk_write_bytes_current,
+                  &total_gpu,
+                  &total_gpu_mem,
                   &calc_summary](GtkTreeIter &iter)
   {
     GtkTreeIter child_iter;
@@ -1068,6 +1221,8 @@ proctable_refresh_summary_headers(GsmApplication * app)
     total_disk_write_bytes_total += proc->disk_write_bytes_total;
     total_disk_read_bytes_current += proc->disk_read_bytes_current;
     total_disk_write_bytes_current += proc->disk_write_bytes_current;
+    total_gpu += proc->gpu_percent;
+    total_gpu_mem += proc->gpu_mem;
 
     // child
     if (gtk_tree_model_iter_has_child(model, &iter)) {
@@ -1137,6 +1292,12 @@ proctable_refresh_summary_headers(GsmApplication * app)
       if (!v_str.empty()) {
             v_str = v_str + "/s";
       }
+      break;
+    case COL_GPU:
+      v_str = make_string (g_strdup_printf ("%.01f%%", total_gpu));
+      break;
+    case COL_GPU_MEM:
+      v_str = format_bytes(total_gpu_mem);
       break;
     default:
       v_str = "";
@@ -1316,6 +1477,7 @@ proctable_update (GsmApplication *app)
   // FIXME: not sure if glibtop always returns a sorted list of pid
   // but it is important otherwise refresh_list won't find the parent
   std::sort (pid_list, pid_list + proclist.number);
+  update_gpu_process_usage (gpu_process_usage);
   refresh_list (app, pid_list, proclist.number);
 
   // juggling with tree scroll position to fix https://bugzilla.gnome.org/show_bug.cgi?id=92724

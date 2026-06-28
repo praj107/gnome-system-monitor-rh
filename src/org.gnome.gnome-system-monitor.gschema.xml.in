@@ -142,6 +142,13 @@
       </summary>
     </key>
 
+    <key name="resources-gpu-expanded" type="b">
+      <default>true
+      </default>
+      <summary>Expand GPU section on startup
+      </summary>
+    </key>
+
     <key name="cpu-colors" type="a(us)">
       <default>[
                 (0, '#e01b24'),
@@ -206,6 +213,20 @@
       <default>'#e66100'
       </default>
       <summary>Default graph disk write color
+      </summary>
+    </key>
+
+    <key name="gpu-util-color" type="s">
+      <default>'#c061cb'
+      </default>
+      <summary>Default graph GPU utilization color
+      </summary>
+    </key>
+
+    <key name="gpu-mem-color" type="s">
+      <default>'#ffbe6f'
+      </default>
+      <summary>Default graph GPU memory color
       </summary>
     </key>
 

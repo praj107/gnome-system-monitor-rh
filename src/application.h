@@ -32,6 +32,8 @@ struct ProcConfig
     net_out_color (),
     disk_read_color (),
     disk_write_color (),
+    gpu_util_color (),
+    gpu_mem_color (),
     bg_color (),
     frame_color (),
     num_cpus (0),
@@ -58,6 +60,8 @@ struct ProcConfig
   GdkRGBA net_out_color;
   GdkRGBA disk_read_color;
   GdkRGBA disk_write_color;
+  GdkRGBA gpu_util_color;
+  GdkRGBA gpu_mem_color;
   GdkRGBA bg_color;
   GdkRGBA frame_color;
   gint num_cpus;
@@ -126,6 +130,7 @@ public:
   LoadGraph *mem_graph;
   LoadGraph *net_graph;
   LoadGraph *disk_graph;
+  LoadGraph *gpu_graph;
 
   GsmDisksView *disk_list;
 

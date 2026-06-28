@@ -1,3 +1,6 @@
+This is an independent fork of GNOME System Monitor.
+
+Original authors:
 Kevin Vandersloot <kfv101@psu.edu>
 Erik Johnsson <zaphod@linux.nu> - icon support
 Jorgen Scheibengruber
@@ -5,6 +8,6 @@ Benoît Dejean <benoit@placenet.org>
 Paolo Borelli <pborelli@katamail.com>
 Baptiste Mille-Mathias - artwork
 Karl Lattimer <karl@qdh.org.uk>
-Robert Roth <robert.roth.off@gmail.com> - maintainer
+Robert Roth <robert.roth.off@gmail.com>
 Jacob Barkdull <jacobbarkdull@gmail.com>
-Óscar Fernández Díaz <oscarfernandezdiaz@gnome.org> - maintainer
+Óscar Fernández Díaz <oscarfernandezdiaz@gnome.org>

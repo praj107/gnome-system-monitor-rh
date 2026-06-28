@@ -185,10 +185,16 @@ gsm_graph_dispose (GObject *self)
   GsmGraphPrivate *priv = gsm_graph_get_instance_private (GSM_GRAPH (self));
 
   if (priv->background)
-    cairo_surface_destroy (priv->background);
+    {
+      cairo_surface_destroy (priv->background);
+      priv->background = NULL;
+    }
 
   if (priv->redraw_timeout)
-    g_source_remove (priv->redraw_timeout);
+    {
+      g_source_remove (priv->redraw_timeout);
+      priv->redraw_timeout = 0;
+    }
 
   G_OBJECT_CLASS (gsm_graph_parent_class)->dispose (G_OBJECT (self));
 }

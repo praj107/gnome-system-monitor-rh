@@ -4,7 +4,7 @@ sudo apt-get install meson gettext appstream-util itstool libglibmm-2.4-dev libg
 # Meson
 
 ## configure creates the build directory
-meson build --prefix /home/benoit/gnome
+meson setup build
 
 ## build - compiles the source
 ninja -C build
@@ -24,7 +24,7 @@ rm -rf build
 # Old
 
 ## configure
-./autogen.sh --prefix=/home/benoit/gnome
+./autogen.sh
 
 ## build
 make

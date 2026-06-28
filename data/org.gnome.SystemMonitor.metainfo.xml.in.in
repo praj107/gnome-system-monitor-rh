@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Copyright 2016 Robert Roth -->
+<!-- Fork of GNOME System Monitor -->
 <component type="desktop-application">
   <id>@APP_ID@</id>
   <metadata_license>CC0-1.0</metadata_license>
@@ -9,12 +9,12 @@
   <description>
     <p>
       System Monitor is a process viewer and system monitor with
-      an attractive, easy-to-use interface. 
+      an attractive, easy-to-use interface.
     </p>
     <p>
       System Monitor can help you find out what applications are using the processor
       or the memory of your computer, can manage the running applications, force
-      stop processes not responding, and change the state or priority of existing 
+      stop processes not responding, and change the state or priority of existing
       processes.
     </p>
     <p>
@@ -22,37 +22,17 @@
       computer displaying recent network, memory and processor usage.
     </p>
   </description>
-  <screenshots>
-    <screenshot type="default">
-      <image>https://gitlab.gnome.org/GNOME/gnome-system-monitor/raw/HEAD/data/screenshots/Processes.png</image>
-      <caption>Process list view</caption>
-    </screenshot>
-    <screenshot>
-      <image>https://gitlab.gnome.org/GNOME/gnome-system-monitor/raw/HEAD/data/screenshots/Resources.png</image>
-      <caption>Resources overview</caption>
-    </screenshot>
-    <screenshot>
-      <image>https://gitlab.gnome.org/GNOME/gnome-system-monitor/raw/HEAD/data/screenshots/Disks.png</image>
-      <caption>File Systems view</caption>
-    </screenshot>
-  </screenshots>
-  <update_contact>robert.roth.off_at_gmail.com</update_contact>
-  <project_group>GNOME</project_group>
   <content_rating type="oars-1.1" />
   <translation type="gettext">gnome-system-monitor</translation>
   <launchable type="desktop-id">@APP_ID@.desktop</launchable>
 
-  <developer id="org.gnome">
-    <name>The GNOME Project</name>
+  <developer id="fork.gnome-system-monitor">
+    <name>Fork of GNOME System Monitor</name>
   </developer>
 
-  <url type="bugtracker">https://gitlab.gnome.org/GNOME/gnome-system-monitor/issues</url>
-  <url type="contribute">https://welcome.gnome.org/app/SystemMonitor/</url>
-  <url type="donation">https://www.gnome.org/donate/</url>
-  <url type="help">https://help.gnome.org/users/gnome-system-monitor/stable/</url>
-  <url type="homepage">https://apps.gnome.org/SystemMonitor/</url>
-  <url type="translate">https://l10n.gnome.org/module/gnome-system-monitor/</url>
-  <url type="vcs-browser">https://gitlab.gnome.org/GNOME/gnome-system-monitor</url>
+  <url type="bugtracker">https://github.com</url>
+  <url type="homepage">https://github.com</url>
+  <url type="vcs-browser">https://github.com</url>
 
   <provides>
     <binary>gnome-system-monitor</binary>

@@ -31,6 +31,10 @@ std::string
 ProcInfo::lookup_user (guint uid)
 {
   static std::map<guint, std::string> users;
+
+  if (users.size () > 256)
+    users.clear ();
+
   const auto [it, inserted] = users.try_emplace (uid, "");
 
   // procman_debug("User lookup for uid %u: %s", uid, (inserted ? "MISS" : "HIT"));

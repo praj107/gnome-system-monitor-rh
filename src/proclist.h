@@ -32,6 +32,7 @@ class ProcList
   {
     std::lock_guard<std::mutex> lg (data_lock);
 
+    cpu_times.erase (it->first);
     return data.erase (it);
   }
   ProcInfo*

@@ -304,10 +304,10 @@ found_mount (GObject *source, GAsyncResult *result, gpointer user_data)
 
   if (!icon) {
     g_autofree char *path = g_file_get_path (self->directory);
-    g_autoptr (GUnixMountEntry) entry =
-      g_unix_mount_entry_at (path, NULL);
+    g_autoptr (GUnixMountPoint) entry =
+      g_unix_mount_at (path, NULL);
     if (entry) {
-      icon = g_unix_mount_entry_guess_icon (entry);
+      icon = g_unix_mount_guess_icon (entry);
     }
   }
 

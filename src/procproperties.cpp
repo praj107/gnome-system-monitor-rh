@@ -60,8 +60,18 @@ fill_proc_properties (GtkBuilder *builder,
   AdwActionRow *row;
   char *text;
 
+  label = GTK_LABEL (gtk_builder_get_object (builder, "name_label"));
+  text = g_strdup_printf ("%s", info->name.c_str ());
+  gtk_label_set_label (label, text);
+  g_free (text);
+
   label = GTK_LABEL (gtk_builder_get_object (builder, "pid_label"));
   text = g_strdup_printf ("%d", info->pid);
+  gtk_label_set_label (label, text);
+  g_free (text);
+
+  label = GTK_LABEL (gtk_builder_get_object (builder, "process_type_label"));
+  text = g_strdup_printf ("%s", info->process_type.c_str ());
   gtk_label_set_label (label, text);
   g_free (text);
 
@@ -70,31 +80,26 @@ fill_proc_properties (GtkBuilder *builder,
   gtk_label_set_label (label, text);
   g_free (text);
 
+  label = GTK_LABEL (gtk_builder_get_object (builder, "status_label"));
+  gtk_label_set_label (label, format_process_state (info->status));
+
   label = GTK_LABEL (gtk_builder_get_object (builder, "started_label"));
   text = procman_format_date_for_display (info->start_time);
   gtk_label_set_label (label, text);
   g_free (text);
-
-  label = GTK_LABEL (gtk_builder_get_object (builder, "priority_label"));
-  text = g_strdup_printf ("%s (%d)", procman::get_nice_level (info->nice), info->nice);
-  gtk_label_set_label (label, text);
-  g_free (text);
-
-  label = GTK_LABEL (gtk_builder_get_object (builder, "status_label"));
-  gtk_label_set_label (label, format_process_state (info->status));
 
   label = GTK_LABEL (gtk_builder_get_object (builder, "cpu_label"));
   text = g_strdup_printf ("%.2f%%", info->pcpu);
   gtk_label_set_label (label, text);
   g_free (text);
 
-  label = GTK_LABEL (gtk_builder_get_object (builder, "memory_label"));
-  text = format_memsize (info->mem);
+  label = GTK_LABEL (gtk_builder_get_object (builder, "cputime_label"));
+  text = procman::format_duration_for_display (100 * info->cpu_time / GsmApplication::get ().frequency);
   gtk_label_set_label (label, text);
   g_free (text);
 
-  label = GTK_LABEL (gtk_builder_get_object (builder, "cputime_label"));
-  text = procman::format_duration_for_display (100 * info->cpu_time / GsmApplication::get ().frequency);
+  label = GTK_LABEL (gtk_builder_get_object (builder, "memory_label"));
+  text = format_memsize (info->mem);
   gtk_label_set_label (label, text);
   g_free (text);
 
@@ -118,6 +123,21 @@ fill_proc_properties (GtkBuilder *builder,
   gtk_label_set_label (label, text);
   g_free (text);
 
+  label = GTK_LABEL (gtk_builder_get_object (builder, "threads_label"));
+  text = g_strdup_printf ("%u", info->num_threads);
+  gtk_label_set_label (label, text);
+  g_free (text);
+
+  label = GTK_LABEL (gtk_builder_get_object (builder, "priority_label"));
+  text = g_strdup_printf ("%s (%d)", procman::get_nice_level (info->nice), info->nice);
+  gtk_label_set_label (label, text);
+  g_free (text);
+
+  row = ADW_ACTION_ROW (gtk_builder_get_object (builder, "commandline_row"));
+  text = g_strdup_printf ("%s", info->arguments.c_str ());
+  adw_action_row_set_subtitle (row, text);
+  g_free (text);
+
   row = ADW_ACTION_ROW (gtk_builder_get_object (builder, "securitycontext_row"));
   text = not info->security_context.empty ()
             ? g_strdup_printf ("%s", info->security_context.c_str ())
@@ -125,8 +145,10 @@ fill_proc_properties (GtkBuilder *builder,
   adw_action_row_set_subtitle (row, text);
   g_free (text);
 
-  row = ADW_ACTION_ROW (gtk_builder_get_object (builder, "commandline_row"));
-  text = g_strdup_printf ("%s", info->arguments.c_str ());
+  row = ADW_ACTION_ROW (gtk_builder_get_object (builder, "controlgroup_row"));
+  text = not info->cgroup_name.empty ()
+            ? g_strdup_printf ("%s", info->cgroup_name.c_str ())
+            : g_strdup ("—");
   adw_action_row_set_subtitle (row, text);
   g_free (text);
 
@@ -135,9 +157,23 @@ fill_proc_properties (GtkBuilder *builder,
   adw_action_row_set_subtitle (row, text);
   g_free (text);
 
-  row = ADW_ACTION_ROW (gtk_builder_get_object (builder, "controlgroup_row"));
-  text = not info->cgroup_name.empty ()
-            ? g_strdup_printf ("%s", info->cgroup_name.c_str ())
+  row = ADW_ACTION_ROW (gtk_builder_get_object (builder, "unit_row"));
+  text = not info->unit.empty ()
+            ? g_strdup_printf ("%s", info->unit.c_str ())
+            : g_strdup ("—");
+  adw_action_row_set_subtitle (row, text);
+  g_free (text);
+
+  row = ADW_ACTION_ROW (gtk_builder_get_object (builder, "session_row"));
+  text = not info->session.empty ()
+            ? g_strdup_printf ("%s", info->session.c_str ())
+            : g_strdup ("—");
+  adw_action_row_set_subtitle (row, text);
+  g_free (text);
+
+  row = ADW_ACTION_ROW (gtk_builder_get_object (builder, "seat_row"));
+  text = not info->seat.empty ()
+            ? g_strdup_printf ("%s", info->seat.c_str ())
             : g_strdup ("—");
   adw_action_row_set_subtitle (row, text);
   g_free (text);

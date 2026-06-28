@@ -1,4 +1,4 @@
-# https://gitlab.gnome.org/GNOME/gnome-system-monitor/issues
+# Fork of GNOME System Monitor
 project('gnome-system-monitor',
   'c', 'cpp',
   default_options : [
@@ -53,15 +53,17 @@ datadir = join_paths(prefix, get_option('datadir'))
 ################################################################################
 # Dependencies
 
-giomm      = dependency('giomm-2.68',  version: '>=2.80')
+# NOTE: version requirements lowered from upstream to build on Ubuntu 24.04 / Fedora 40
+# Fork changes do not depend on the newer API surface.
+giomm      = dependency('giomm-2.68',  version: '>=2.78')
 glib       = dependency('glib-2.0',    version: '>=2.80')
-gio_unix   = dependency('gio-unix-2.0', version: '>=2.84')
+gio_unix   = dependency('gio-unix-2.0', version: '>=2.80')
 glibmm     = dependency('glibmm-2.68', version: '>=2.68')
 gmodule    = dependency('gmodule-2.0')
-gtk        = dependency('gtk4',        version: '>=4.17.5')
-gtkmm      = dependency('gtkmm-4.0',   version: '>=4.17.5')
+gtk        = dependency('gtk4',        version: '>=4.14')
+gtkmm      = dependency('gtkmm-4.0',   version: '>=4.10')
 libgtop    = dependency('libgtop-2.0', version: '>=2.41.2')
-libadwaita = dependency('libadwaita-1',version: '>=1.8.alpha')
+libadwaita = dependency('libadwaita-1',version: '>=1.5')
 librsvg    = dependency('librsvg-2.0', version: '>=2.46')
 
 if get_option('systemd')

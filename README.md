@@ -53,7 +53,6 @@ Where `build` is just a directory name, and is up to your choosing.
 ##### Remove the build directory to rebuild from scratch.
 `rm -rf build`
 
-## Bugs
+## About this fork
 
-Please file System-Monitor bugs at:
-https://gitlab.gnome.org/GNOME/gnome-system-monitor/issues
+This is an independent fork of GNOME System Monitor with additional features and fixes. Please file bugs via the fork's issue tracker, not the upstream GNOME project.

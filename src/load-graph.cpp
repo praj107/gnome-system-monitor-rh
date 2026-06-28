@@ -903,6 +903,72 @@ get_disk (LoadGraph *graph)
   }
 }
 
+static void
+get_gpu (LoadGraph *graph)
+{
+  if (!graph->gpu.nvidia_smi_path)
+    return;
+
+  gchar *stdout_str = NULL;
+  gchar *stderr_str = NULL;
+  gint exit_status = 0;
+  GError *error = NULL;
+
+  gchar *command = g_strdup_printf ("%s --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits",
+                                    graph->gpu.nvidia_smi_path);
+
+  if (!g_spawn_command_line_sync (command, &stdout_str, &stderr_str, &exit_status, &error))
+    {
+      g_warning ("Failed to run nvidia-smi: %s", error ? error->message : "unknown error");
+      g_clear_error (&error);
+      g_free (command);
+      return;
+    }
+
+  g_free (command);
+
+  if (exit_status != 0)
+    {
+      g_free (stdout_str);
+      g_free (stderr_str);
+      return;
+    }
+
+  gchar **lines = g_strsplit (stdout_str, "\n", -1);
+  if (lines && lines[0] && lines[0][0] != '\0')
+    {
+      gchar **parts = g_strsplit_set (lines[0], ",", -1);
+      if (g_strv_length (parts) >= 3)
+        {
+          gdouble util = g_strtod (g_strstrip (parts[0]), NULL);
+          gdouble mem_used = g_strtod (g_strstrip (parts[1]), NULL);
+          gdouble mem_total = g_strtod (g_strstrip (parts[2]), NULL);
+          gdouble mem_percent = (mem_total > 0.0) ? mem_used / mem_total : 0.0;
+
+          gchar *text;
+
+          text = g_strdup_printf (_("%.1f%%"), util);
+          gtk_label_set_text (GTK_LABEL (graph->labels.gpu_util), text);
+          g_free (text);
+
+          text = g_strdup_printf (_("%.1f%%"), mem_percent * 100.0);
+          gtk_label_set_text (GTK_LABEL (graph->labels.gpu_mem), text);
+          g_free (text);
+
+          if (graph->iteration != 1)
+            {
+              graph->data[0][0] = util / 100.0;
+              graph->data[0][1] = mem_percent;
+            }
+        }
+      g_strfreev (parts);
+    }
+
+  g_strfreev (lines);
+  g_free (stdout_str);
+  g_free (stderr_str);
+}
+
 int
 load_graph_update_data (LoadGraph *graph)
 {
@@ -932,6 +998,10 @@ load_graph_update_data (LoadGraph *graph)
 
       case LOAD_GRAPH_DISK:
         get_disk (graph);
+        break;
+
+      case LOAD_GRAPH_GPU:
+        get_gpu (graph);
         break;
 
       default:
@@ -1013,6 +1083,14 @@ LoadGraph::LoadGraph(guint type)
         labels.disk_write = init_tnum_label (10, GTK_ALIGN_END);
         labels.disk_write_total = init_tnum_label (10, GTK_ALIGN_END);
         break;
+
+      case LOAD_GRAPH_GPU:
+        gpu = GPU {};
+        n = 2;
+        gpu.nvidia_smi_path = g_find_program_in_path ("nvidia-smi");
+        labels.gpu_util = init_tnum_label (10, GTK_ALIGN_START);
+        labels.gpu_mem = init_tnum_label (10, GTK_ALIGN_START);
+        break;
     }
 
   colors.resize (n);
@@ -1053,6 +1131,12 @@ LoadGraph::LoadGraph(guint type)
         colors[1] = GsmApplication::get ().config.disk_write_color;
         gsm_graph_set_max_value (disp, this->disk.max);
         break;
+
+      case LOAD_GRAPH_GPU:
+        colors[0] = GsmApplication::get ().config.gpu_util_color;
+        colors[1] = GsmApplication::get ().config.gpu_mem_color;
+        gsm_graph_set_max_value (disp, 100);
+        break;
     }
 
   main_widget = GTK_BOX (gtk_box_new (GTK_ORIENTATION_VERTICAL, 6));
@@ -1080,6 +1164,9 @@ LoadGraph::LoadGraph(guint type)
 LoadGraph::~LoadGraph()
 {
   load_graph_stop (this);
+
+  if (type == LOAD_GRAPH_GPU && gpu.nvidia_smi_path)
+    g_free (gpu.nvidia_smi_path);
 }
 
 void

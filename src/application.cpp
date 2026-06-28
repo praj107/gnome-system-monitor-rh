@@ -78,6 +78,8 @@ cb_draw_smooth_changed (Gio::Settings& settings,
   app->mem_graph->clear_background ();
   app->net_graph->clear_background ();
   app->disk_graph->clear_background ();
+  if (app->gpu_graph)
+    app->gpu_graph->clear_background ();
 }
 
 static void
@@ -135,6 +137,9 @@ cb_timeouts_changed (Gio::Settings& settings,
                                app->config.graph_update_interval);
       load_graph_change_speed (app->disk_graph,
                                app->config.graph_update_interval);
+      if (app->gpu_graph)
+        load_graph_change_speed (app->gpu_graph,
+                                 app->config.graph_update_interval);
     }
 }
 
@@ -150,6 +155,8 @@ cb_data_points_changed (Gio::Settings& settings,
   load_graph_change_num_points (app->mem_graph, points);
   load_graph_change_num_points (app->net_graph, points);
   load_graph_change_num_points (app->disk_graph, points);
+  if (app->gpu_graph)
+    load_graph_change_num_points (app->gpu_graph, points);
 }
 
 static void
@@ -246,6 +253,18 @@ cb_color_changed (Gio::Settings& settings,
       gdk_rgba_parse (&app->config.disk_write_color, color.c_str ());
       app->disk_graph->colors.at (1) = app->config.disk_write_color;
     }
+  else if (key == GSM_SETTING_GPU_UTIL_COLOR)
+    {
+      gdk_rgba_parse (&app->config.gpu_util_color, color.c_str ());
+      if (app->gpu_graph)
+        app->gpu_graph->colors.at (0) = app->config.gpu_util_color;
+    }
+  else if (key == GSM_SETTING_GPU_MEM_COLOR)
+    {
+      gdk_rgba_parse (&app->config.gpu_mem_color, color.c_str ());
+      if (app->gpu_graph)
+        app->gpu_graph->colors.at (1) = app->config.gpu_mem_color;
+    }
 }
 
 void
@@ -340,14 +359,21 @@ GsmApplication::load_settings ()
 
   auto disk_write_color = this->settings->get_string (GSM_SETTING_DISK_WRITE_COLOR);
 
-  gdk_rgba_parse (&config.disk_write_color, disk_write_color.empty () ? "#00f2000000c1" : disk_write_color.c_str ());
+  gdk_rgba_parse (&config.disk_write_color, disk_write_color.empty () ? "#e66100" : disk_write_color.c_str ());
 
+  auto gpu_util_color = this->settings->get_string (GSM_SETTING_GPU_UTIL_COLOR);
+
+  gdk_rgba_parse (&config.gpu_util_color, gpu_util_color.empty () ? "#c061cb" : gpu_util_color.c_str ());
+
+  auto gpu_mem_color = this->settings->get_string (GSM_SETTING_GPU_MEM_COLOR);
+
+  gdk_rgba_parse (&config.gpu_mem_color, gpu_mem_color.empty () ? "#ffbe6f" : gpu_mem_color.c_str ());
 
   auto cbcc = [this](const Glib::ustring&key) {
                 cb_color_changed (*this->settings.operator-> (), key, this);
               };
 
-  for (auto k : { GSM_SETTING_CPU_COLORS, GSM_SETTING_MEM_COLOR, GSM_SETTING_SWAP_COLOR, GSM_SETTING_NET_IN_COLOR, GSM_SETTING_NET_OUT_COLOR, GSM_SETTING_DISK_READ_COLOR, GSM_SETTING_DISK_WRITE_COLOR })
+  for (auto k : { GSM_SETTING_CPU_COLORS, GSM_SETTING_MEM_COLOR, GSM_SETTING_SWAP_COLOR, GSM_SETTING_NET_IN_COLOR, GSM_SETTING_NET_OUT_COLOR, GSM_SETTING_DISK_READ_COLOR, GSM_SETTING_DISK_WRITE_COLOR, GSM_SETTING_GPU_UTIL_COLOR, GSM_SETTING_GPU_MEM_COLOR })
     this->settings->signal_changed (k).connect (cbcc);
 }
 
@@ -382,6 +408,7 @@ GsmApplication::GsmApplication()
   mem_graph (NULL),
   net_graph (NULL),
   disk_graph (NULL),
+  gpu_graph (NULL),
 
   disk_list (NULL),
 
@@ -390,7 +417,8 @@ GsmApplication::GsmApplication()
   smooth_refresh (NULL)
 {
   Glib::set_application_name (_("System Monitor"));
-  this->set_version (VERSION);
+  // set_version requires newer gtkmm; skip on older distros
+  // this->set_version (VERSION);
   this->set_option_context_summary (_("A simple process and system monitor."));
   this->add_main_option_entry (OptionType::BOOL,
                                "show-processes-tab",

@@ -33,6 +33,8 @@ std::tuple<double, double, double> hsv_to_rgb (double h,
                                                double s,
                                                double v);
 std::string                        rgb_to_color_string (const std::tuple<double, double, double> &t);
+std::string                        get_cpu_core_label (int cpu_index,
+                                                       int total_cpus);
 
 inline string
 make_string (char *c_str)
