@@ -35,7 +35,7 @@
   <url type="vcs-browser">https://github.com</url>
 
   <provides>
-    <binary>gnome-system-monitor</binary>
+    <binary>gnome-system-monitor-rh</binary>
     <id>org.gnome.SystemMonitor.desktop</id>
   </provides>
 

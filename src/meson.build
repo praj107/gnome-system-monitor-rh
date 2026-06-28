@@ -130,7 +130,7 @@ libgsm_dep = declare_dependency(
   link_with: libgsm,
 )
 
-executable(meson.project_name(),
+executable('gnome-system-monitor-rh',
   ['main.cpp'],
   dependencies: libgsm_dep,
   install: true,

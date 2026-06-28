@@ -1,14 +1,14 @@
 [Desktop Entry]
 Name=GNOME System Monitor
 Comment=View current processes and monitor system state
-TryExec=gnome-system-monitor
-Exec=gnome-system-monitor
+TryExec=gnome-system-monitor-rh
+Exec=gnome-system-monitor-rh
 # Translators: Do NOT translate or transliterate this text (this is an icon file name)!
 Icon=@APP_ID@
 Terminal=false
 Type=Application
 StartupNotify=true
-StartupWMClass=gnome-system-monitor
+StartupWMClass=gnome-system-monitor-rh
 Categories=GNOME;GTK;System;Monitor;
 OnlyShowIn=KDE;
 # Translators: Search terms to find this application. Do NOT translate or localize the semicolons! The list MUST also end with a semicolon!
