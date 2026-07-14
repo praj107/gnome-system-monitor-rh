@@ -951,7 +951,9 @@ get_gpu (LoadGraph *graph)
           gtk_label_set_text (GTK_LABEL (graph->labels.gpu_util), text);
           g_free (text);
 
-          text = g_strdup_printf (_("%.1f%%"), mem_percent * 100.0);
+          guint64 mem_used_bytes = (guint64)mem_used * 1024ULL * 1024ULL;
+          g_autofree gchar *mem_str = g_format_size_full (mem_used_bytes, G_FORMAT_SIZE_IEC_UNITS);
+          text = g_strdup_printf (_("%s (%.1f%%)"), mem_str, mem_percent * 100.0);
           gtk_label_set_text (GTK_LABEL (graph->labels.gpu_mem), text);
           g_free (text);
 

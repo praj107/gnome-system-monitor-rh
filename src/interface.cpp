@@ -511,12 +511,12 @@ create_sys_view (GsmApplication *app,
       gtk_widget_set_valign (GTK_WIDGET (color_picker), GTK_ALIGN_CENTER);
       g_signal_connect (G_OBJECT (color_picker), "color-set",
                         G_CALLBACK (cb_gpu_mem_color_changed), app);
-      title_text = g_strdup_printf (title_template, _("GPU Memory"));
+      title_text = g_strdup_printf (title_template, _("VRAM Usage"));
       gsm_color_button_set_title (color_picker, title_text);
       g_free (title_text);
       gtk_grid_attach (gpu_table, GTK_WIDGET (color_picker), 0, 1, 1, 1);
 
-      label = GTK_LABEL (gtk_label_new (_("GPU Memory")));
+      label = GTK_LABEL (gtk_label_new (_("VRAM Usage")));
       gtk_widget_set_halign (GTK_WIDGET (label), GTK_ALIGN_START);
       gtk_grid_attach (gpu_table, GTK_WIDGET (label), 1, 1, 1, 1);
       gtk_grid_attach (gpu_table, GTK_WIDGET (load_graph_get_labels (gpu_graph)->gpu_mem), 2, 1, 1, 1);

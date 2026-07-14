@@ -41,10 +41,7 @@ typedef struct _proc_arg
 static char *
 format_memsize (guint64 size)
 {
-  if (size == 0)
-    return g_strdup ("—");
-  else
-    return g_format_size_full (size, G_FORMAT_SIZE_IEC_UNITS);
+  return g_format_size_full (size, G_FORMAT_SIZE_IEC_UNITS);
 }
 
 static void

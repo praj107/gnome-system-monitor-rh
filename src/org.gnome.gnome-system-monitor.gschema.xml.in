@@ -658,53 +658,67 @@
     <key name="col-25-width" type="i">
       <default>100
       </default>
-      <summary>Width of process "GPU" column
+      <summary>Width of process "Disk write" column
       </summary>
     </key>
 
     <key name="col-25-visible" type="b">
-      <default>false
+      <default>true
       </default>
-      <summary>Show process "GPU" column on startup
+      <summary>Show process "Disk write" column on startup
       </summary>
     </key>
 
     <key name="col-26-width" type="i">
       <default>100
       </default>
-      <summary>Width of process "GPU Memory" column
+      <summary>Width of process "GPU" column
       </summary>
     </key>
 
     <key name="col-26-visible" type="b">
-      <default>false
+      <default>true
       </default>
-      <summary>Show process "GPU Memory" column on startup
+      <summary>Show process "GPU" column on startup
       </summary>
     </key>
 
     <key name="col-27-width" type="i">
       <default>100
       </default>
-      <summary>Width of process "Priority" column
+      <summary>Width of process "GPU Memory" column
       </summary>
     </key>
 
     <key name="col-27-visible" type="b">
       <default>false
       </default>
-      <summary>Show process "Priority" column on startup
+      <summary>Show process "GPU Memory" column on startup
       </summary>
     </key>
 
     <key name="col-28-width" type="i">
       <default>100
       </default>
-      <summary>Width of process "Threads" column
+      <summary>Width of process "Priority" column
       </summary>
     </key>
 
     <key name="col-28-visible" type="b">
+      <default>false
+      </default>
+      <summary>Show process "Priority" column on startup
+      </summary>
+    </key>
+
+    <key name="col-29-width" type="i">
+      <default>100
+      </default>
+      <summary>Width of process "Threads" column
+      </summary>
+    </key>
+
+    <key name="col-29-visible" type="b">
       <default>false
       </default>
       <summary>Show process "Threads" column on startup

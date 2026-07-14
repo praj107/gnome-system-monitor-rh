@@ -397,7 +397,14 @@ percentage_cell_data_func (GtkTreeViewColumn *,
   size = g_value_get_double (&value);
   g_value_unset (&value);
 
-  char *str = size < 0.1 ? g_strdup ("—") : g_strdup_printf ("%.1f %%", size);
+  char *str;
+
+  if (size == 0.0)
+    str = g_strdup ("0.0 %");
+  else if (size < 0.05)
+    str = g_strdup ("~0.0 %");
+  else
+    str = g_strdup_printf ("%.1f %%", size);
 
   g_object_set (renderer, "text", str, NULL);
   g_free (str);
@@ -437,20 +444,9 @@ size_na_cell_data_func (GtkTreeViewColumn *,
 
   g_value_unset (&value);
 
-  if (size == 0)
-    {
-      g_object_set (renderer,
-                    "text", "—",
-                    NULL);
-    }
-  else
-    {
-      char *str = format_byte_size (size, GsmApplication::get ().config.process_memory_in_iec);
-      g_object_set (renderer,
-                    "text", str,
-                    NULL);
-      g_free (str);
-    }
+  char *str = format_byte_size (size, GsmApplication::get ().config.process_memory_in_iec);
+  g_object_set (renderer, "text", str, NULL);
+  g_free (str);
 }
 
 void
@@ -483,14 +479,9 @@ io_rate_cell_data_func (GtkTreeViewColumn *,
 
   g_value_unset (&value);
 
-  if (size == 0)
-    g_object_set (renderer,
-                  "text", "—",
-                  NULL);
-  else
-    g_object_set (renderer,
-                  "text", procman::format_rate (size, FALSE).c_str (),
-                  NULL);
+  g_object_set (renderer,
+                "text", procman::format_rate (size, FALSE).c_str (),
+                NULL);
 }
 
 void
