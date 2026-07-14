@@ -75,6 +75,15 @@
       </description>
     </key>
 
+    <key name="health-tracking" type="b">
+      <default>false
+      </default>
+      <summary>Whether to record drive wear and per-app write volume over time
+      </summary>
+      <description>Whether a background service records drive health and how much each application writes, so that wear can be charted over time and attributed. Off by default: it is what makes lifespan estimates and per-app blame possible, but it also keeps a local record of application activity, so the user opts in explicitly. All data stays on this machine.
+      </description>
+    </key>
+
     <key name="disks-interval" type="i">
       <range min="1000" max="100000"/>
       <default>5000</default>
@@ -102,6 +111,7 @@
         <choice value="resources"/>
         <choice value="processes"/>
         <choice value="disks"/>
+        <choice value="health"/>
       </choices>
       <default>'resources'</default>
       <summary>Saves the currently viewed tab

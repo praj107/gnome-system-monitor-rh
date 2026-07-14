@@ -4,10 +4,12 @@ subdir('legacy')
 subdir('systemd')
 subdir('selinux')
 subdir('cgroups')
+subdir('health')
 
 system_monitor_sources = [
   'application.cpp',
   'column-view-persister.c',
+  'dev-ipc.c',
   'disk.c',
   'disks.c',
   'gsm-graph.c',
@@ -39,6 +41,7 @@ system_monitor_headers = [
   'application.h',
   'column-view-persister.h',
   'defaulttable.h',
+  'dev-ipc.h',
   'disk.h',
   'disks.h',
   'gsm-graph.h',
@@ -116,6 +119,7 @@ system_monitor_dependencies = [
   libgsm_systemd_dep,
   libgsm_selinux_dep,
   libgsm_cgroups_dep,
+  libgsm_health_dep,
 ]
 libgsm = static_library(
   'libgsm',

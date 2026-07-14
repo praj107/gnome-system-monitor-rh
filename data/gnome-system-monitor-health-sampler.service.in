@@ -1,0 +1,42 @@
+[Unit]
+Description=GNOME System Monitor storage wear sampler
+Documentation=man:gnome-system-monitor(1)
+
+[Service]
+Type=simple
+ExecStart=@pkglibexecdir@/gsm-health-sampler
+Restart=on-failure
+RestartSec=30
+
+# This service is deliberately unprivileged. Everything it reads — udisks2 over
+# the system bus, cgroup io.stat, /proc/<pid>/io, battery sysfs — is available
+# to a normal user, and it must never gain the ability to do more than that.
+# SMART reads that genuinely require root happen only on demand, from the UI,
+# via a one-shot pkexec helper that exits immediately.
+NoNewPrivileges=yes
+PrivateNetwork=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+# The one thing it does need to write: its own history database.
+ReadWritePaths=%h/.local/share/gnome-system-monitor-rh
+
+# Wear moves on the scale of days. This should never be something the user
+# notices competing with their actual work.
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+[Install]
+WantedBy=default.target

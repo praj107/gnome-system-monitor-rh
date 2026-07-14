@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="libadwaita" version="1.0"/>
+
+  <template class="GsmHealthView" parent="AdwBin">
+    <property name="child">
+      <object class="AdwPreferencesPage" id="page">
+        <property name="hexpand">True</property>
+        <property name="vexpand">True</property>
+
+        <child>
+          <object class="AdwPreferencesGroup" id="battery_group">
+            <property name="title" translatable="yes">Battery</property>
+            <property name="visible">False</property>
+          </object>
+        </child>
+
+        <child>
+          <object class="AdwPreferencesGroup" id="tracking_group">
+            <property name="title" translatable="yes">Wear Tracking</property>
+            <property name="description" translatable="yes">Recording wear over time is what makes a lifespan estimate — and finding out which apps are wearing a drive out — possible at all. Everything is stored locally on this machine and is never sent anywhere.</property>
+
+            <child>
+              <object class="AdwBanner" id="io_accounting_banner">
+                <property name="title" translatable="yes">This system does not account for app disk writes per drive, so per-app figures are estimates. Enabling it makes them exact.</property>
+                <property name="button-label" translatable="yes">Enable…</property>
+                <property name="revealed">False</property>
+                <signal name="button-clicked" handler="on_enable_io_accounting" swapped="yes"/>
+              </object>
+            </child>
+
+            <child>
+              <object class="AdwSwitchRow" id="tracking_row">
+                <property name="title" translatable="yes">Track wear over time</property>
+                <property name="subtitle" translatable="yes">Samples drive health and per-app write volume every 15 seconds in the background</property>
+                <signal name="notify::active" handler="on_tracking_toggled" swapped="yes"/>
+              </object>
+            </child>
+
+            <child>
+              <object class="AdwActionRow" id="history_row">
+                <property name="title" translatable="yes">History</property>
+                <property name="subtitle" translatable="yes">No history yet</property>
+                <child type="suffix">
+                  <object class="GtkButton">
+                    <property name="label" translatable="yes">Clear…</property>
+                    <property name="valign">center</property>
+                    <style>
+                      <class name="destructive-action"/>
+                    </style>
+                    <signal name="clicked" handler="on_clear_history" swapped="yes"/>
+                  </object>
+                </child>
+              </object>
+            </child>
+
+          </object>
+        </child>
+
+      </object>
+    </property>
+  </template>
+</interface>

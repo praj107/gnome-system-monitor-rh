@@ -49,5 +49,6 @@
 #define GSM_SETTING_DISKS_UPDATE_INTERVAL   "disks-interval"
 #define GSM_SETTING_SHOW_ALL_FS             "show-all-fs"
 #define GSM_SETTING_SMOOTH_REFRESH          "smooth-refresh"
+#define GSM_SETTING_HEALTH_TRACKING         "health-tracking"
 
 #endif /* _GSM_SETTINGS_KEYS_H_ */

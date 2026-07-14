@@ -74,6 +74,15 @@ else
   conf.set('HAVE_SYSTEMD', false)
 endif
 
+# The developer control socket. Off unless asked for, and loudly so — it can
+# drive the UI, and must never be compiled into anything users install.
+if get_option('dev_ipc')
+  conf.set('HAVE_DEV_IPC', true)
+  warning('dev_ipc is ENABLED: this build exposes a control socket and must not be released')
+else
+  conf.set('HAVE_DEV_IPC', false)
+endif
+
 
 ################################################################################
 # Compiler flags

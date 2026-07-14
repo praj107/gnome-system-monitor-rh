@@ -62,6 +62,17 @@ configure_file(
   install_dir: join_paths(get_option('datadir'), 'dbus-1', 'services'),
 )
 
+# The wear sampler's systemd user unit. Installed but NOT enabled: the user
+# turns it on from the Health tab, which is also where they are told what it
+# records.
+configure_file(
+  input: 'gnome-system-monitor-health-sampler.service.in',
+  output: 'gnome-system-monitor-health-sampler.service',
+  configuration: dataconf,
+  install: true,
+  install_dir: join_paths(get_option('prefix'), 'lib', 'systemd', 'user'),
+)
+
 ################################################################################
 # Tests
 

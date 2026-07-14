@@ -42,7 +42,9 @@
 #include "procproperties.h"
 #include "load-graph.h"
 #include "util.h"
+#include "dev-ipc.h"
 #include "disks.h"
+#include "health.h"
 #include "settings-keys.h"
 #include "legacy/gsm_color_button.h"
 
@@ -960,6 +962,11 @@ create_main_window (GsmApplication *app)
   GtkBuilder *builder = gtk_builder_new ();
   GError *err = NULL;
 
+  /* GsmHealthView lives in a static library that nothing here references by
+   * symbol, so without this the linker drops it and GtkBuilder cannot resolve
+   * the type named in interface.ui. */
+  g_type_ensure (GSM_TYPE_HEALTH_VIEW);
+
   gtk_builder_add_from_resource (builder, "/org/gnome/gnome-system-monitor/data/interface.ui", &err);
   if (err != NULL)
     g_error ("%s", err->message);
@@ -1044,6 +1051,11 @@ create_main_window (GsmApplication *app)
 
   // Surface is available only after a widget has been shown
   gtk_window_present (GTK_WINDOW (app->main_window));
+
+  /* No-op unless this was built with -Ddev_ipc=true *and* GSM_DEV_IPC=1 is
+   * set; compiles to nothing at all otherwise. Must come after present(), as
+   * it needs a realised window to render from. */
+  gsm_dev_ipc_init (GTK_WINDOW (app->main_window));
 
   g_object_set (GTK_WINDOW (app->main_window),
                 "default-width",

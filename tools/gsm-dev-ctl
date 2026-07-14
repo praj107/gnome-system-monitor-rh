@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""
+Drive a running gnome-system-monitor-rh from the command line.
+
+Only works against a binary built with -Ddev_ipc=true and launched with
+GSM_DEV_IPC=1; see src/dev-ipc.h for why it is locked twice. Never present in
+a release build.
+
+Unlike poking at the app with xdotool, this neither steals focus nor moves the
+pointer, and it captures the window's own render tree — so it works while the
+window is buried behind your editor, and it cannot photograph the wrong window.
+
+  gsm-dev-ctl tab                  # what tabs exist, which is showing
+  gsm-dev-ctl tab health           # switch to the Health tab
+  gsm-dev-ctl size 1100x950        # resize
+  gsm-dev-ctl scroll bottom        # scroll the visible tab (top|bottom|<px>)
+  gsm-dev-ctl click 'Unlock Full'  # press a button by its visible label
+  gsm-dev-ctl toggle 'Track wear'  # flip a switch row by its title
+  gsm-dev-ctl text                 # dump the visible text (assert on it)
+  gsm-dev-ctl shot /tmp/out.png    # save a PNG of the window as it is now
+  gsm-dev-ctl quit
+"""
+
+import os
+import socket
+import sys
+
+SOCKET_NAME = "gnome-system-monitor-rh-dev.sock"
+
+
+def socket_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, SOCKET_NAME)
+
+
+def send(command: str) -> str:
+    path = socket_path()
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+            client.connect(path)
+        except (FileNotFoundError, ConnectionRefusedError):
+            sys.exit(
+                f"gsm-dev-ctl: nothing listening on {path}\n"
+                "  Is the app running, built with -Ddev_ipc=true "
+                "and started with GSM_DEV_IPC=1?"
+            )
+
+        client.sendall(command.encode() + b"\n")
+
+        chunks = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+    return b"".join(chunks).decode(errors="replace").rstrip("\n")
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+
+    reply = send(" ".join(sys.argv[1:]))
+    print(reply)
+
+    # Make failures usable from a shell: `gsm-dev-ctl click X && ...`
+    return 1 if reply.startswith("ERR") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

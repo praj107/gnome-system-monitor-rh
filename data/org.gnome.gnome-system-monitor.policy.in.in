@@ -29,4 +29,37 @@
     <annotate key="org.freedesktop.policykit.exec.path">@pkglibexecdir@/gsm-renice</annotate>
   </action>
 
+  <action id="org.gnome.gnome-system-monitor.smart">
+    <description>Read drive health data</description>
+    <message>Privileges are required to read SMART health data from this drive</message>
+    <defaults>
+      <!--
+        auth_admin_keep, not auth_admin: reading SMART is harmless and a user
+        checking whether their disk is dying should not have to re-authenticate
+        for every drive. The helper only ever reads, and only ever from one
+        block device given on the command line.
+      -->
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@pkglibexecdir@/gsm-smart</annotate>
+  </action>
+
+  <action id="org.gnome.gnome-system-monitor.io-accounting">
+    <description>Enable per-app disk write accounting</description>
+    <message>Privileges are required to let the system record which applications write to which drive</message>
+    <defaults>
+      <!--
+        auth_admin, not auth_admin_keep: unlike reading SMART, this writes
+        system configuration. It is a one-off, so there is nothing to be gained
+        by caching the authorisation, and something to be lost.
+      -->
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@pkglibexecdir@/gsm-io-accounting</annotate>
+  </action>
+
 </policyconfig>

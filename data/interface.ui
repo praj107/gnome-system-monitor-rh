@@ -409,6 +409,20 @@
                 </property>
               </object>
             </child>
+            <child>
+              <object class="AdwViewStackPage">
+                <property name="name">health</property>
+                <property name="use-underline">True</property>
+                <property name="title" translatable="yes">_Health</property>
+                <property name="icon-name">drive-harddisk-symbolic</property>
+                <property name="child">
+                  <object class="GsmHealthView" id="health_view">
+                    <property name="hexpand">True</property>
+                    <property name="vexpand">True</property>
+                  </object>
+                </property>
+              </object>
+            </child>
           </object>
         </property>
       </object>

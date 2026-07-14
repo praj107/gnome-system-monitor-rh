@@ -4,3 +4,12 @@
                 @view_bg_color);
   color: @window_fg_color;
 }
+
+/* Health tab. The chart draws itself from its CSS `color`, which is how it
+   follows the theme without any colour plumbing — see gsm-history-chart.c.
+   No min-height here: a bar chart sizes itself to however many writers there
+   are, and a floor would leave dead space under short lists. The line chart
+   asks for its own height in measure(). */
+historychart {
+  color: @window_fg_color;
+}

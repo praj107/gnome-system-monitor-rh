@@ -5,3 +5,12 @@ option('systemd', type: 'boolean', value: true,
 option('development', type: 'boolean', value: false,
   description: 'If this is a development build'
 )
+
+# Deliberately separate from `development`, and default false, so that it is
+# never enabled by merely building a devel flavour. It exposes a local socket
+# that can drive the UI, which is exactly the sort of thing that must not be
+# reachable in anything shipped to users. Enabling it ALSO requires
+# GSM_DEV_IPC=1 in the environment at run time.
+option('dev_ipc', type: 'boolean', value: false,
+  description: 'Build the developer IPC control socket (never enable for release builds)'
+)

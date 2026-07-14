@@ -1,5 +1,5 @@
 # Dependencies - can be found in meson.build
-sudo apt-get install meson gettext appstream-util itstool libglibmm-2.4-dev libgtkmm-4.0-dev libgtop2-dev librsvg2-dev libsystemd-dev libadwaita-dev
+sudo apt-get install meson gettext appstream-util itstool libglibmm-2.4-dev libgtkmm-4.0-dev libgtop2-dev librsvg2-dev libsystemd-dev libadwaita-dev libsqlite3-dev
 
 # Meson
 
@@ -17,6 +17,36 @@ ninja -C build -t clean
 
 ## start from scratch
 rm -rf build
+
+
+# Driving the UI from a script (developer builds only)
+
+The Health tab is tedious to test by hand: it depends on real drives, on the
+history database having content, and on privilege prompts. `-Ddev_ipc=true`
+builds a small control socket so a script can drive the running app instead.
+
+It is NOT implied by -Ddevelopment=true, and it must never be enabled for a
+release build: it exposes a socket that can drive the UI. It is locked twice —
+the code is only compiled with the meson option, and even then it stays dormant
+unless GSM_DEV_IPC=1 is set at run time. A default build contains none of it
+(verify with: nm build/src/gnome-system-monitor-rh | grep dev_ipc).
+
+    meson setup build -Ddev_ipc=true
+    ninja -C build
+    GSM_DEV_IPC=1 ./build/src/gnome-system-monitor-rh &
+
+    tools/gsm-dev-ctl tab                  # list tabs, show current
+    tools/gsm-dev-ctl tab health
+    tools/gsm-dev-ctl size 1150x1050
+    tools/gsm-dev-ctl scroll bottom
+    tools/gsm-dev-ctl click 'Unlock Full'  # press a button by visible label
+    tools/gsm-dev-ctl toggle 'Track wear'  # flip a switch row by title
+    tools/gsm-dev-ctl text                 # dump visible text, to assert on
+    tools/gsm-dev-ctl shot /tmp/health.png
+
+`shot` renders the window's own widget tree rather than grabbing the screen, so
+it works while the window is unfocused, occluded, or on another workspace — and
+it never moves the pointer or steals focus the way synthetic input does.
 
 
 
