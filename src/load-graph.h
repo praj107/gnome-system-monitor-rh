@@ -5,6 +5,7 @@
 #include <glibtop/cpu.h>
 
 #include "gsm-graph.h"
+#include "psi.h"
 #include "legacy/gsm_color_button.h"
 #include "util.h"
 #include "settings-keys.h"
@@ -40,6 +41,7 @@ struct LoadGraphLabels
   GtkLabel *disk_write_total;
   GtkLabel *gpu_util;
   GtkLabel *gpu_mem;
+  GtkLabel *pressure; /* CPU, memory and disk graphs only */
 };
 
 struct LoadGraph
@@ -105,6 +107,15 @@ struct LoadGraph
     guint64 max;
     std::vector<unsigned> values;
   } disk;
+
+  /* The previous /proc/pressure reading, for the share of the refresh
+   * window spent stalled (CPU, memory and disk graphs only). */
+  struct PRESSURE
+  {
+    GsmPsi  last;
+    gint64  last_time_us;
+    bool    have_last;
+  } pressure;
 
   struct GPU
   {

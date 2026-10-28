@@ -18,6 +18,8 @@ system_monitor_sources = [
   'lsof.cpp',
   'mem-map.c',
   'meminfo.c',
+  'cputopology.c',
+  'psi.c',
   'memmaps.cpp',
   'open-file.cpp',
   'openfiles.cpp',
@@ -140,6 +142,30 @@ test(
   executable(
     'test-meminfo',
     ['meminfo.c', 'tests/test-meminfo.c'],
+    include_directories: rootInclude,
+    dependencies: [glib],
+  ),
+  args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
+)
+
+test(
+  'cputopology',
+  executable(
+    'test-cputopology',
+    ['cputopology.c', 'tests/test-cputopology.c'],
+    include_directories: rootInclude,
+    dependencies: [glib],
+  ),
+  args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
+)
+
+test(
+  'psi',
+  executable(
+    'test-psi',
+    ['psi.c', 'tests/test-psi.c'],
     include_directories: rootInclude,
     dependencies: [glib],
   ),

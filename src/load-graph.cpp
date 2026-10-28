@@ -15,6 +15,7 @@
 #include "application.h"
 #include "load-graph.h"
 #include "meminfo.h"
+#include "psi.h"
 #include "util.h"
 #include "legacy/gsm_color_button.h"
 
@@ -463,6 +464,94 @@ load_graph_reset (LoadGraph *graph)
   std::fill (graph->data_block.begin (), graph->data_block.end (), -1.0);
 }
 
+/* A stall share as text, or "—" when it cannot be told (invariant 1). */
+static char *
+format_stall_share (gboolean known,
+                    double   percent)
+{
+  if (!known)
+    return g_strdup ("—");
+  // Translators: pressure stall percentage: 1.4%
+  return g_strdup_printf (_("%.1f%%"), percent);
+}
+
+/* The "Pressure" line of a graph: the share of the time since the previous
+ * refresh that tasks were stalled on the resource, from the change in the
+ * kernel's cumulative stall counter (Documentation/accounting/psi.rst). The
+ * first refresh has no earlier reading and shows "—". The tooltip carries the
+ * kernel's own 10 s average for comparison. One small read per refresh. */
+static void
+update_pressure_label (LoadGraph  *graph,
+                       const char *path,
+                       const char *resource,
+                       bool        show_full)
+{
+  GsmPsi now;
+  double some_percent = 0.0;
+  double full_percent = 0.0;
+  gboolean some_known = FALSE;
+  gboolean full_known = FALSE;
+  gint64 now_us;
+  char *some_text;
+  char *full_text;
+  char *text;
+  char *tooltip;
+
+  if (!gsm_psi_read (path, &now))
+    {
+      graph->pressure.have_last = false;
+      // xgettext: the pressure line when the kernel gives no reading
+      text = show_full ? g_strdup (_("Pressure: some —, full —"))
+                       : g_strdup (_("Pressure: some —"));
+      gtk_label_set_text (graph->labels.pressure, text);
+      gtk_widget_set_tooltip_text (GTK_WIDGET (graph->labels.pressure),
+                                   _("Pressure stall information is not available from this kernel."));
+      g_free (text);
+      return;
+    }
+  now_us = g_get_monotonic_time ();
+
+  if (graph->pressure.have_last)
+    {
+      gint64 elapsed_us = now_us - graph->pressure.last_time_us;
+
+      some_known = gsm_psi_window_share (&graph->pressure.last.some, &now.some, elapsed_us, &some_percent);
+      full_known = gsm_psi_window_share (&graph->pressure.last.full, &now.full, elapsed_us, &full_percent);
+    }
+  graph->pressure.last = now;
+  graph->pressure.last_time_us = now_us;
+  graph->pressure.have_last = true;
+
+  some_text = format_stall_share (some_known, some_percent);
+  full_text = format_stall_share (full_known, full_percent);
+  if (show_full)
+    // xgettext: share of time tasks were stalled, e.g.: "Pressure: some 1.4%, full 0.0%"
+    text = g_strdup_printf (_("Pressure: some %s, full %s"), some_text, full_text);
+  else
+    // xgettext: share of time tasks were stalled, e.g.: "Pressure: some 1.4%"
+    text = g_strdup_printf (_("Pressure: some %s"), some_text);
+  gtk_label_set_text (graph->labels.pressure, text);
+
+  if (show_full && now.full.present)
+    // xgettext: %s is the resource (memory, CPU or disk I/O); the averages are percent, from the kernel
+    tooltip = g_strdup_printf (_("Share of the last refresh in which tasks were stalled waiting for %s "
+                                 "(some: at least one task; full: all non-idle tasks).\n"
+                                 "Kernel 10 s average: some %.2f%%, full %.2f%%"),
+                               resource, now.some.avg10, now.full.avg10);
+  else
+    // xgettext: %s is the resource (memory, CPU or disk I/O); the average is percent, from the kernel
+    tooltip = g_strdup_printf (_("Share of the last refresh in which tasks were stalled waiting for %s "
+                                 "(some: at least one task).\n"
+                                 "Kernel 10 s average: some %.2f%%"),
+                               resource, now.some.avg10);
+  gtk_widget_set_tooltip_text (GTK_WIDGET (graph->labels.pressure), tooltip);
+
+  g_free (some_text);
+  g_free (full_text);
+  g_free (text);
+  g_free (tooltip);
+}
+
 static void
 get_load (LoadGraph *graph)
 {
@@ -529,6 +618,8 @@ get_load (LoadGraph *graph)
   }
 
   graph->cpu.now ^= 1;
+
+  update_pressure_label (graph, "/proc/pressure/cpu", _("CPU"), false);
 }
 
 static void
@@ -648,6 +739,7 @@ get_memory (LoadGraph *graph)
     graph->data[0][0] = graph->translate_to_log_partial_if_needed (mempercent);
     graph->data[0][1] = swap.total > 0 ? graph->translate_to_log_partial_if_needed (swappercent) : -1.0;
   }
+  update_pressure_label (graph, "/proc/pressure/memory", _("memory"), true);
 }
 
 /* Nice Numbers for Graph Labels after Paul Heckbert
@@ -943,6 +1035,7 @@ get_disk (LoadGraph *graph)
                             FALSE, FALSE, graph->labels.disk_read, graph->labels.disk_write,
                             graph->labels.disk_read_total, graph->labels.disk_write_total);
   }
+  update_pressure_label (graph, "/proc/pressure/io", _("disk I/O"), true);
 }
 
 static void
@@ -1100,12 +1193,14 @@ LoadGraph::LoadGraph(guint type)
         for (guint i = 0; i < G_N_ELEMENTS (labels.cpu); ++i)
           labels.cpu[i] = make_tnum_label ();
 
+        labels.pressure = init_tnum_label (0, GTK_ALIGN_START);
         break;
 
       case LOAD_GRAPH_MEM:
         n = 2;
         labels.memory = init_tnum_label (10, GTK_ALIGN_START);
         labels.swap = init_tnum_label (10, GTK_ALIGN_START);
+        labels.pressure = init_tnum_label (0, GTK_ALIGN_START);
         break;
 
       case LOAD_GRAPH_NET:
@@ -1126,6 +1221,7 @@ LoadGraph::LoadGraph(guint type)
         labels.disk_read_total = init_tnum_label (16, GTK_ALIGN_END);
         labels.disk_write = init_tnum_label (10, GTK_ALIGN_END);
         labels.disk_write_total = init_tnum_label (10, GTK_ALIGN_END);
+        labels.pressure = init_tnum_label (0, GTK_ALIGN_START);
         break;
 
       case LOAD_GRAPH_GPU:

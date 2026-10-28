@@ -236,6 +236,17 @@ cb_gpu_mem_color_changed (GsmColorButton *cp,
   change_settings_color (*app->settings.operator-> (), GSM_SETTING_GPU_MEM_COLOR, cp);
 }
 
+/* The "Pressure" line sits under a graph's figures, indented like them. */
+static void
+append_pressure_label (GtkBox   *graph_box,
+                       GtkLabel *pressure,
+                       gint      margin_start)
+{
+  gtk_widget_set_margin_start (GTK_WIDGET (pressure), margin_start);
+  gtk_widget_add_css_class (GTK_WIDGET (pressure), "dim-label");
+  gtk_box_append (graph_box, GTK_WIDGET (pressure));
+}
+
 static void
 create_sys_view (GsmApplication *app,
                   GtkBuilder     *builder)
@@ -309,6 +320,9 @@ create_sys_view (GsmApplication *app,
       gtk_box_append (temp_hbox, GTK_WIDGET (label));
       g_free (label_text);
 
+      std::string cpu_tooltip = get_cpu_core_tooltip (i, app->config.num_cpus);
+      gtk_widget_set_tooltip_text (GTK_WIDGET (temp_hbox), cpu_tooltip.c_str ());
+
       cpu_label = make_tnum_label ();
 
       /* Reserve some space to avoid the layout changing with the values. */
@@ -317,6 +331,7 @@ create_sys_view (GsmApplication *app,
       load_graph_get_labels (cpu_graph)->cpu[i] = cpu_label;
     }
 
+  append_pressure_label (cpu_graph_box, load_graph_get_labels (cpu_graph)->pressure, 21);
   app->cpu_graph = cpu_graph;
 
   /** The memory box */
@@ -357,6 +372,7 @@ create_sys_view (GsmApplication *app,
   gtk_grid_attach_next_to (table, GTK_WIDGET (color_picker), GTK_WIDGET (label), GTK_POS_LEFT, 1, 3);
   gtk_grid_attach_next_to (table, GTK_WIDGET (load_graph_get_labels (mem_graph)->swap), GTK_WIDGET (label), GTK_POS_BOTTOM, 1, 2);
 
+  append_pressure_label (mem_graph_box, load_graph_get_labels (mem_graph)->pressure, 54);
   app->mem_graph = mem_graph;
 
   /* The net box */
@@ -465,6 +481,7 @@ create_sys_view (GsmApplication *app,
   gtk_widget_set_hexpand (GTK_WIDGET (load_graph_get_labels (disk_graph)->disk_write), true);
   gtk_widget_set_halign (GTK_WIDGET (load_graph_get_labels (disk_graph)->disk_write), GTK_ALIGN_START);
 
+  append_pressure_label (disk_graph_box, load_graph_get_labels (disk_graph)->pressure, 54);
   app->disk_graph = disk_graph;
 
   /* The GPU box */
