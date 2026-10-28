@@ -14,6 +14,7 @@
 
 #include "application.h"
 #include "load-graph.h"
+#include "meminfo.h"
 #include "util.h"
 #include "legacy/gsm_color_button.h"
 
@@ -534,19 +535,15 @@ static void
 set_memory_label_and_picker (GtkLabel       *label,
                              GsmColorButton *picker,
                              guint64         used,
-                             guint64         cached,
                              guint64         total,
-                             double          percent)
+                             double          percent,
+                             const char     *details)
 {
   char *used_text;
-  char *cached_text;
-  char *cached_label;
   char *total_text;
   char *text;
-  char *tmp_text;
 
   used_text = format_byte_size (used, GsmApplication::get ().config.resources_memory_in_iec);
-  cached_text = format_byte_size (cached, GsmApplication::get ().config.resources_memory_in_iec);
   total_text = format_byte_size (total, GsmApplication::get ().config.resources_memory_in_iec);
   if (total == 0)
     {
@@ -557,12 +554,9 @@ set_memory_label_and_picker (GtkLabel       *label,
       // xgettext: "540MiB (53 %) of 1.0 GiB" or "540MB (53 %) of 1.0 GB"
       text = g_strdup_printf (_("%s (%.1f%%) of %s"), used_text, 100.0 * percent, total_text);
 
-      if (cached != 0)
+      if (details != NULL)
         {
-          // xgettext: Used cache string, e.g.: "Cache 2.4GiB" or "Cache 2.4GB"
-          cached_label = g_strdup_printf (_("Cache %s"), cached_text);
-          tmp_text = g_strdup_printf ("%s\n%s", text, cached_label);
-          g_free (cached_label);
+          char *tmp_text = g_strdup_printf ("%s\n%s", text, details);
           g_free (text);
           text = tmp_text;
         }
@@ -570,12 +564,54 @@ set_memory_label_and_picker (GtkLabel       *label,
 
   gtk_label_set_text (label, text);
   g_free (used_text);
-  g_free (cached_text);
   g_free (total_text);
   g_free (text);
 
   if (picker)
     gsm_color_button_set_fraction (picker, percent);
+}
+
+/* A meminfo field as text, or "—" when the kernel did not report it
+ * (invariant 1: unknown is never 0). */
+static char *
+format_meminfo_bytes (guint64 bytes)
+{
+  if (bytes == GSM_MEMINFO_MISSING)
+    return g_strdup ("—");
+  return format_byte_size (bytes, GsmApplication::get ().config.resources_memory_in_iec);
+}
+
+/* The lines under "Used": Available, RAM-backed files and File cache, all
+ * from one read of /proc/meminfo (see meminfo.h for the partition). */
+static char *
+build_memory_details (void)
+{
+  GsmMemInfo info;
+  GsmMemPartition partition;
+
+  gsm_meminfo_read (&info);
+  gsm_meminfo_partition (&info, &partition);
+
+  char *available = format_meminfo_bytes (info.mem_available_bytes);
+  char *ram_backed = format_meminfo_bytes (partition.valid ? partition.ram_backed_files_bytes : GSM_MEMINFO_MISSING);
+  char *file_cache = format_meminfo_bytes (partition.valid ? partition.file_cache_bytes : GSM_MEMINFO_MISSING);
+
+  // xgettext: Memory the kernel estimates it can hand out without swapping, e.g.: "Available 2.4GiB"
+  char *available_line = g_strdup_printf (_("Available %s"), available);
+  // xgettext: tmpfs and shared memory, which only swap can release, e.g.: "RAM-backed files 2.4GiB (not reclaimable without swap)"
+  char *ram_backed_line = g_strdup_printf (_("RAM-backed files %s (not reclaimable without swap)"), ram_backed);
+  // xgettext: Page cache that the kernel can drop when needed, e.g.: "File cache 2.4GiB"
+  char *file_cache_line = g_strdup_printf (_("File cache %s"), file_cache);
+
+  char *text = g_strdup_printf ("%s\n%s\n%s", available_line, ram_backed_line, file_cache_line);
+
+  g_free (available);
+  g_free (ram_backed);
+  g_free (file_cache);
+  g_free (available_line);
+  g_free (ram_backed_line);
+  g_free (file_cache_line);
+  return text;
 }
 
 static void
@@ -592,13 +628,19 @@ get_memory (LoadGraph *graph)
   /* There's no swap on LiveCD : 0.0f is better than NaN :) */
   swappercent = (swap.total ? (float)swap.used / (float)swap.total : 0.0f);
   mempercent = (float)mem.user / (float)mem.total;
+
+  /* "Used" is MemTotal - MemAvailable (libgtop mem.user); the other figures
+   * come from meminfo.c, never from libgtop's Cached + Slab, which counted
+   * tmpfs as cache. */
+  char *details = build_memory_details ();
   set_memory_label_and_picker (GTK_LABEL (graph->labels.memory),
                                GSM_COLOR_BUTTON (graph->mem_color_picker),
-                               mem.user, mem.cached, mem.total, mempercent);
+                               mem.user, mem.total, mempercent, details);
+  g_free (details);
 
   set_memory_label_and_picker (GTK_LABEL (graph->labels.swap),
                                GSM_COLOR_BUTTON (graph->swap_color_picker),
-                               swap.used, 0, swap.total, swappercent);
+                               swap.used, swap.total, swappercent, NULL);
 
   gtk_widget_set_sensitive (GTK_WIDGET (graph->swap_color_picker), swap.total > 0);
 

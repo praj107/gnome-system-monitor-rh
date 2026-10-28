@@ -32,8 +32,13 @@ struct MutableProcInfo
     pcpu (0),
     nice (0),
     num_threads (0U),
+    io_readable (false),
+    io_rate_valid (false),
+    io_sample_us (0),
     gpu_percent (0.0),
-    gpu_mem (0UL)
+    gpu_mem (0UL),
+    gpu_percent_known (false),
+    gpu_mem_known (false)
   {
   }
 
@@ -61,8 +66,17 @@ struct MutableProcInfo
   gdouble pcpu;
   gint nice;
   guint num_threads;
+  // /proc/<pid>/io is readable only for the user's own processes; an
+  // unreadable value is unknown and shown as such, never as 0.
+  bool io_readable;
+  // a rate needs two readable samples: the first one has none
+  bool io_rate_valid;
+  gint64 io_sample_us; // g_get_monotonic_time () of the last readable sample
   gdouble gpu_percent;
   gulong gpu_mem;
+  // unknown unless the GPU query reported the process
+  bool gpu_percent_known;
+  bool gpu_mem_known;
   std::string cgroup_name;
 
   std::string unit;

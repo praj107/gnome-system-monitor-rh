@@ -17,6 +17,7 @@ system_monitor_sources = [
   'load-graph.cpp',
   'lsof.cpp',
   'mem-map.c',
+  'meminfo.c',
   'memmaps.cpp',
   'open-file.cpp',
   'openfiles.cpp',
@@ -132,6 +133,18 @@ libgsm_dep = declare_dependency(
   dependencies: system_monitor_dependencies,
   include_directories: rootInclude,
   link_with: libgsm,
+)
+
+test(
+  'meminfo',
+  executable(
+    'test-meminfo',
+    ['meminfo.c', 'tests/test-meminfo.c'],
+    include_directories: rootInclude,
+    dependencies: [glib],
+  ),
+  args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
 )
 
 executable('gnome-system-monitor-rh',

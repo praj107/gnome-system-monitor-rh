@@ -19,6 +19,8 @@
 
 #include "util.h"
 #include "application.h"
+#include "procinfo.h"
+#include "proctable.h"
 
 extern "C" {
 #include "legacy/e_date.h"
@@ -449,6 +451,72 @@ size_na_cell_data_func (GtkTreeViewColumn *,
   g_free (str);
 }
 
+static const char *const UNKNOWN_FIGURE = "—";
+
+static ProcInfo *
+proc_info_of_row (GtkTreeModel *model,
+                  GtkTreeIter  *iter)
+{
+  gpointer info = NULL;
+
+  gtk_tree_model_get (model, iter, COL_POINTER, &info, -1);
+  return static_cast<ProcInfo *>(info);
+}
+
+/* Disk totals: "—" when /proc/PID/io was unreadable for the process. */
+void
+io_total_cell_data_func (GtkTreeViewColumn *col,
+                         GtkCellRenderer   *renderer,
+                         GtkTreeModel      *model,
+                         GtkTreeIter       *iter,
+                         gpointer           user_data)
+{
+  const ProcInfo *info = proc_info_of_row (model, iter);
+
+  if (info != NULL && !info->io_readable)
+    {
+      g_object_set (renderer, "text", UNKNOWN_FIGURE, NULL);
+      return;
+    }
+  size_na_cell_data_func (col, renderer, model, iter, user_data);
+}
+
+/* GPU memory: "—" unless the nvidia-smi query reported the process. */
+void
+gpu_memory_cell_data_func (GtkTreeViewColumn *col,
+                           GtkCellRenderer   *renderer,
+                           GtkTreeModel      *model,
+                           GtkTreeIter       *iter,
+                           gpointer           user_data)
+{
+  const ProcInfo *info = proc_info_of_row (model, iter);
+
+  if (info != NULL && !info->gpu_mem_known)
+    {
+      g_object_set (renderer, "text", UNKNOWN_FIGURE, NULL);
+      return;
+    }
+  size_na_cell_data_func (col, renderer, model, iter, user_data);
+}
+
+/* GPU utilisation: "—" unless a source reported it for the process. */
+void
+gpu_percentage_cell_data_func (GtkTreeViewColumn *col,
+                               GtkCellRenderer   *renderer,
+                               GtkTreeModel      *model,
+                               GtkTreeIter       *iter,
+                               gpointer           user_data)
+{
+  const ProcInfo *info = proc_info_of_row (model, iter);
+
+  if (info != NULL && !info->gpu_percent_known)
+    {
+      g_object_set (renderer, "text", UNKNOWN_FIGURE, NULL);
+      return;
+    }
+  percentage_cell_data_func (col, renderer, model, iter, user_data);
+}
+
 void
 io_rate_cell_data_func (GtkTreeViewColumn *,
                         GtkCellRenderer *renderer,
@@ -457,6 +525,14 @@ io_rate_cell_data_func (GtkTreeViewColumn *,
                         gpointer         user_data)
 {
   const guint index = GPOINTER_TO_UINT (user_data);
+
+  /* Unreadable, or a first sample: no rate yet, shown as "—". */
+  const ProcInfo *info = proc_info_of_row (model, iter);
+  if (info != NULL && !(info->io_readable && info->io_rate_valid))
+    {
+      g_object_set (renderer, "text", UNKNOWN_FIGURE, NULL);
+      return;
+    }
 
   guint64 size;
   GValue value = G_VALUE_INIT;

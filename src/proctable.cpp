@@ -354,7 +354,7 @@ proctable_new (GsmApplication * const app)
     N_("ID"),
     N_("Security Context"),
     N_("Command Line"),
-    N_("Memory"),
+    N_("Private (anon)"),
     /* xgettext: combined noun, the function the process is waiting in, see wchan ps(1) */
     N_("Waiting Channel"),
     N_("Control Group"),
@@ -491,6 +491,8 @@ proctable_new (GsmApplication * const app)
           gtk_box_append (GTK_BOX (box), title_label);
           gtk_box_append (GTK_BOX (box), value_label);
           gtk_tree_view_column_set_widget (col, box);
+          if (i == COL_MEM)
+            gtk_widget_set_tooltip_text (box, _("Anonymous memory private to the process (RssAnon in /proc/PID/status): heap, stacks and private mappings. Excludes file-backed and shared pages."));
           break;
         default:
           /* Don't insert a second label */
@@ -509,17 +511,29 @@ proctable_new (GsmApplication * const app)
           case COL_MEMRES:
           case COL_MEMSHARED:
           case COL_MEM:
-          case COL_GPU_MEM:
             gtk_tree_view_column_set_cell_data_func (col, cell,
                                                      &procman::size_na_cell_data_func,
                                                      GUINT_TO_POINTER (i),
                                                      NULL);
             break;
 
+          case COL_GPU_MEM:
+            gtk_tree_view_column_set_cell_data_func (col, cell,
+                                                     &procman::gpu_memory_cell_data_func,
+                                                     GUINT_TO_POINTER (i),
+                                                     NULL);
+            break;
+
           case COL_CPU:
-          case COL_GPU:
             gtk_tree_view_column_set_cell_data_func (col, cell,
                                                      &procman::percentage_cell_data_func,
+                                                     GUINT_TO_POINTER (i),
+                                                     NULL);
+            break;
+
+          case COL_GPU:
+            gtk_tree_view_column_set_cell_data_func (col, cell,
+                                                     &procman::gpu_percentage_cell_data_func,
                                                      GUINT_TO_POINTER (i),
                                                      NULL);
             break;
@@ -548,7 +562,7 @@ proctable_new (GsmApplication * const app)
           case COL_DISK_READ_TOTAL:
           case COL_DISK_WRITE_TOTAL:
             gtk_tree_view_column_set_cell_data_func (col, cell,
-                                                     &procman::size_na_cell_data_func,
+                                                     &procman::io_total_cell_data_func,
                                                      GUINT_TO_POINTER (i),
                                                      NULL);
             break;
@@ -979,7 +993,9 @@ get_process_type (ProcInfo *info)
   return _("User");
 }
 
-static std::map<pid_t, std::pair<gdouble, gulong>> gpu_process_usage;
+// pid -> bytes of GPU memory, from nvidia-smi --query-compute-apps. Empty when
+// the command is absent or fails: every process then shows "—".
+static std::map<pid_t, gulong> gpu_process_usage;
 
 static gchar *
 get_nvidia_smi_path (void)
@@ -991,20 +1007,20 @@ get_nvidia_smi_path (void)
 }
 
 static void
-update_gpu_process_usage (std::map<pid_t, std::pair<gdouble, gulong>> &usage)
+update_gpu_process_usage (std::map<pid_t, gulong> &usage)
 {
+  usage.clear ();
+
   gchar *nvidia_smi = get_nvidia_smi_path ();
   if (!nvidia_smi)
     return;
-
-  usage.clear ();
 
   gchar *stdout_str = NULL;
   gchar *stderr_str = NULL;
   gint exit_status = 0;
   GError *error = NULL;
 
-  gchar *command = g_strdup_printf ("%s --query-compute-apps=pid,used_gpu_memory,utilization.gpu --format=csv,noheader,nounits",
+  gchar *command = g_strdup_printf ("%s --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits",
                                     nvidia_smi);
 
   if (!g_spawn_command_line_sync (command, &stdout_str, &stderr_str, &exit_status, &error))
@@ -1033,13 +1049,13 @@ update_gpu_process_usage (std::map<pid_t, std::pair<gdouble, gulong>> &usage)
       if (len >= 2)
         {
           pid_t pid = (pid_t) g_ascii_strtoll (g_strstrip (parts[0]), NULL, 10);
-          gulong mem = (gulong) g_ascii_strtoull (g_strstrip (parts[1]), NULL, 10);
-          mem *= 1024ULL * 1024ULL; // MiB -> bytes
-          gdouble percent = 0.0;
-          if (len >= 3)
-            percent = g_strtod (g_strstrip (parts[2]), NULL);
+          gchar *mem_text = g_strstrip (parts[1]);
+          gchar *mem_end = NULL;
+          gulong mem = (gulong) g_ascii_strtoull (mem_text, &mem_end, 10);
 
-          usage[pid] = std::make_pair (percent, mem);
+          // "[N/A]" or an empty field is unknown, not 0 MiB
+          if (mem_end != mem_text)
+            usage[pid] = mem * 1024ULL * 1024ULL; // MiB -> bytes
         }
       g_strfreev (parts);
     }
@@ -1047,6 +1063,48 @@ update_gpu_process_usage (std::map<pid_t, std::pair<gdouble, gulong>> &usage)
   g_strfreev (lines);
   g_free (stdout_str);
   g_free (stderr_str);
+}
+
+/* Disk I/O from /proc/<pid>/io. libgtop leaves the "disk_*bytes" flags
+ * unset when the file cannot be read (EACCES for other users' processes,
+ * ESRCH for one that just exited): that is unknown, not 0. Rates use the
+ * measured time between two readable samples. */
+static void
+update_disk_io (ProcInfo             *info,
+                const glibtop_proc_io &procio)
+{
+  const guint64 needed_flags = (1ULL << GLIBTOP_PROC_IO_DISK_RBYTES) | (1ULL << GLIBTOP_PROC_IO_DISK_WBYTES);
+  const bool readable = (procio.flags & needed_flags) == needed_flags;
+
+  if (!readable)
+    {
+      info->io_readable = false;
+      info->io_rate_valid = false;
+      info->disk_read_bytes_total = info->disk_write_bytes_total = 0;
+      info->disk_read_bytes_current = info->disk_write_bytes_current = 0;
+      return;
+    }
+
+  const gint64 now_us = g_get_monotonic_time ();
+  const gint64 elapsed_us = now_us - info->io_sample_us;
+
+  info->io_rate_valid = info->io_readable && elapsed_us > 0
+                        && procio.disk_rbytes >= info->disk_read_bytes_total
+                        && procio.disk_wbytes >= info->disk_write_bytes_total;
+  if (info->io_rate_valid)
+    {
+      info->disk_read_bytes_current = (procio.disk_rbytes - info->disk_read_bytes_total) * G_USEC_PER_SEC / elapsed_us;
+      info->disk_write_bytes_current = (procio.disk_wbytes - info->disk_write_bytes_total) * G_USEC_PER_SEC / elapsed_us;
+    }
+  else
+    {
+      info->disk_read_bytes_current = info->disk_write_bytes_current = 0;
+    }
+
+  info->io_readable = true;
+  info->io_sample_us = now_us;
+  info->disk_read_bytes_total = procio.disk_rbytes;
+  info->disk_write_bytes_total = procio.disk_wbytes;
 }
 
 static void
@@ -1058,7 +1116,6 @@ update_info (GsmApplication *app,
   glibtop_proc_time proctime;
   glibtop_proc_kernel prockernel;
   glibtop_proc_io procio;
-  gdouble update_interval_seconds = app->config.update_interval / 1000;
 
   glibtop_get_proc_kernel (&prockernel, info->pid);
   info->wchan = get_proc_kernel_wchan (prockernel);
@@ -1092,11 +1149,7 @@ update_info (GsmApplication *app,
   app->processes.cpu_times[info->pid] = info->cpu_time = proctime.rtime;
   info->nice = procuid.nice;
 
-  info->disk_write_bytes_current = (procio.disk_wbytes - info->disk_write_bytes_total) / update_interval_seconds;
-  info->disk_read_bytes_current = (procio.disk_rbytes - info->disk_read_bytes_total) / update_interval_seconds;
-
-  info->disk_write_bytes_total = procio.disk_wbytes;
-  info->disk_read_bytes_total = procio.disk_rbytes;
+  update_disk_io (info, procio);
 
   // set the ppid only if one can exist
   // i.e. pid=0 can never have a parent
@@ -1112,17 +1165,14 @@ update_info (GsmApplication *app,
   info->num_threads = get_process_thread_count (info->pid);
   info->process_type = get_process_type (info);
 
+  // nvidia-smi's compute-apps query has no per-process utilisation, so the
+  // percentage is always unknown here; memory is known only for processes
+  // the query reported (a process absent from it is "not reported", not 0).
+  info->gpu_percent = 0.0;
+  info->gpu_percent_known = false;
   auto gpu_it = gpu_process_usage.find (info->pid);
-  if (gpu_it != gpu_process_usage.end ())
-    {
-      info->gpu_percent = gpu_it->second.first;
-      info->gpu_mem = gpu_it->second.second;
-    }
-  else
-    {
-      info->gpu_percent = 0.0;
-      info->gpu_mem = 0;
-    }
+  info->gpu_mem_known = gpu_it != gpu_process_usage.end ();
+  info->gpu_mem = info->gpu_mem_known ? gpu_it->second : 0;
 }
 
 
@@ -1141,7 +1191,9 @@ proctable_refresh_summary_headers(GsmApplication * app)
   uint64_t total_disk_write_bytes_total = 0;
   uint64_t total_disk_read_bytes_current = 0;
   uint64_t total_disk_write_bytes_current = 0;
-  double total_gpu = 0;
+  // Only rows whose /proc/PID/io was readable add to the disk totals.
+  guint io_readable_count = 0;
+  guint process_count = 0;
   uint64_t total_gpu_mem = 0;
   std::function<void(GtkTreeIter&)> calc_summary;
   GtkTreeView *treeview = GTK_TREE_VIEW (app->tree);
@@ -1164,6 +1216,15 @@ proctable_refresh_summary_headers(GsmApplication * app)
       app->config.process_memory_in_iec ? G_FORMAT_SIZE_IEC_UNITS : G_FORMAT_SIZE_DEFAULT;
 
     return make_string (g_format_size_full (bytes, flags));
+  };
+
+  // Helper: "1.2 GiB (45/300)"; the sum covers the readable rows only, and the
+  // column tooltip spells it out ("45 of 300 readable")
+  auto with_readable_count = [&io_readable_count, &process_count](const std::string &value) -> std::string
+  {
+    // Translators: sum, then readable processes / all processes, under a Disk column heading, e.g.: "1.2 GiB (45/300)"
+    return make_string (g_strdup_printf (_("%s (%u/%u)"),
+                                         value.c_str (), io_readable_count, process_count));
   };
 
   // Helper: get second label from column header
@@ -1198,7 +1259,8 @@ proctable_refresh_summary_headers(GsmApplication * app)
                   &total_disk_write_bytes_total,
                   &total_disk_read_bytes_current,
                   &total_disk_write_bytes_current,
-                  &total_gpu,
+                  &io_readable_count,
+                  &process_count,
                   &total_gpu_mem,
                   &calc_summary](GtkTreeIter &iter)
   {
@@ -1217,12 +1279,17 @@ proctable_refresh_summary_headers(GsmApplication * app)
     total_vmsize += proc->vmsize;
     total_memshared += proc->memshared;
     total_memwritable += proc->memwritable;
-    total_disk_read_bytes_total += proc->disk_read_bytes_total;
-    total_disk_write_bytes_total += proc->disk_write_bytes_total;
-    total_disk_read_bytes_current += proc->disk_read_bytes_current;
-    total_disk_write_bytes_current += proc->disk_write_bytes_current;
-    total_gpu += proc->gpu_percent;
-    total_gpu_mem += proc->gpu_mem;
+    process_count++;
+    if (proc->io_readable)
+      {
+        io_readable_count++;
+        total_disk_read_bytes_total += proc->disk_read_bytes_total;
+        total_disk_write_bytes_total += proc->disk_write_bytes_total;
+        total_disk_read_bytes_current += proc->disk_read_bytes_current;
+        total_disk_write_bytes_current += proc->disk_write_bytes_current;
+      }
+    if (proc->gpu_mem_known)
+      total_gpu_mem += proc->gpu_mem;
 
     // child
     if (gtk_tree_model_iter_has_child(model, &iter)) {
@@ -1276,25 +1343,19 @@ proctable_refresh_summary_headers(GsmApplication * app)
       v_str = format_bytes(total_memshared);
       break;
     case COL_DISK_READ_TOTAL:
-      v_str = format_bytes(total_disk_read_bytes_total);
+      v_str = with_readable_count (format_bytes (total_disk_read_bytes_total));
       break;
     case COL_DISK_WRITE_TOTAL:
-      v_str = format_bytes(total_disk_write_bytes_total);
+      v_str = with_readable_count (format_bytes (total_disk_write_bytes_total));
       break;
     case COL_DISK_READ_CURRENT:
-      v_str = format_bytes(total_disk_read_bytes_current);
-      if (!v_str.empty()) {
-            v_str = v_str + "/s";
-      }
+      v_str = with_readable_count (format_bytes (total_disk_read_bytes_current) + "/s");
       break;
     case COL_DISK_WRITE_CURRENT:
-      v_str = format_bytes(total_disk_write_bytes_current);
-      if (!v_str.empty()) {
-            v_str = v_str + "/s";
-      }
+      v_str = with_readable_count (format_bytes (total_disk_write_bytes_current) + "/s");
       break;
     case COL_GPU:
-      v_str = make_string (g_strdup_printf ("%.01f%%", total_gpu));
+      v_str = "—";
       break;
     case COL_GPU_MEM:
       v_str = format_bytes(total_gpu_mem);
@@ -1303,6 +1364,16 @@ proctable_refresh_summary_headers(GsmApplication * app)
       v_str = "";
     }
     gtk_label_set_text(label, v_str.c_str());
+
+    if (column_id == COL_DISK_READ_TOTAL || column_id == COL_DISK_WRITE_TOTAL
+        || column_id == COL_DISK_READ_CURRENT || column_id == COL_DISK_WRITE_CURRENT)
+      {
+        // Translators: tooltip of a Disk column heading, e.g.: "Sum over the 45 of 300 readable processes. /proc/PID/io is readable only for your own processes; the others show — (unknown), not 0."
+        char *tip = g_strdup_printf (_("Sum over the %u of %u readable processes. /proc/PID/io is readable only for your own processes; the others show — (unknown), not 0."),
+                                     io_readable_count, process_count);
+        gtk_widget_set_tooltip_text (gtk_widget_get_parent (GTK_WIDGET (label)), tip);
+        g_free (tip);
+      }
   }
   g_list_free(columns);
 }

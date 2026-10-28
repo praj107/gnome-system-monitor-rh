@@ -65,6 +65,24 @@ void                     size_cell_data_func (GtkTreeViewColumn *col,
                                               GtkTreeIter       *iter,
                                               gpointer           user_data);
 
+void io_total_cell_data_func (GtkTreeViewColumn *col,
+                              GtkCellRenderer   *renderer,
+                              GtkTreeModel      *model,
+                              GtkTreeIter       *iter,
+                              gpointer           user_data);
+
+void gpu_memory_cell_data_func (GtkTreeViewColumn *col,
+                                GtkCellRenderer   *renderer,
+                                GtkTreeModel      *model,
+                                GtkTreeIter       *iter,
+                                gpointer           user_data);
+
+void gpu_percentage_cell_data_func (GtkTreeViewColumn *col,
+                                    GtkCellRenderer   *renderer,
+                                    GtkTreeModel      *model,
+                                    GtkTreeIter       *iter,
+                                    gpointer           user_data);
+
 void io_rate_cell_data_func (GtkTreeViewColumn *col,
                              GtkCellRenderer   *renderer,
                              GtkTreeModel      *model,
