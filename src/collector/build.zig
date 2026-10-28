@@ -52,4 +52,30 @@ pub fn build(b: *std.Build) void {
     // The tests open testdata/ relative to the package root.
     run_tests.setCwd(b.path("."));
     b.step("test", "Run every test").dependOn(&run_tests.step);
+
+    // Optional: when the ztest runner is present at vendor/ztest (it is not
+    // part of this repository), `zig build ztest` runs the same tests under it,
+    // adding filtering, isolation, timeouts and reports. The tests are plain
+    // `test` blocks either way, so `zig build test` is always the full suite.
+    const ztest_runner = "vendor/ztest/src/runner.zig";
+    if (fileExists(b, ztest_runner)) {
+        const ztests = b.addTest(.{
+            .name = "gsmcollect-ztest",
+            .root_module = collector,
+            .filters = filters,
+            .test_runner = .{ .path = b.path(ztest_runner), .mode = .simple },
+        });
+        const run_ztests = b.addRunArtifact(ztests);
+        run_ztests.setCwd(b.path("."));
+        // With a custom runner the build system does not check the exit code
+        // itself, so inherit stdio: a failing suite then fails the step.
+        run_ztests.stdio = .inherit;
+        if (b.args) |args| run_ztests.addArgs(args);
+        b.step("ztest", "Run every test under the ztest runner in vendor/ztest").dependOn(&run_ztests.step);
+    }
+}
+
+fn fileExists(b: *std.Build, sub_path: []const u8) bool {
+    b.build_root.handle.access(b.graph.io, sub_path, .{}) catch return false;
+    return true;
 }

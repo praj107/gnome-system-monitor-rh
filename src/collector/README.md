@@ -146,6 +146,13 @@ zig-out/bin/gsmcollect-probe --cgroups [--cgroup-root DIR] [--under PATH] [--lis
 zig fmt --check .
 ```
 
+The tests are plain `test` blocks with `std.testing`, so `zig build test` is
+always the whole suite. When a checkout of the
+[ztest](https://github.com/praj107/ztest) runner is placed at
+`vendor/ztest` (it is not part of this repository), `zig build ztest` runs
+the same tests under it, with its filtering, isolation, timeouts and
+reports.
+
 ### Fuzzing
 
 Every parser and the walk has a `test "fuzz: ..."`. Zig 0.16.0's default test
