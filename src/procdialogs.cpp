@@ -43,23 +43,30 @@ struct ProcActionArgs {
 };
 
 
+/* The window a dialog should attach to: the active toplevel, or the main
+ * window when none is active (a compositor that reports no focus, or the
+ * action activated while another application has it). gtk_window_get_toplevels()
+ * returns GTK's own list, which the caller must not unref; unreffing it freed
+ * the list and the next window creation failed, then crashed. */
 static GtkWindow *
-get_active_window ()
+get_active_window (GsmApplication *app)
 {
   GListModel *toplevels = gtk_window_get_toplevels ();
-
   guint n_toplevels = g_list_model_get_n_items (toplevels);
+
   for (guint i = 0; i < n_toplevels; i++)
     {
       GtkWindow *window = GTK_WINDOW (g_list_model_get_item (toplevels, i));
+      gboolean active = gtk_window_is_active (window);
 
-      if (gtk_window_is_active (window))
+      /* The list keeps the window alive, so the returned pointer stays valid. */
+      g_object_unref (window);
+
+      if (active)
         return window;
     }
 
-  g_object_unref (toplevels);
-
-  return NULL;
+  return GTK_WINDOW (app->main_window);
 }
 
 static void
@@ -201,7 +208,7 @@ procdialog_create_kill_dialog (GsmApplication *app,
   cancellable = g_cancellable_new ();
 
   adw_alert_dialog_choose (ADW_ALERT_DIALOG (kill_alert_dialog),
-                           GTK_WIDGET (get_active_window ()),
+                           GTK_WIDGET (get_active_window (app)),
                            cancellable,
                            kill_dialog_choose,
                            kargs);

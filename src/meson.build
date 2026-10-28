@@ -222,11 +222,33 @@ test(
   protocol: 'tap',
 )
 
-executable('gnome-system-monitor-rh',
+gsm_app = executable('gnome-system-monitor-rh',
   ['main.cpp'],
   dependencies: libgsm_dep,
   install: true,
 )
+
+# Runs the application in a private headless Weston, so it only exists in a
+# developer build (the control socket it drives is compiled out otherwise) and
+# skips itself when Weston is missing.
+if get_option('dev_ipc')
+  python = find_program('python3', required: false)
+  glib_compile_schemas = find_program('glib-compile-schemas', required: false)
+  if python.found() and glib_compile_schemas.found()
+    test(
+      'headless-crashes',
+      python,
+      args: [
+        meson.current_source_dir() / 'tests' / 'test-headless-crashes.py',
+        gsm_app.full_path(),
+        meson.project_source_root() / 'tools' / 'gsm-dev-ctl',
+        meson.current_build_dir(),
+      ],
+      depends: [gsm_app, gsm_gsettings],
+      timeout: 180,
+    )
+  endif
+endif
 
 gnome.post_install(
   glib_compile_schemas: true,

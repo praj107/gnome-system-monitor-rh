@@ -27,7 +27,6 @@ struct _GsmDisksView {
   /* We don't actually use this from C,
    * but if we don't bind it it'll be disposed */
   GsmColumnViewPersister *persister;
-  GSignalGroup *root_signals;
   GSignalGroup *monitor_signals;
 
   int update_interval;
@@ -401,6 +400,10 @@ activate_disk (GtkColumnView *view, guint position, gpointer user_data)
 }
 
 
+static void gsm_disks_view_root (GtkWidget *widget);
+static void gsm_disks_view_unroot (GtkWidget *widget);
+
+
 static void
 gsm_disks_view_class_init (GsmDisksViewClass *klass)
 {
@@ -411,6 +414,8 @@ gsm_disks_view_class_init (GsmDisksViewClass *klass)
   object_class->get_property = gsm_disks_view_get_property;
   object_class->set_property = gsm_disks_view_set_property;
 
+  widget_class->root = gsm_disks_view_root;
+  widget_class->unroot = gsm_disks_view_unroot;
   widget_class->map = gsm_disks_view_map;
   widget_class->unmap = gsm_disks_view_unmap;
 
@@ -431,7 +436,6 @@ gsm_disks_view_class_init (GsmDisksViewClass *klass)
   gtk_widget_class_bind_template_child (widget_class, GsmDisksView, selection);
   gtk_widget_class_bind_template_child (widget_class, GsmDisksView, list_store);
   gtk_widget_class_bind_template_child (widget_class, GsmDisksView, persister);
-  gtk_widget_class_bind_template_child (widget_class, GsmDisksView, root_signals);
   gtk_widget_class_bind_template_child (widget_class, GsmDisksView, monitor_signals);
 
   gtk_widget_class_bind_template_callback (widget_class, format_size);
@@ -454,6 +458,42 @@ suspended_notified (GtkWindow                *window,
   } else if (gtk_widget_get_mapped (GTK_WIDGET (window))) {
     setup_timeout (self, FALSE);
   }
+}
+
+
+/* Follow the window's "suspended" state with a plain handler that is added
+ * in root() and removed in unroot(). A GSignalGroup whose target is the
+ * window cannot do this safely: when the window is torn down, GLib has
+ * already cleared the window's weak references by the time the group is
+ * finalised, so the group never removes its own weak notify and the window
+ * later calls it on freed memory (gtk_window_close then crashes in
+ * g_object_unref). */
+static void
+gsm_disks_view_root (GtkWidget *widget)
+{
+  GtkRoot *root;
+
+  GTK_WIDGET_CLASS (gsm_disks_view_parent_class)->root (widget);
+
+  root = gtk_widget_get_root (widget);
+  if (!GTK_IS_WINDOW (root))
+    return;
+
+  g_signal_connect_object (root, "notify::suspended",
+                           G_CALLBACK (suspended_notified), widget,
+                           G_CONNECT_DEFAULT);
+}
+
+
+static void
+gsm_disks_view_unroot (GtkWidget *widget)
+{
+  GtkRoot *root = gtk_widget_get_root (widget);
+
+  if (GTK_IS_WINDOW (root))
+    g_signal_handlers_disconnect_by_func (root, suspended_notified, widget);
+
+  GTK_WIDGET_CLASS (gsm_disks_view_parent_class)->unroot (widget);
 }
 
 
@@ -488,10 +528,6 @@ gsm_disks_view_init (GsmDisksView *self)
   g_settings_bind (self->settings, GSM_SETTING_SHOW_ALL_FS,
                    G_OBJECT (self), GSM_SETTING_SHOW_ALL_FS, G_SETTINGS_BIND_DEFAULT);
 
-  g_signal_group_connect (self->root_signals,
-                          "notify::suspended",
-                          G_CALLBACK (suspended_notified),
-                          self);
 }
 
 
