@@ -27,6 +27,11 @@ gnome-system-monitor-rh (50.0+rh.1) noble; urgency=medium
   * Network: the headline counts physical interfaces only, so traffic through
     bridges, container and VPN interfaces is no longer counted twice.
   * New --version option.
+  * GPU: NVIDIA figures come from NVML in-process instead of running
+    nvidia-smi every second, and a powered-down GPU is shown as such and not
+    woken to be asked. lscpu no longer runs at startup.
+  * Fixes a crash when closing the main window, and a crash when an action
+    dialog was opened while no window of the app was active.
   * New Health tab: storage wear and lifespan estimates from SMART data
     (udisks2 first, then a pkexec helper for what udisks cannot read), which
     processes write the most, battery wear, and an opt-in background sampler
@@ -39,4 +44,4 @@ gnome-system-monitor-rh (50.0+rh.1) noble; urgency=medium
     privileged helpers install under /usr, and the storage wear sampler's
     user unit under /usr/lib/systemd/user.
 
- -- Pranav <pranavrajput321@gmail.com>  Wed, 28 Oct 2026 20:09:31 +0800
+ -- Pranav <pranavrajput321@gmail.com>  Wed, 28 Oct 2026 22:07:02 +0800
