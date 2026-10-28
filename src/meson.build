@@ -21,6 +21,7 @@ system_monitor_sources = [
   'cputopology.c',
   'diskstats.c',
   'netif.c',
+  'nvml.c',
   'psi.c',
   'memmaps.cpp',
   'open-file.cpp',
@@ -111,6 +112,9 @@ gsm_gsettings = gnome.mkenums('org.gnome.gnome-system-monitor.enums.xml',
   install_dir: join_paths(get_option('datadir'), 'glib-2.0', 'schemas'),
 )
 
+# dlopen of the NVIDIA management library (a separate library before glibc 2.34)
+dl_dep = meson.get_compiler('c').find_library('dl', required: false)
+
 system_monitor_dependencies = [
   glibmm,
   giomm,
@@ -125,6 +129,7 @@ system_monitor_dependencies = [
   libgsm_selinux_dep,
   libgsm_cgroups_dep,
   libgsm_health_dep,
+  dl_dep,
 ]
 libgsm = static_library(
   'libgsm',
@@ -196,6 +201,24 @@ test(
     dependencies: [glib],
   ),
   args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
+)
+
+fake_nvml = shared_library(
+  'fake-nvml',
+  'tests/fake-nvml.c',
+)
+
+test(
+  'nvml',
+  executable(
+    'test-nvml',
+    ['nvml.c', 'tests/test-nvml.c'],
+    include_directories: rootInclude,
+    dependencies: [glib, dl_dep],
+  ),
+  args: [meson.current_source_dir() / 'tests' / 'fixtures', fake_nvml.full_path()],
+  depends: fake_nvml,
   protocol: 'tap',
 )
 

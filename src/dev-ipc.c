@@ -352,6 +352,15 @@ cmd_text (DevIpc *self)
 }
 
 
+static gboolean
+close_window_idle (G_GNUC_UNUSED gpointer user_data)
+{
+  /* Quit the application rather than destroy the window: destroying it runs
+   * the shutdown handler inside a widget teardown and segfaults in GObject. */
+  g_application_quit (g_application_get_default ());
+  return G_SOURCE_REMOVE;
+}
+
 static char *
 handle_command (DevIpc *self,
                 char   *line)
@@ -384,7 +393,9 @@ handle_command (DevIpc *self,
   if (g_strcmp0 (line, "text") == 0)
     return cmd_text (self);
   if (g_strcmp0 (line, "quit") == 0) {
-    gtk_window_close (self->window);
+    /* Closing destroys the window and the objects this handler's caller
+     * still uses to send the reply, so close from an idle callback. */
+    g_idle_add (close_window_idle, NULL);
     return g_strdup ("OK closing\n");
   }
 

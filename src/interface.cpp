@@ -41,6 +41,7 @@
 #include "openfiles.h"
 #include "procproperties.h"
 #include "load-graph.h"
+#include "nvml.h"
 #include "util.h"
 #include "dev-ipc.h"
 #include "disks.h"
@@ -485,8 +486,8 @@ create_sys_view (GsmApplication *app,
   app->disk_graph = disk_graph;
 
   /* The GPU box */
-  gchar *nvidia_smi = g_find_program_in_path ("nvidia-smi");
-  if (nvidia_smi)
+  const char *gpu_unavailable_reason = NULL;
+  if (gsm_nvml_available (gsm_nvml_default (), &gpu_unavailable_reason))
     {
       GtkBox *gpu_graph_box;
       GtkExpander *gpu_expander;
@@ -559,10 +560,10 @@ create_sys_view (GsmApplication *app,
       gtk_box_append (res_box, GTK_WIDGET (gpu_expander));
 
       app->gpu_graph = gpu_graph;
-      g_free (nvidia_smi);
     }
   else
     {
+      g_message ("GPU section hidden: %s", gpu_unavailable_reason);
       app->gpu_graph = NULL;
     }
 

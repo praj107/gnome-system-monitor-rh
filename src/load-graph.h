@@ -118,10 +118,6 @@ struct LoadGraph
     bool    have_last;
   } pressure;
 
-  struct GPU
-  {
-    gchar *nvidia_smi_path;
-  } gpu;
   /* }; */
 };
 

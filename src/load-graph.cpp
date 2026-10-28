@@ -16,6 +16,7 @@
 #include "load-graph.h"
 #include "meminfo.h"
 #include "netif.h"
+#include "nvml.h"
 #include "psi.h"
 #include "util.h"
 #include "legacy/gsm_color_button.h"
@@ -1044,72 +1045,61 @@ get_disk (LoadGraph *graph)
   update_pressure_label (graph, "/proc/pressure/io", _("disk I/O"), true);
 }
 
+/* The first NVIDIA GPU, through NVML and without waking it: a runtime-
+ * suspended GPU is shown as powered down and is not queried (see nvml.h). */
 static void
 get_gpu (LoadGraph *graph)
 {
-  if (!graph->gpu.nvidia_smi_path)
+  GsmNvml *nvml = gsm_nvml_default ();
+  GsmGpuDevice device;
+
+  if (gsm_nvml_device_count (nvml) == 0)
     return;
+  gsm_nvml_read_device (nvml, 0, &device);
 
-  gchar *stdout_str = NULL;
-  gchar *stderr_str = NULL;
-  gint exit_status = 0;
-  GError *error = NULL;
+  // -1 is the graph's "no data" marker: a figure that is not known is not drawn as 0
+  double util_fraction = -1.0;
+  double mem_fraction = -1.0;
+  g_autofree gchar *util_text = NULL;
+  g_autofree gchar *mem_text = NULL;
 
-  gchar *command = g_strdup_printf ("%s --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits",
-                                    graph->gpu.nvidia_smi_path);
-
-  if (!g_spawn_command_line_sync (command, &stdout_str, &stderr_str, &exit_status, &error))
+  if (device.state == GSM_GPU_STATE_POWERED_DOWN)
     {
-      g_warning ("Failed to run nvidia-smi: %s", error ? error->message : "unknown error");
-      g_clear_error (&error);
-      g_free (command);
-      return;
+      util_text = g_strdup (_("Powered down"));
+      mem_text = g_strdup (_("Powered down"));
     }
-
-  g_free (command);
-
-  if (exit_status != 0)
+  else
     {
-      g_free (stdout_str);
-      g_free (stderr_str);
-      return;
-    }
-
-  gchar **lines = g_strsplit (stdout_str, "\n", -1);
-  if (lines && lines[0] && lines[0][0] != '\0')
-    {
-      gchar **parts = g_strsplit_set (lines[0], ",", -1);
-      if (g_strv_length (parts) >= 3)
+      if (device.util_known)
         {
-          gdouble util = g_strtod (g_strstrip (parts[0]), NULL);
-          gdouble mem_used = g_strtod (g_strstrip (parts[1]), NULL);
-          gdouble mem_total = g_strtod (g_strstrip (parts[2]), NULL);
-          gdouble mem_percent = (mem_total > 0.0) ? mem_used / mem_total : 0.0;
-
-          gchar *text;
-
-          text = g_strdup_printf (_("%.1f%%"), util);
-          gtk_label_set_text (GTK_LABEL (graph->labels.gpu_util), text);
-          g_free (text);
-
-          guint64 mem_used_bytes = (guint64)mem_used * 1024ULL * 1024ULL;
-          g_autofree gchar *mem_str = g_format_size_full (mem_used_bytes, G_FORMAT_SIZE_IEC_UNITS);
-          text = g_strdup_printf (_("%s (%.1f%%)"), mem_str, mem_percent * 100.0);
-          gtk_label_set_text (GTK_LABEL (graph->labels.gpu_mem), text);
-          g_free (text);
-
-          if (graph->iteration != 1)
-            {
-              graph->data[0][0] = util / 100.0;
-              graph->data[0][1] = mem_percent;
-            }
+          util_text = g_strdup_printf (_("%u%%"), device.util_percent);
+          util_fraction = device.util_percent / 100.0;
         }
-      g_strfreev (parts);
+      else
+        util_text = g_strdup (_("—"));
+
+      if (device.mem_known && device.mem_total_bytes > 0)
+        {
+          mem_fraction = (double) device.mem_used_bytes / (double) device.mem_total_bytes;
+          g_autofree gchar *mem_str = g_format_size_full (device.mem_used_bytes, G_FORMAT_SIZE_IEC_UNITS);
+          mem_text = g_strdup_printf (_("%s (%.1f%%)"), mem_str, mem_fraction * 100.0);
+        }
+      else
+        mem_text = g_strdup (_("—"));
     }
 
-  g_strfreev (lines);
-  g_free (stdout_str);
-  g_free (stderr_str);
+  gtk_label_set_text (GTK_LABEL (graph->labels.gpu_util), util_text);
+  gtk_label_set_text (GTK_LABEL (graph->labels.gpu_mem), mem_text);
+  gtk_widget_set_tooltip_text (GTK_WIDGET (graph->labels.gpu_util),
+                               device.reason[0] != '\0' ? device.reason : NULL);
+  gtk_widget_set_tooltip_text (GTK_WIDGET (graph->labels.gpu_mem),
+                               device.reason[0] != '\0' ? device.reason : NULL);
+
+  if (graph->iteration != 1)
+    {
+      graph->data[0][0] = util_fraction;
+      graph->data[0][1] = mem_fraction;
+    }
 }
 
 int
@@ -1231,9 +1221,7 @@ LoadGraph::LoadGraph(guint type)
         break;
 
       case LOAD_GRAPH_GPU:
-        gpu = GPU {};
         n = 2;
-        gpu.nvidia_smi_path = g_find_program_in_path ("nvidia-smi");
         labels.gpu_util = init_tnum_label (10, GTK_ALIGN_START);
         labels.gpu_mem = init_tnum_label (10, GTK_ALIGN_START);
         break;
@@ -1310,9 +1298,6 @@ LoadGraph::LoadGraph(guint type)
 LoadGraph::~LoadGraph()
 {
   load_graph_stop (this);
-
-  if (type == LOAD_GRAPH_GPU && gpu.nvidia_smi_path)
-    g_free (gpu.nvidia_smi_path);
 }
 
 void

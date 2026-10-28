@@ -4,10 +4,10 @@
 #include <glibtop.h>
 #include <glibtop/close.h>
 #include <glibtop/cpu.h>
-#include <glibtop/sysinfo.h>
 #include <adwaita.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <glib.h>
 #include <sigc++/functors/functors.h>
 
@@ -333,7 +333,9 @@ GsmApplication::load_settings ()
   glibtop_get_cpu (&cpu);
   frequency = cpu.frequency;
 
-  config.num_cpus = glibtop_get_sysinfo ()->ncpu;  // or server->ncpu + 1
+  // Not glibtop_get_sysinfo (): it runs `lscpu` to fill in model names this
+  // program never shows. The online CPUs are the ones /proc/stat lists.
+  config.num_cpus = MAX (sysconf (_SC_NPROCESSORS_ONLN), 1);
 
   apply_cpu_color_settings (*this->settings.operator-> (), this);
 

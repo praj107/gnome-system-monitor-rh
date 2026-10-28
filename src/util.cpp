@@ -482,7 +482,7 @@ io_total_cell_data_func (GtkTreeViewColumn *col,
   size_na_cell_data_func (col, renderer, model, iter, user_data);
 }
 
-/* GPU memory: "—" unless the nvidia-smi query reported the process. */
+/* GPU memory: "—" unless NVML reported the process. */
 void
 gpu_memory_cell_data_func (GtkTreeViewColumn *col,
                            GtkCellRenderer   *renderer,

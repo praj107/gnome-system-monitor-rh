@@ -48,6 +48,7 @@
 #include "prettytable.h"
 #include "util.h"
 #include "interface.h"
+#include "nvml.h"
 #include "procinfo.h"
 #include "gsm-selinux.h"
 #include "settings-keys.h"
@@ -993,76 +994,34 @@ get_process_type (ProcInfo *info)
   return _("User");
 }
 
-// pid -> bytes of GPU memory, from nvidia-smi --query-compute-apps. Empty when
-// the command is absent or fails: every process then shows "—".
-static std::map<pid_t, gulong> gpu_process_usage;
-
-static gchar *
-get_nvidia_smi_path (void)
-{
-  static gchar *path = NULL;
-  if (!path)
-    path = g_find_program_in_path ("nvidia-smi");
-  return path;
-}
+// pid -> what NVML reports for it, refreshed once per process-list refresh.
+// Empty when no GPU could be asked (no NVML, or every GPU powered down):
+// every process then shows "—", and a runtime-suspended GPU is not woken.
+static std::map<pid_t, GsmGpuProcess> gpu_process_usage;
 
 static void
-update_gpu_process_usage (std::map<pid_t, gulong> &usage)
+update_gpu_process_usage (std::map<pid_t, GsmGpuProcess> &usage)
 {
   usage.clear ();
 
-  gchar *nvidia_smi = get_nvidia_smi_path ();
-  if (!nvidia_smi)
+  GsmNvml *nvml = gsm_nvml_default ();
+
+  if (!gsm_nvml_available (nvml, NULL))
     return;
 
-  gchar *stdout_str = NULL;
-  gchar *stderr_str = NULL;
-  gint exit_status = 0;
-  GError *error = NULL;
+  GHashTable *table = gsm_nvml_read_processes (nvml);
 
-  gchar *command = g_strdup_printf ("%s --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits",
-                                    nvidia_smi);
+  if (table == NULL)
+    return;
 
-  if (!g_spawn_command_line_sync (command, &stdout_str, &stderr_str, &exit_status, &error))
-    {
-      g_clear_error (&error);
-      g_free (command);
-      return;
-    }
-  g_free (command);
+  GHashTableIter iter;
+  gpointer key, value;
 
-  if (exit_status != 0)
-    {
-      g_free (stdout_str);
-      g_free (stderr_str);
-      return;
-    }
+  g_hash_table_iter_init (&iter, table);
+  while (g_hash_table_iter_next (&iter, &key, &value))
+    usage[(pid_t) GPOINTER_TO_UINT (key)] = *static_cast<GsmGpuProcess *> (value);
 
-  gchar **lines = g_strsplit (stdout_str, "\n", -1);
-  for (guint i = 0; lines && lines[i]; i++)
-    {
-      if (lines[i][0] == '\0')
-        continue;
-
-      gchar **parts = g_strsplit_set (lines[i], ",", -1);
-      guint len = g_strv_length (parts);
-      if (len >= 2)
-        {
-          pid_t pid = (pid_t) g_ascii_strtoll (g_strstrip (parts[0]), NULL, 10);
-          gchar *mem_text = g_strstrip (parts[1]);
-          gchar *mem_end = NULL;
-          gulong mem = (gulong) g_ascii_strtoull (mem_text, &mem_end, 10);
-
-          // "[N/A]" or an empty field is unknown, not 0 MiB
-          if (mem_end != mem_text)
-            usage[pid] = mem * 1024ULL * 1024ULL; // MiB -> bytes
-        }
-      g_strfreev (parts);
-    }
-
-  g_strfreev (lines);
-  g_free (stdout_str);
-  g_free (stderr_str);
+  g_hash_table_destroy (table);
 }
 
 /* Disk I/O from /proc/<pid>/io. libgtop leaves the "disk_*bytes" flags
@@ -1165,14 +1124,20 @@ update_info (GsmApplication *app,
   info->num_threads = get_process_thread_count (info->pid);
   info->process_type = get_process_type (info);
 
-  // nvidia-smi's compute-apps query has no per-process utilisation, so the
-  // percentage is always unknown here; memory is known only for processes
-  // the query reported (a process absent from it is "not reported", not 0).
+  // Each figure is known only when NVML reported it for this process; a
+  // process absent from NVML's lists is "not reported", not 0.
   info->gpu_percent = 0.0;
   info->gpu_percent_known = false;
+  info->gpu_mem = 0;
+  info->gpu_mem_known = false;
   auto gpu_it = gpu_process_usage.find (info->pid);
-  info->gpu_mem_known = gpu_it != gpu_process_usage.end ();
-  info->gpu_mem = info->gpu_mem_known ? gpu_it->second : 0;
+  if (gpu_it != gpu_process_usage.end ())
+    {
+      info->gpu_percent_known = gpu_it->second.util_known;
+      info->gpu_percent = gpu_it->second.util_known ? gpu_it->second.util_percent : 0.0;
+      info->gpu_mem_known = gpu_it->second.mem_known;
+      info->gpu_mem = gpu_it->second.mem_known ? gpu_it->second.mem_bytes : 0;
+    }
 }
 
 
