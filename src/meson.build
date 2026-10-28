@@ -19,6 +19,8 @@ system_monitor_sources = [
   'mem-map.c',
   'meminfo.c',
   'cputopology.c',
+  'diskstats.c',
+  'netif.c',
   'psi.c',
   'memmaps.cpp',
   'open-file.cpp',
@@ -154,6 +156,30 @@ test(
   executable(
     'test-cputopology',
     ['cputopology.c', 'tests/test-cputopology.c'],
+    include_directories: rootInclude,
+    dependencies: [glib],
+  ),
+  args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
+)
+
+test(
+  'diskstats',
+  executable(
+    'test-diskstats',
+    ['diskstats.c', 'tests/test-diskstats.c'],
+    include_directories: rootInclude,
+    dependencies: [glib],
+  ),
+  args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
+)
+
+test(
+  'netif',
+  executable(
+    'test-netif',
+    ['netif.c', 'tests/test-netif.c'],
     include_directories: rootInclude,
     dependencies: [glib],
   ),

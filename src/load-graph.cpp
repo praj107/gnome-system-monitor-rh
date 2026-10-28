@@ -6,15 +6,16 @@
 
 #include <glibtop.h>
 #include <glibtop/cpu.h>
-#include <glibtop/disk.h>
 #include <glibtop/mem.h>
 #include <glibtop/swap.h>
 #include <glibtop/netload.h>
 #include <glibtop/netlist.h>
 
 #include "application.h"
+#include "diskstats.h"
 #include "load-graph.h"
 #include "meminfo.h"
+#include "netif.h"
 #include "psi.h"
 #include "util.h"
 #include "legacy/gsm_color_button.h"
@@ -972,6 +973,13 @@ get_net (LoadGraph *graph)
   for (i = 0; i < netlist.number; ++i)
     {
       glibtop_netload netload;
+
+      /* Virtual interfaces (loopback, bridges, veth, tun/tap, VPN tunnels)
+         carry bytes that also cross a physical link; counting both doubles
+         them. */
+      if (!gsm_netif_is_physical ("/sys", ifnames[i]))
+        continue;
+
       glibtop_get_netload (&netload, ifnames[i]);
 
       if (netload.if_flags & (1 << GLIBTOP_IF_FLAGS_LOOPBACK))
@@ -1013,28 +1021,26 @@ get_net (LoadGraph *graph)
 static void
 get_disk (LoadGraph *graph)
 {
-  glibtop_disk disk;
-  gint32 i;
-  guint64 read = 0, write = 0;
+  GsmDiskTotals totals;
 
-  glibtop_get_disk (&disk);
-
-  for (i = 0; i < glibtop_global_server->ndisk; i++)
+  /* One read of /proc/diskstats, whole physical disks only. libgtop's
+     glibtop_get_disk runs lsblk through a shell pipeline on every call. */
+  if (gsm_diskstats_read ("/proc/diskstats", "/sys", &totals))
     {
-      read += disk.xdisk_sectors_read[i];
-      write += disk.xdisk_sectors_write[i];
+      /* These sectors are standard unix 512 byte sectors, already turned into
+         bytes. A disk appearing or vanishing changes the device-set hash, and
+         handle_dynamic_max_value then reports no rate for that interval
+         instead of a spike. */
+      if (graph->iteration != 1)
+        handle_dynamic_max_value (graph, &graph->disk.values, &graph->disk.max, &graph->disk.last_read,
+                                  &graph->disk.last_write, totals.read_bytes, totals.written_bytes,
+                                  &graph->disk.time, totals.device_set_hash, &graph->disk.last_hash,
+                                  FALSE, FALSE, graph->labels.disk_read, graph->labels.disk_write,
+                                  graph->labels.disk_read_total, graph->labels.disk_write_total);
     }
+  else
+    g_warning_once ("Cannot read /proc/diskstats: the disk figures are unknown");
 
-  // These sectors are standard unix 512 byte sectors, not the actual disk sectors.
-  read *= 512;
-  write *= 512;
-
-  if(graph->iteration != 1) {
-    handle_dynamic_max_value (graph, &graph->disk.values, &graph->disk.max, &graph->disk.last_read,
-                            &graph->disk.last_write, read, write, &graph->disk.time, 0, NULL,
-                            FALSE, FALSE, graph->labels.disk_read, graph->labels.disk_write,
-                            graph->labels.disk_read_total, graph->labels.disk_write_total);
-  }
   update_pressure_label (graph, "/proc/pressure/io", _("disk I/O"), true);
 }
 

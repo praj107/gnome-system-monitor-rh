@@ -421,6 +421,11 @@ GsmApplication::GsmApplication()
   // this->set_version (VERSION);
   this->set_option_context_summary (_("A simple process and system monitor."));
   this->add_main_option_entry (OptionType::BOOL,
+                               "version",
+                               '\0',
+                               _("Print the version and exit"));
+  this->signal_handle_local_options ().connect (sigc::mem_fun (*this, &GsmApplication::handle_local_options), false);
+  this->add_main_option_entry (OptionType::BOOL,
                                "show-processes-tab",
                                'p',
                                _("Show the Processes tab"));
@@ -432,6 +437,19 @@ GsmApplication::GsmApplication()
                                "show-file-systems-tab",
                                'f',
                                _("Show the File Systems tab"));
+}
+
+/* Runs in the process that was started, before the application registers on
+   the bus, so --version never reaches a running instance or opens a window.
+   Returning -1 lets normal startup continue; 0 exits with success. */
+int
+GsmApplication::handle_local_options (const Glib::RefPtr<Glib::VariantDict> &options)
+{
+  if (!options->contains ("version"))
+    return -1;
+
+  g_print ("gnome-system-monitor-rh %s\n", VERSION);
+  return 0;
 }
 
 GsmApplication&

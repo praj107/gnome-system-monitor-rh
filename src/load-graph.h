@@ -103,6 +103,7 @@ struct LoadGraph
   struct DISK
   {
     guint64 last_read, last_write;
+    guint64 last_hash;
     guint64 time;
     guint64 max;
     std::vector<unsigned> values;
