@@ -1,8 +1,42 @@
-gnome-system-monitor-rh (50.0+rh.1) UNRELEASED; urgency=medium
+gnome-system-monitor-rh (50.0+rh.1) noble; urgency=medium
 
-  * First packaged release of the fork: release build without the developer
-    control socket, Health tab, polkit policy and helpers under /usr, the
-    storage wear sampler unit under /usr/lib/systemd/user.
-  * Replaces the distribution's gnome-system-monitor.
+  * First packaged release of the fork, based on GNOME System Monitor 50.0.
+    Replaces the distribution's gnome-system-monitor (Provides, Conflicts and
+    Replaces), so the fork's menu entry, D-Bus name and settings are the ones
+    the distribution package used.
+  * Memory: the Resources tab reads /proc/meminfo directly and shows
+    Available, RAM-backed files (tmpfs and shared memory, labelled as not
+    reclaimable without swap) and File cache apart, so tmpfs no longer
+    counts as reclaimable cache. The process column formerly titled "Memory"
+    is anonymous resident memory and is now titled "Private (anon)".
+  * Disk I/O: values the kernel does not let the user read are shown as "—"
+    instead of 0, the totals row says how many rows were readable, and rates
+    use the measured interval.
+  * GPU: NVIDIA per-process GPU memory works (the nvidia-smi query was
+    invalid and always showed 0); per-process GPU utilisation is "—" until a
+    source for it is used. GPU utilisation and memory graphs and columns are
+    new and appear only when nvidia-smi is found.
+  * CPU: labels follow the real topology (P-core threads P1a/P1b, E-cores
+    E1.., or "CPU n" when the kernel does not publish it). Hybrid Intel parts
+    were mislabelled before.
+  * Resources tab: a Pressure line under CPU, memory and disk shows the share
+    of time tasks were stalled on that resource, from /proc/pressure.
+  * Disk: the disk graph reads /proc/diskstats once per refresh and counts
+    whole physical disks only (not partitions, loop, zram, dm or md); the
+    lsblk pipeline libgtop ran on every refresh is gone.
+  * Network: the headline counts physical interfaces only, so traffic through
+    bridges, container and VPN interfaces is no longer counted twice.
+  * New --version option.
+  * New Health tab: storage wear and lifespan estimates from SMART data
+    (udisks2 first, then a pkexec helper for what udisks cannot read), which
+    processes write the most, battery wear, and an opt-in background sampler
+    that keeps a local history. Estimated figures say so.
+  * Process properties show the thread count and the kind of process (kernel
+    thread, system or user); the process table has a Threads column.
+  * Fixes memory growth in the process list, the user-name cache and the
+    graph widgets over long sessions.
+  * Release builds contain no developer control socket. The polkit policy and
+    privileged helpers install under /usr, and the storage wear sampler's
+    user unit under /usr/lib/systemd/user.
 
- -- Pranav <pranavrajput321@gmail.com>  Wed, 28 Oct 2026 18:54:47 +0800
+ -- Pranav <pranavrajput321@gmail.com>  Wed, 28 Oct 2026 20:09:31 +0800

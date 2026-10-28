@@ -1,12 +1,19 @@
 # Release and development channel tooling
 
-Three scripts, all unprivileged, none of which installs anything system-wide:
+The build, publish and development-channel scripts are unprivileged and install
+nothing system-wide. The install scripts are run by the owner, from a terminal,
+and use `sudo` only where it is printed first:
 
 | Script | What it does |
 |---|---|
 | `build-deb.sh` | Builds the gated `.deb` from a git revision into `build-release/`. `--dev` stamps a development version. |
 | `dev-channel.sh` | User-prefix A/B install: versioned builds, atomic switch, rollback. The pipeline's testbed. |
 | `publish.sh` | Turns `.deb` files into a signed local flat apt repository. |
+| `first-install.sh` | The owner's one-time install: publish, root setup, retire the old `~/.local` install, `apt install`, verify. |
+| `release.sh` | A later release: build, publish, print the one `sudo` copy command. |
+| `rollback.sh` | Back to the distribution's package and the old `~/.local` install. |
+| `retire-user-install.sh` | Moves an old `~/.local` install aside, with a manifest; `--restore` puts it back. |
+| `release.conf` | Key fingerprint, repository, key and source paths shared by the above. |
 
 Releases are a signed `.deb` that replaces the distribution's
 `gnome-system-monitor` (`Provides`/`Conflicts`/`Replaces`). Development builds
@@ -19,70 +26,110 @@ are user-prefix installs that never touch `/usr`.
   commit's UTC day. `~` sorts before everything in dpkg, so a dev build always
   sorts below the release it leads to (`dpkg --compare-versions`).
 
-## Making a release
+## The first release (`50.0+rh.1`)
 
-1. Bump the entry in `debian/changelog` and commit.
-2. `tools/release/build-deb.sh` builds `HEAD` in an RAM scratch directory with
-   `dpkg-buildpackage`. The build is a release profile (`buildtype=release`,
-   `dev_ipc=false`, `development=false`). Gates in `debian/rules` fail the build
-   if meson was configured otherwise, if the tests fail, or if any installed
-   ELF file defines a `dev_ipc` symbol or contains the `GSM_DEV_IPC` switch.
-   The result is `build-release/gnome-system-monitor-rh_<version>_amd64.deb`.
-   `GSM_RH_GATE_SELFTEST=dev_ipc` proves the gate can fail.
-3. Publish into a staging repository you own (the key is yours, gpg asks for
-   its passphrase):
-
-   ```sh
-   tools/release/publish.sh --repo ~/gsm-rh-staging --key YOURKEYID \
-       build-release/gnome-system-monitor-rh_50.0+rh.1_amd64.deb
-   ```
-
-   `publish.sh` re-checks the `.deb` for dev IPC symbols, refuses a version that
-   is already in the repository with different contents, rebuilds `Packages`,
-   `Packages.gz` and `Release`, signs `InRelease` and `Release.gpg`, verifies
-   both with `gpgv` against the exported public key (as apt does) and writes the
-   key as `gsm-rh-archive-key.gpg`.
-4. Copy the staging repository into the root-owned repository directory. In
-   production that directory is owned by root so that the user's own processes
-   cannot publish. This step needs root and is the owner's:
-
-   ```sh
-   sudo rsync -a --delete ~/gsm-rh-staging/ /srv/gsm-rh-apt/
-   ```
-
-   Keep the last few `.deb` files in the repository to allow a rollback, so omit
-   `--delete` if you want old versions to stay.
-
-### One-time setup (root, the owner's)
-
-The repository directory must be readable by the `_apt` user, so it cannot live
-under a home directory at mode 750.
+`debian/changelog` is finalised and committed, then:
 
 ```sh
-sudo install -d -m 755 /srv/gsm-rh-apt
-sudo install -D -m 644 ~/gsm-rh-staging/gsm-rh-archive-key.gpg /etc/apt/keyrings/gsm-rh.gpg
-printf 'Types: deb\nURIs: file:///srv/gsm-rh-apt\nSuites: ./\nSigned-By: /etc/apt/keyrings/gsm-rh.gpg\n' \
-    | sudo tee /etc/apt/sources.list.d/gsm-rh.sources
+tools/release/build-deb.sh                 # gated .deb into build-release/
+tools/release/first-install.sh --dry-run   # every step printed, nothing done
+tools/release/first-install.sh             # the real thing
 ```
 
-Upgrades then arrive through `apt upgrade` or the update manager and ask for
-the owner's password. Nothing upgrades unattended.
+`first-install.sh` prints each step before it runs it. The steps are:
+
+1. Check that the release key (by fingerprint, in `release.conf`) is in your
+   keyring, that the `.deb` is built and `debian/changelog` is not
+   `UNRELEASED`, and that nothing is half-done.
+2. Publish into `~/gsm-rh-staging` with `publish.sh`. gpg asks for the key's
+   passphrase here; this is the only place the key is used.
+3. With `sudo`: create `/srv/gsm-rh-apt` (root-owned, 0755; it cannot live
+   under a home directory at mode 750 because the `_apt` user must read it),
+   copy the staging repository into it (nothing is deleted, so older packages
+   stay available), install the repository's public key as
+   `/etc/apt/keyrings/gsm-rh.gpg` (first checking that it is the release key),
+   write `/etc/apt/sources.list.d/gsm-rh.sources` (`Suites: ./`, `Signed-By`),
+   and refresh apt's list for that one source.
+4. Ask a running app to quit with its own quit action (no signal).
+5. Retire the old `~/.local` install (below).
+6. `sudo apt-get install gnome-system-monitor-rh`, which removes the
+   distribution's `gnome-system-monitor`.
+7. Verify: the package is installed and the distribution's is gone,
+   `gnome-system-monitor` resolves to `/usr/bin`, `pkaction` shows the helpers
+   under `/usr/libexec/gnome-system-monitor`, the system D-Bus service file
+   runs `/usr/bin`, no user D-Bus service file shadows it, and the binary runs
+   `--help`.
+
+If a step fails, run `rollback.sh`. Upgrades afterwards arrive through
+`apt upgrade` or the update manager and ask for your password; nothing upgrades
+unattended.
+
+### Retiring the `~/.local` install
+
+User files win over system ones: `~/.local/bin` precedes `/usr/bin` in `PATH`,
+a user D-Bus service file is preferred over the system one, user `.desktop`
+files override the package's, and a user `glib-2.0/schemas/gschemas.compiled`
+shadows the system schemas. So the package would not be the app that runs.
+
+`retire-user-install.sh [--home DIR] [--dry-run]` **moves** the install's files
+(binary, helpers, desktop files, D-Bus service file, schemas, icons, metainfo,
+the polkit policy, help pages, translations; the table is at the top of the
+script) into `~/.local/share/gsm-rh-retired-<stamp>/files/` and lists them in
+`MANIFEST` there. Nothing is deleted. If other schemas remain in the user
+schema directory it recompiles them (the original `gschemas.compiled` is kept
+in the backup); otherwise it moves the compiled file too. The app's own data
+(history database, settings) is not touched. It refuses to run while the app is
+running. `--restore <stamp>|latest` puts every file back, and refuses, moving
+nothing, if any destination exists again. Empty directories it leaves behind
+are left in place.
 
 ### What an install replaces, and how to roll back
 
 Installing `gnome-system-monitor-rh` removes the distribution's
-`gnome-system-monitor` package (`Conflicts`/`Replaces`). It installs
-`/usr/bin/gnome-system-monitor-rh` (with `/usr/bin/gnome-system-monitor` as a
-symlink to it), the helpers in `/usr/libexec/gnome-system-monitor/`, the polkit
-policy, the D-Bus service, the desktop files, the schemas and the sampler's
-user unit under `/usr`.
+`gnome-system-monitor` package (`Conflicts`/`Replaces`; the fork also
+`Provides` it). It installs `/usr/bin/gnome-system-monitor-rh` (with
+`/usr/bin/gnome-system-monitor` as a symlink to it), the helpers in
+`/usr/libexec/gnome-system-monitor/`, the polkit policy, the D-Bus service, the
+desktop files, the schemas and the sampler's user unit under `/usr`. It also
+adds `/srv/gsm-rh-apt`, `/etc/apt/keyrings/gsm-rh.gpg` and
+`/etc/apt/sources.list.d/gsm-rh.sources`.
 
 ```sh
+tools/release/rollback.sh                    # distro package back, old ~/.local files restored
+tools/release/rollback.sh --disable-source   # also rename the apt source to gsm-rh.sources.disabled
 # To an older fork release still in the repository:
 sudo apt install gnome-system-monitor-rh=50.0+rh.1 --allow-downgrades
-# Back to the distribution's package:
-sudo apt remove gnome-system-monitor-rh && sudo apt install gnome-system-monitor
 ```
+
+`rollback.sh` leaves `/srv/gsm-rh-apt` and the key in place (harmless without
+the source); remove them yourself if you want them gone.
+
+## Later releases
+
+1. Edit `debian/changelog` (a new entry, a real distribution) and commit.
+2. `tools/release/release.sh` builds `HEAD`, publishes into the staging
+   repository (gpg asks for the passphrase), and prints the one `sudo` command
+   that copies it into `/srv/gsm-rh-apt`. `publish.sh` refuses a version that is
+   already published with different contents, and re-checks the `.deb` for dev
+   IPC symbols. It never changes a version itself.
+3. Run the printed command, then `sudo apt update && sudo apt install
+   gnome-system-monitor-rh`, or wait for the update manager.
+
+`build-deb.sh` builds in a RAM scratch directory with `dpkg-buildpackage`; the
+build is a release profile (`buildtype=release`, `dev_ipc=false`,
+`development=false`) and gates in `debian/rules` fail it if meson was configured
+otherwise, if the tests fail, or if any installed ELF file defines a `dev_ipc`
+symbol or contains the `GSM_DEV_IPC` switch. `GSM_RH_GATE_SELFTEST=dev_ipc`
+proves the gate can fail.
+
+### Testing the scripts without root
+
+`first-install.sh --sysroot DIR --home DIR --key FPR --gnupghome DIR` writes the
+root-owned parts under `DIR`, signs with a throwaway key, retires a fake home
+and replaces `apt install` with an `apt-get -s` simulation; `rollback.sh
+--sysroot DIR --home DIR` simulates the way back. These options exist for
+tests; the real key is fixed in `release.conf` and the install scripts refuse a
+different one outside a sysroot.
 
 ## The development channel
 
@@ -129,6 +176,6 @@ Test those parts with the signed package.
 
 ## Tools used
 
-`dpkg-buildpackage`, `dpkg-deb`, `apt-ftparchive`, `gpg`, `gpgv`, `meson`,
-`nm`. `tools/scratch.sh` and `agent-run` are used when present and replaced by
+`dpkg-buildpackage`, `dpkg-deb`, `dpkg-parsechangelog`, `apt-ftparchive`,
+`apt-get`, `gpg`, `gpgv`, `glib-compile-schemas`, `pgrep`, `meson`, `nm`. `tools/scratch.sh` and `agent-run` are used when present and replaced by
 checked fallbacks when not.
