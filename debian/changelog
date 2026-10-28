@@ -1,0 +1,8 @@
+gnome-system-monitor-rh (50.0+rh.1) UNRELEASED; urgency=medium
+
+  * First packaged release of the fork: release build without the developer
+    control socket, Health tab, polkit policy and helpers under /usr, the
+    storage wear sampler unit under /usr/lib/systemd/user.
+  * Replaces the distribution's gnome-system-monitor.
+
+ -- Pranav <pranavrajput321@gmail.com>  Wed, 28 Oct 2026 18:54:47 +0800

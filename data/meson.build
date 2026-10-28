@@ -65,12 +65,22 @@ configure_file(
 # The wear sampler's systemd user unit. Installed but NOT enabled: the user
 # turns it on from the Health tab, which is also where they are told what it
 # records.
+#
+# systemd only searches lib/systemd/user under /usr (see systemd.unit(5),
+# "Unit File Load Path"); a user prefix such as ~/.local is not on that path,
+# so there the unit goes to share/systemd/user for the user to link or copy.
+if get_option('prefix') in ['/usr', '/usr/local']
+  sampler_unit_dir = join_paths(get_option('prefix'), 'lib', 'systemd', 'user')
+else
+  sampler_unit_dir = join_paths(get_option('prefix'), 'share', 'systemd', 'user')
+endif
+
 configure_file(
   input: 'gnome-system-monitor-health-sampler.service.in',
   output: 'gnome-system-monitor-health-sampler.service',
   configuration: dataconf,
   install: true,
-  install_dir: join_paths(get_option('prefix'), 'lib', 'systemd', 'user'),
+  install_dir: sampler_unit_dir,
 )
 
 ################################################################################

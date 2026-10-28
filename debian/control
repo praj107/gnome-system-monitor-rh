@@ -1,0 +1,50 @@
+Source: gnome-system-monitor-rh
+Section: admin
+Priority: optional
+Maintainer: Pranav <pranavrajput321@gmail.com>
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/praj107/gnome-system-monitor-rh
+Build-Depends:
+ appstream,
+ appstream-util,
+ binutils,
+ catch2,
+ debhelper-compat (= 13),
+ desktop-file-utils,
+ gettext,
+ itstool,
+ libadwaita-1-dev (>= 1.5),
+ libglibmm-2.68-dev,
+ libgtkmm-4.0-dev,
+ libgtop2-dev,
+ librsvg2-dev,
+ libsqlite3-dev,
+ libsystemd-dev,
+ meson (>= 0.57),
+ pkgconf,
+ python3,
+
+Package: gnome-system-monitor-rh
+Architecture: any
+Depends:
+ pkexec | policykit-1,
+ ${misc:Depends},
+ ${shlibs:Depends},
+Recommends:
+ udisks2,
+Provides:
+ gnome-system-monitor,
+Conflicts:
+ gnome-system-monitor,
+Replaces:
+ gnome-system-monitor,
+Description: operator-grade resource monitor (fork of GNOME System Monitor)
+ A fork of GNOME System Monitor 50.0 that reports what each figure measures,
+ groups load by who is responsible for it, and adds a Health tab with storage
+ wear, per-process write blame and component lifespan.
+ .
+ The binary is gnome-system-monitor-rh; /usr/bin/gnome-system-monitor is a
+ symlink to it. This package replaces the distribution's gnome-system-monitor.
+ Privileged actions (signals, renice, affinity, SMART reads) go through
+ root-owned helpers in /usr/libexec/gnome-system-monitor, run with pkexec.

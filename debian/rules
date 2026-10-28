@@ -1,0 +1,45 @@
+#!/usr/bin/make -f
+# Release gates: the developer control socket can drive the UI and must never
+# ship. The package is configured as a release build without it, the
+# configuration is read back from meson, the tests run, and the installed
+# files are checked for dev IPC symbols before anything is packaged.
+# See debian/gate-check.sh.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+BUILDDIR := obj-$(shell dpkg-architecture -qDEB_HOST_GNU_TYPE)
+DESTDIR  := $(CURDIR)/debian/tmp
+
+# Proves the gate can fail: GSM_RH_GATE_SELFTEST=dev_ipc forces dev_ipc=true.
+ifeq ($(GSM_RH_GATE_SELFTEST),dev_ipc)
+DEV_IPC := true
+else
+DEV_IPC := false
+endif
+
+# LTO is on, as in the project's own defaults: releases are what users run.
+# Its parallel link jobs need more than 4 GiB together (OOM-killed under a
+# 4 GiB cap; about 20 s under 6 GiB), so tools/release/build-deb.sh caps a
+# release build at 6 GiB. GSM_RH_LTO=false gives a quicker test build.
+GSM_RH_LTO ?= true
+
+%:
+	dh $@ --buildsystem=meson --builddirectory=$(BUILDDIR)
+
+override_dh_auto_configure:
+	dh_auto_configure -- --buildtype=release -Ddev_ipc=$(DEV_IPC) \
+		-Ddevelopment=false -Db_lto=$(GSM_RH_LTO)
+	sh debian/gate-check.sh configured $(BUILDDIR)
+
+# Every suite but "formatting" must pass. The formatting suite compares the
+# source with uncrustify's output, and uncrustify 0.78 on this distribution
+# disagrees with the checked-in style on unchanged files (src/open-file.cpp,
+# ...), so it reports on the package build but cannot gate it.
+override_dh_auto_test:
+	dh_auto_test -- --no-suite formatting --print-errorlogs
+	-dh_auto_test -- --suite formatting >/dev/null 2>&1 \
+		|| echo "WARNING: the formatting suite fails (uncrustify version drift); not a gate"
+
+override_dh_auto_install:
+	dh_auto_install --destdir=$(DESTDIR)
+	sh debian/gate-check.sh symbols $(DESTDIR)
