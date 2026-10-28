@@ -1,0 +1,8 @@
+# Meson build directories write their own .gitignore; these catch the rest.
+/build*/
+
+# Python bytecode from dev tooling
+__pycache__/
+
+# Local environment
+.env
