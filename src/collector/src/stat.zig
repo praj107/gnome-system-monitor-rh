@@ -29,6 +29,11 @@ pub const Stat = struct {
     utime_ticks: u64,
     stime_ticks: u64,
     num_threads: u32,
+    /// Field 18: the kernel's scheduling priority as shown by ps/top (20 for
+    /// a normal task at nice 0; negative for real-time tasks).
+    priority: i32,
+    /// Field 19: nice value, -20 (least nice) to 19.
+    nice: i32,
     /// Field 22: clock ticks after boot at which the process started. With
     /// `pid` it is the process's identity: a reused pid gets a new value.
     start_ticks: u64,
@@ -43,6 +48,8 @@ const token_tty_nr = 4;
 const token_flags = 6;
 const token_utime = 11;
 const token_stime = 12;
+const token_priority = 15;
+const token_nice = 16;
 const token_num_threads = 17;
 const token_starttime = 19;
 // One token past starttime (vsize) must exist: it proves the starttime
@@ -79,6 +86,8 @@ pub fn parse(bytes: []const u8) Error!Stat {
         .flags = try numbers.unsigned(u32, tokens[token_flags]),
         .utime_ticks = try numbers.unsigned(u64, tokens[token_utime]),
         .stime_ticks = try numbers.unsigned(u64, tokens[token_stime]),
+        .priority = try numbers.signed(i32, tokens[token_priority]),
+        .nice = try numbers.signed(i32, tokens[token_nice]),
         .num_threads = try numbers.unsigned(u32, tokens[token_num_threads]),
         .start_ticks = try numbers.unsigned(u64, tokens[token_starttime]),
     };
@@ -110,6 +119,18 @@ test "a stat line gives identity, state, tree ids, cpu ticks and start" {
     try std.testing.expectEqual(@as(u32, 4), st.num_threads);
     try std.testing.expectEqual(@as(u64, 987654), st.start_ticks);
     try std.testing.expect(!isKernelThread(st.flags));
+    try std.testing.expectEqual(@as(i32, 20), st.priority);
+    try std.testing.expectEqual(@as(i32, 0), st.nice);
+}
+
+test "a niced process and a real-time task keep their signed priority and nice" {
+    const niced = "9 (x) S 1 1 1 0 -1 0 0 0 0 0 7 3 0 0 39 19 4 0 5 8\n";
+    try std.testing.expectEqual(@as(i32, 39), (try parse(niced)).priority);
+    try std.testing.expectEqual(@as(i32, 19), (try parse(niced)).nice);
+    const realtime = "9 (x) S 1 1 1 0 -1 0 0 0 0 0 7 3 0 0 -51 -20 4 0 5 8\n";
+    try std.testing.expectEqual(@as(i32, -51), (try parse(realtime)).priority);
+    try std.testing.expectEqual(@as(i32, -20), (try parse(realtime)).nice);
+    try std.testing.expectError(error.Malformed, parse("9 (x) S 1 1 1 0 -1 0 0 0 0 0 7 3 0 0 two 19 4 0 5 8\n"));
 }
 
 test "a comm holding spaces and parentheses is parsed from the last close parenthesis" {

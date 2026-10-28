@@ -105,7 +105,7 @@ fn probeProcesses(init: std.process.Init, out: *std.Io.Writer, options: Options)
     const elapsed_ns = started.durationTo(nowNs(io)).nanoseconds;
 
     const counts = snapshot.counts;
-    try out.print("root: {s}\nprocesses: {d}\nexited: {d}\nelapsed_ns: {d}\n", .{ options.root_path, counts.listed, counts.exited, elapsed_ns });
+    try out.print("root: {s}\nprocesses: {d}\nexited: {d}\nfile_syscalls: {d}\nelapsed_ns: {d}\n", .{ options.root_path, counts.listed, counts.exited, counts.file_syscalls, elapsed_ns });
     inline for (@typeInfo(gsm.File).@"enum".fields) |field| {
         try out.print("{s}: unreadable {d} malformed {d}\n", .{ field.name, counts.unreadable[field.value], counts.malformed[field.value] });
     }
@@ -115,13 +115,16 @@ fn probeProcesses(init: std.process.Init, out: *std.Io.Writer, options: Options)
 fn show(out: *std.Io.Writer, snapshot: *const gsm.Snapshot, pid: u32) !void {
     const process = snapshot.find(pid) orelse return out.print("pid {d}: not listed\n", .{pid});
     try out.print("pid {d} comm {s} start_ticks {d} state {c} kthread {}\n", .{ pid, process.comm(), process.start_ticks, process.state, process.isKernelThread() });
-    try out.print("utime_ticks {d} stime_ticks {d} threads {d}\n", .{ process.utime_ticks, process.stime_ticks, process.num_threads });
+    try out.print("utime_ticks {d} stime_ticks {d} threads {d} priority {d} nice {d}\n", .{ process.utime_ticks, process.stime_ticks, process.num_threads, process.priority, process.nice });
     if (process.status) |s| {
         try out.print("RssAnon_bytes {?d} RssFile_bytes {?d} RssShmem_bytes {?d} VmSwap_bytes {?d} VmSize_bytes {?d} uid {?d}\n", .{ s.rss_anon_bytes, s.rss_file_bytes, s.rss_shmem_bytes, s.vm_swap_bytes, s.vm_size_bytes, s.uid_real });
     } else try out.writeAll("status: unknown\n");
     if (process.schedstat) |s| {
         try out.print("run_ns {d} run_delay_ns {d} timeslices {d}\n", .{ s.run_ns, s.run_delay_ns, s.timeslices });
     } else try out.writeAll("schedstat: unknown\n");
+    if (process.io) |s| {
+        try out.print("rchar_bytes {d} wchar_bytes {d} syscr {d} syscw {d} read_bytes {d} write_bytes {d} cancelled_write_bytes {d}\n", .{ s.rchar_bytes, s.wchar_bytes, s.syscr, s.syscw, s.read_bytes, s.write_bytes, s.cancelled_write_bytes });
+    } else try out.writeAll("io: unknown\n");
     try out.print("cgroup {?s}\n", .{process.cgroup_path});
 }
 

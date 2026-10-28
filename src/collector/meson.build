@@ -31,6 +31,7 @@ collector_sources = files(
   'build.zig',
   'build.zig.zon',
   'include/gsmcollect.h',
+  'src/budget.zig',
   'src/c_api.zig',
   'src/cgroup.zig',
   'src/cgroup_files.zig',
@@ -38,6 +39,7 @@ collector_sources = files(
   'src/meminfo.zig',
   'src/numbers.zig',
   'src/pressure.zig',
+  'src/proc_io.zig',
   'src/readfile.zig',
   'src/root.zig',
   'src/schedstat.zig',
@@ -84,6 +86,23 @@ test(
     collector_cache_args,
   ],
   suite: 'collector-zig',
+  timeout: 600,
+  is_parallel: false,
+)
+
+# The overhead budgets on the live machine (ReleaseSafe, as the library is
+# built): the process walk's CPU time per 500 processes. Skips itself in a
+# sandbox with fewer than 100 processes.
+test(
+  'collector-budget',
+  zig,
+  args: [
+    'build', 'budget',
+    '--build-file', collector_build_file,
+    '-j4',
+    collector_cache_args,
+  ],
+  suite: 'collector-budget',
   timeout: 600,
   is_parallel: false,
 )

@@ -9,6 +9,7 @@
 //                                   into zig-out/include
 //   zig build test                  every test, over the fixture tree in testdata/
 //   zig build test --fuzz           the same, with Zig's coverage-guided fuzzer
+//   zig build budget                the process walk's CPU time on the live /proc, ReleaseSafe
 //   zig build run -- --once         run the probe (args after --)
 //
 // Optionally keep the build cache in RAM rather than on the SSD:
@@ -92,6 +93,25 @@ pub fn build(b: *std.Build) void {
     // The tests open testdata/ relative to the package root.
     run_tests.setCwd(b.path("."));
     b.step("test", "Run every test").dependOn(&run_tests.step);
+
+    // `zig build budget`: the overhead budgets measured on the live machine.
+    // Always ReleaseSafe, which is how Meson builds the library, whatever
+    // -Doptimize says; it is its own step because `test` runs in Debug over
+    // fixtures. has_side_effects keeps the build system from caching a result
+    // that depends on the machine's load.
+    const budget_tests = b.addTest(.{
+        .name = "gsmcollect-budget",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/budget.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+        // The walk's own tests come along with its import; only the budget runs here.
+        .filters = &.{"budget: "},
+    });
+    const run_budget = b.addRunArtifact(budget_tests);
+    run_budget.has_side_effects = true;
+    b.step("budget", "Assert the process walk's CPU time on the live /proc (ReleaseSafe)").dependOn(&run_budget.step);
 
     // Optional: when the ztest runner is present at vendor/ztest (it is not
     // part of this repository), `zig build ztest` runs the same tests under it,

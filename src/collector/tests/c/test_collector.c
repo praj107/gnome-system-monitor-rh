@@ -193,6 +193,167 @@ check_fixture_snapshot (const char *proc_root,
   gsm_collect_free (collector);
 }
 
+/* The records exactly as layout 1 of the header declared them (the fields of
+ * gsm_process up to comm, and of gsm_sample_stats up to reserved): a consumer
+ * built against layout 1 indexes the arrays with these. */
+typedef struct
+{
+  uint32_t struct_size;
+  uint32_t pid;
+  uint64_t known;
+  uint64_t start_ticks;
+  uint64_t utime_ticks;
+  uint64_t stime_ticks;
+  uint64_t rss_anon_bytes;
+  uint64_t rss_file_bytes;
+  uint64_t rss_shmem_bytes;
+  uint64_t vm_swap_bytes;
+  uint64_t vm_size_bytes;
+  uint64_t run_ns;
+  uint64_t run_delay_ns;
+  uint64_t timeslices;
+  uint32_t ppid;
+  uint32_t pgrp;
+  uint32_t session;
+  int32_t tty_nr;
+  uint32_t flags;
+  uint32_t num_threads;
+  uint32_t uid_real;
+  uint32_t cgroup_offset;
+  uint32_t cgroup_len;
+  uint8_t state;
+  uint8_t comm_len;
+  uint8_t reserved[6];
+  char comm[64];
+} gsm_process_layout1;
+
+typedef struct
+{
+  uint32_t struct_size;
+  uint32_t readers_run;
+  uint64_t sampled_at_ns;
+  uint32_t processes_exited;
+  uint32_t process_files_unreadable;
+  uint32_t process_files_malformed;
+  uint32_t cgroups_vanished;
+  uint32_t cgroup_files_unreadable;
+  uint32_t cgroup_files_malformed;
+  int32_t reader_errno[GSM_READER_COUNT];
+  uint32_t reserved[2];
+} gsm_sample_stats_layout1;
+
+static gsm_collector *
+new_collector_layout (const char *procfs_root,
+                      const char *cgroupfs_root,
+                      uint32_t    api_version)
+{
+  gsm_collect_config config = {
+    0
+  };
+
+  config.struct_size = sizeof config;
+  config.api_version = api_version;
+  config.readers = GSM_READ_PROCESSES | GSM_READ_CGROUPS;
+  config.procfs_root = procfs_root;
+  config.cgroupfs_root = cgroupfs_root;
+  return gsm_collect_new (&config);
+}
+
+static void
+check_layouts (const char *proc_root,
+               const char *cgroup_root)
+{
+  /* the sizes layout 1 shipped with, and layout 2 appending without padding */
+  CHECK (sizeof (gsm_process_layout1) == 216);
+  CHECK (sizeof (gsm_sample_stats_layout1) == 64);
+  CHECK (offsetof (gsm_process, priority) == 212);
+  CHECK (offsetof (gsm_process, comm) == offsetof (gsm_process_layout1, comm));
+  CHECK (offsetof (gsm_process, io_rchar_bytes) % 8 == 0);
+  CHECK (sizeof (gsm_process) == 280);
+  CHECK (sizeof (gsm_sample_stats) == 72);
+  CHECK (offsetof (gsm_sample_stats, process_io_unreadable) == sizeof (gsm_sample_stats_layout1));
+  CHECK (GSM_COLLECT_API_VERSION == 2);
+
+  gsm_collector *new_reader = new_collector_layout (proc_root, cgroup_root, 2);
+  gsm_collector *old_reader = new_collector_layout (proc_root, cgroup_root, 1);
+  gsm_snapshot *new_snapshot = NULL, *old_snapshot = NULL;
+
+  CHECK (new_reader != NULL && old_reader != NULL);
+  if (new_reader == NULL || old_reader == NULL)
+    {
+      gsm_collect_free (new_reader);
+      gsm_collect_free (old_reader);
+      return;
+    }
+  CHECK (gsm_collect_sample (new_reader, &new_snapshot) == 0);
+  CHECK (gsm_collect_sample (old_reader, &old_snapshot) == 0);
+  if (new_snapshot == NULL || old_snapshot == NULL)
+    {
+      gsm_snapshot_free (new_snapshot);
+      gsm_snapshot_free (old_snapshot);
+      gsm_collect_free (new_reader);
+      gsm_collect_free (old_reader);
+      return;
+    }
+
+  /* layout 2: nice, priority and io, read through the header */
+  const gsm_process *sleeper = find_process (new_snapshot, 344260);
+  const gsm_process *shell = find_process (new_snapshot, 344261);
+  CHECK (sleeper != NULL && shell != NULL);
+  if (sleeper != NULL && shell != NULL)
+    {
+      CHECK (sleeper->struct_size == sizeof (gsm_process));
+      CHECK (sleeper->priority == 20 && sleeper->nice == 0);
+      CHECK ((sleeper->known & GSM_PROCESS_HAS_IO) != 0);
+      CHECK (sleeper->io_rchar_bytes == 4092 && sleeper->io_syscr == 9 && sleeper->io_write_bytes == 0);
+      CHECK ((shell->known & GSM_PROCESS_HAS_IO) != 0);
+      CHECK (shell->io_rchar_bytes == 1048576 && shell->io_wchar_bytes == 524288);
+      CHECK (shell->io_syscr == 812 && shell->io_syscw == 301);
+      CHECK (shell->io_read_bytes == 262144 && shell->io_write_bytes == 131072);
+      CHECK (shell->io_cancelled_write_bytes == 4096);
+    }
+
+  /* a process with no io file in the capture: unknown, and not zero-as-known */
+  const gsm_process *init_process = find_process (new_snapshot, 1);
+  CHECK (init_process != NULL && (init_process->known & GSM_PROCESS_HAS_IO) == 0);
+  CHECK (init_process != NULL && init_process->priority == 20);  /* stat is always there */
+  /* three captured processes have no io file; that is not an unexpected failure */
+  const gsm_sample_stats *new_stats = gsm_snapshot_stats (new_snapshot);
+  CHECK (new_stats->struct_size == sizeof (gsm_sample_stats));
+  CHECK (new_stats->process_io_unreadable == 3);
+  CHECK (new_stats->process_files_unreadable == 0);
+
+  /* layout 1: the old size and stride, the same processes in the same order */
+  const gsm_sample_stats_layout1 *old_stats = (const gsm_sample_stats_layout1 *) gsm_snapshot_stats (old_snapshot);
+  CHECK (old_stats->struct_size == sizeof (gsm_sample_stats_layout1));
+  CHECK (old_stats->process_files_unreadable == 0);
+
+  size_t old_count = 0, new_count = 0, old_length = 0, new_length = 0;
+  const gsm_process_layout1 *old_records = (const gsm_process_layout1 *) gsm_snapshot_processes (old_snapshot, &old_count);
+  const gsm_process *new_records = gsm_snapshot_processes (new_snapshot, &new_count);
+  const char *old_strings = gsm_snapshot_strings (old_snapshot, &old_length);
+  const char *new_strings = gsm_snapshot_strings (new_snapshot, &new_length);
+  CHECK (old_count == 5 && new_count == 5);
+  for (size_t i = 0; i < old_count && i < new_count; i++)
+    {
+      CHECK (old_records[i].struct_size == sizeof (gsm_process_layout1));
+      CHECK (old_records[i].pid == new_records[i].pid);
+      CHECK (old_records[i].start_ticks == new_records[i].start_ticks);
+      CHECK (strcmp (old_records[i].comm, new_records[i].comm) == 0);
+      CHECK ((old_records[i].known & GSM_PROCESS_HAS_IO) == 0);
+      CHECK (old_records[i].cgroup_len == new_records[i].cgroup_len);
+      CHECK (old_records[i].cgroup_offset + (size_t) old_records[i].cgroup_len < old_length);
+      CHECK (new_records[i].cgroup_offset + (size_t) new_records[i].cgroup_len < new_length);
+      CHECK (strcmp (old_strings + old_records[i].cgroup_offset,
+                     new_strings + new_records[i].cgroup_offset) == 0);
+    }
+
+  gsm_snapshot_free (new_snapshot);
+  gsm_snapshot_free (old_snapshot);
+  gsm_collect_free (new_reader);
+  gsm_collect_free (old_reader);
+}
+
 static void
 check_helpers_and_errors (void)
 {
@@ -311,6 +472,7 @@ main (int    argc,
       return 2;
     }
   check_fixture_snapshot (argv[1], argv[2]);
+  check_layouts (argv[1], argv[2]);
   check_helpers_and_errors ();
   check_live_machine ();
   if (failures != 0)

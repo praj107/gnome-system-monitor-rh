@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The process walk: one record per live process under a procfs root,
 //! keyed by (pid, start_ticks), which survives pid reuse. Per process, `stat`,
-//! `status`, `schedstat` and `cgroup` are each opened, read once
-//! with a single pread and closed: three syscalls a file, no directory open.
+//! `status`, `schedstat`, `io` and `cgroup` are each opened, read once
+//! with a single pread and closed: three syscalls a file, no directory open
+//! (15 a process at most; `Counts.file_syscalls` counts them). `io` is
+//! refused (EACCES at open, one syscall) for other users' processes, which
+//! is most of them on a workstation.
 //!
 //! Kernel input is untrusted and processes come and go mid-read, so:
 //!  - a process that vanishes mid-read (ENOENT, or ESRCH, which std reports
@@ -14,19 +17,21 @@
 //!    and is counted in `malformed`;
 //!  - `stat` is the key: when it cannot be read or parsed the process cannot
 //!    be keyed and is not listed (its failure is counted).
-//! `schedstat` is absent on kernels built without CONFIG_SCHED_INFO, so a
-//! missing `schedstat` is "unknown", not "exited"; the read order puts
-//! `cgroup`, which always exists, last so a vanish is still caught.
+//! `schedstat` is absent on kernels built without CONFIG_SCHED_INFO and `io`
+//! on kernels built without CONFIG_TASK_IO_ACCOUNTING, so a missing one is
+//! "unknown", not "exited"; the read order puts `cgroup`, which always
+//! exists, last so a vanish is still caught.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const stat_file = @import("stat.zig");
 const status_file = @import("status.zig");
 const schedstat_file = @import("schedstat.zig");
+const proc_io_file = @import("proc_io.zig");
 const cgroup_file = @import("cgroup.zig");
 const numbers = @import("numbers.zig");
 
-pub const File = enum { stat, status, schedstat, cgroup };
+pub const File = enum { stat, status, schedstat, io, cgroup };
 pub const file_count = @typeInfo(File).@"enum".fields.len;
 
 pub const Process = struct {
@@ -44,9 +49,14 @@ pub const Process = struct {
     utime_ticks: u64,
     stime_ticks: u64,
     num_threads: u32,
+    /// stat fields 18 and 19; always valid, `stat` being the key.
+    priority: i32,
+    nice: i32,
     /// Null parts below mean the file could not be read or parsed.
     status: ?status_file.Status,
     schedstat: ?schedstat_file.Schedstat,
+    /// Null when `io` is absent or refused (normal for other users' processes).
+    io: ?proc_io_file.ProcIo,
     /// The cgroup v2 path; null when unreadable or there is no v2 line.
     /// Owned by the snapshot.
     cgroup_path: ?[]const u8,
@@ -68,6 +78,9 @@ pub const Counts = struct {
     /// Per file, indexed by `File`.
     unreadable: [file_count]u32 = @splat(0),
     malformed: [file_count]u32 = @splat(0),
+    /// openat, pread and close calls the per-process file reads issued
+    /// (a failed openat counts; the directory listing does not).
+    file_syscalls: u32 = 0,
 };
 
 pub const WalkError = Allocator.Error || Io.Dir.Iterator.Error;
@@ -124,7 +137,7 @@ pub const Snapshot = struct {
 
     // 8 KiB holds a status file with room (about 1.5 KiB today); a read that
     // fills its buffer is refused as too long, not parsed as if whole.
-    const read_buffer_bytes = 8192;
+    pub const read_buffer_bytes = 8192;
 
     fn readProcess(self: *Snapshot, io: Io, root: Io.Dir, pid: u32) ReadError!void {
         var buffer: [read_buffer_bytes]u8 = undefined;
@@ -150,8 +163,11 @@ pub const Snapshot = struct {
             .utime_ticks = st.utime_ticks,
             .stime_ticks = st.stime_ticks,
             .num_threads = st.num_threads,
+            .priority = st.priority,
+            .nice = st.nice,
             .status = null,
             .schedstat = null,
+            .io = null,
             .cgroup_path = null,
         };
         @memcpy(process.comm_bytes[0..st.comm.len], st.comm);
@@ -161,6 +177,9 @@ pub const Snapshot = struct {
         }
         if (try self.readFile(io, root, pid, .schedstat, &buffer)) |bytes| {
             process.schedstat = self.parsed(.schedstat, schedstat_file.parse(bytes));
+        }
+        if (try self.readFile(io, root, pid, .io, &buffer)) |bytes| {
+            process.io = self.parsed(.io, proc_io_file.parse(bytes));
         }
         if (try self.readFile(io, root, pid, .cgroup, &buffer)) |bytes| {
             if (self.parsed(.cgroup, cgroup_file.parse(bytes))) |path| {
@@ -174,19 +193,24 @@ pub const Snapshot = struct {
     /// The bytes of one file, null when it could not be read (counted),
     /// error.Vanished when the process is gone.
     fn readFile(self: *Snapshot, io: Io, root: Io.Dir, pid: u32, file: File, buffer: []u8) error{Vanished}!?[]const u8 {
-        // schedstat may be absent on a live process (see the header).
-        const absence_means_exit = file != .schedstat;
+        // schedstat and io may be absent on a live process (see the header).
+        const absence_means_exit = file != .schedstat and file != .io;
 
         var path_buffer: [32]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buffer, "{d}/{s}", .{ pid, @tagName(file) }) catch
             return self.unreadable(file);
 
+        self.counts.file_syscalls += 1; // openat
         const handle = root.openFile(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return if (absence_means_exit) error.Vanished else self.unreadable(file),
             else => return self.unreadable(file),
         };
-        defer handle.close(io);
+        defer {
+            handle.close(io);
+            self.counts.file_syscalls += 1; // close
+        }
 
+        self.counts.file_syscalls += 1; // pread
         const length = handle.readPositional(io, &.{buffer}, 0) catch |err| switch (err) {
             // ESRCH on a task that exited after the open is not in std's
             // error set; it arrives as Unexpected.
@@ -224,6 +248,8 @@ fn openFixtures() !Io.Dir {
 
 const stat_tail = " S 1 1 1 0 -1 4194560 100 0 2 0 7 3 0 0 20 0 4 0 555 8192 55 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
 
+const io_text = "rchar: 1000\nwchar: 2000\nsyscr: 30\nsyscw: 40\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 512\n";
+
 fn put(dir: Io.Dir, sub_path: []const u8, data: []const u8) !void {
     try dir.writeFile(testing.io, .{ .sub_path = sub_path, .data = data });
 }
@@ -235,6 +261,7 @@ fn putProcess(dir: Io.Dir, pid: []const u8, comm: []const u8) !void {
     try put(dir, try std.fmt.bufPrint(&path, "{s}/stat", .{pid}), try std.fmt.bufPrint(&stat_text, "{s} ({s}){s}", .{ pid, comm, stat_tail }));
     try put(dir, try std.fmt.bufPrint(&path, "{s}/status", .{pid}), "Uid:\t1000\t1000\t1000\t1000\nVmSize:\t   400 kB\nRssAnon:\t    10 kB\nRssFile:\t    20 kB\nRssShmem:\t    30 kB\nVmSwap:\t     0 kB\n");
     try put(dir, try std.fmt.bufPrint(&path, "{s}/schedstat", .{pid}), "2000 300 4\n");
+    try put(dir, try std.fmt.bufPrint(&path, "{s}/io", .{pid}), io_text);
     try put(dir, try std.fmt.bufPrint(&path, "{s}/cgroup", .{pid}), "0::/app.slice/x.service\n");
 }
 
@@ -432,6 +459,125 @@ test "a status file that fills the read buffer is refused as too long" {
     try testing.expectEqual(@as(u32, 1), snapshot.counts.malformed[@intFromEnum(File.status)]);
 }
 
+test "io is known for the captured processes that have the file and unknown for the others" {
+    var root = try openFixtures();
+    defer root.close(testing.io);
+    var snapshot: Snapshot = .init(testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.walk(testing.io, root);
+
+    const shell = snapshot.find(344261).?.io.?;
+    try testing.expectEqual(@as(u64, 1048576), shell.rchar_bytes);
+    try testing.expectEqual(@as(u64, 524288), shell.wchar_bytes);
+    try testing.expectEqual(@as(u64, 812), shell.syscr);
+    try testing.expectEqual(@as(u64, 301), shell.syscw);
+    try testing.expectEqual(@as(u64, 262144), shell.read_bytes);
+    try testing.expectEqual(@as(u64, 131072), shell.write_bytes);
+    try testing.expectEqual(@as(u64, 4096), shell.cancelled_write_bytes);
+    try testing.expectEqual(@as(u64, 4092), snapshot.find(344260).?.io.?.rchar_bytes);
+    // pid 1, pid 2 and the kworker have no io file in the capture: unknown, not an exit.
+    try testing.expectEqual(@as(?proc_io_file.ProcIo, null), snapshot.find(1).?.io);
+    try testing.expectEqual(@as(?proc_io_file.ProcIo, null), snapshot.find(2).?.io);
+    try testing.expectEqual(@as(?proc_io_file.ProcIo, null), snapshot.find(103116).?.io);
+    try testing.expectEqual(@as(u32, 3), snapshot.counts.unreadable[@intFromEnum(File.io)]);
+    try testing.expectEqual(@as(u32, 0), snapshot.counts.exited);
+    // priority and nice come from stat and are valid for every process
+    try testing.expectEqual(@as(i32, 20), snapshot.find(344260).?.priority);
+    try testing.expectEqual(@as(i32, 0), snapshot.find(344260).?.nice);
+}
+
+test "an io file that is refused leaves io unknown and is counted apart, never zero" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try putProcess(tmp.dir, "21", "refused");
+    // A directory where io should be: opening works, reading fails (EISDIR).
+    try tmp.dir.deleteFile(testing.io, "21/io");
+    try tmp.dir.createDirPath(testing.io, "21/io");
+    try putProcess(tmp.dir, "22", "readable");
+
+    var snapshot: Snapshot = .init(testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.walk(testing.io, tmp.dir);
+
+    try testing.expectEqual(@as(?proc_io_file.ProcIo, null), snapshot.find(21).?.io);
+    try testing.expectEqual(@as(u64, 1000), snapshot.find(22).?.io.?.rchar_bytes);
+    try testing.expectEqual(@as(u32, 1), snapshot.counts.unreadable[@intFromEnum(File.io)]);
+    try testing.expectEqual(@as(u32, 0), snapshot.counts.unreadable[@intFromEnum(File.status)]);
+    try testing.expectEqual(@as(u32, 0), snapshot.counts.exited);
+    // the rest of the record is intact
+    try testing.expectEqual(@as(u64, 2000), snapshot.find(21).?.schedstat.?.run_ns);
+}
+
+test "a missing io file is unknown on a live process, not an exit; a malformed one is counted" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try putProcess(tmp.dir, "31", "noio");
+    try tmp.dir.deleteFile(testing.io, "31/io");
+    try putProcess(tmp.dir, "32", "badio");
+    try put(tmp.dir, "32/io", "rchar: 1\nwchar: x\n");
+
+    var snapshot: Snapshot = .init(testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.walk(testing.io, tmp.dir);
+
+    try testing.expectEqual(@as(u32, 2), snapshot.counts.listed);
+    try testing.expectEqual(@as(u32, 0), snapshot.counts.exited);
+    try testing.expectEqual(@as(?proc_io_file.ProcIo, null), snapshot.find(31).?.io);
+    try testing.expectEqual(@as(?proc_io_file.ProcIo, null), snapshot.find(32).?.io);
+    try testing.expectEqual(@as(u32, 1), snapshot.counts.unreadable[@intFromEnum(File.io)]);
+    try testing.expectEqual(@as(u32, 1), snapshot.counts.malformed[@intFromEnum(File.io)]);
+}
+
+test "a process with a vanished cgroup file after io is still exited" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try putProcess(tmp.dir, "33", "leaving");
+    try tmp.dir.deleteFile(testing.io, "33/cgroup");
+    var snapshot: Snapshot = .init(testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.walk(testing.io, tmp.dir);
+    try testing.expectEqual(@as(u32, 1), snapshot.counts.exited);
+    try testing.expect(snapshot.find(33) == null);
+}
+
+test "a niced process keeps its stat priority and nice through the walk" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try putProcess(tmp.dir, "34", "niced");
+    try put(tmp.dir, "34/stat", "34 (niced) S 1 1 1 0 -1 4194560 100 0 2 0 7 3 0 0 39 19 4 0 555 8192 55 1 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
+    var snapshot: Snapshot = .init(testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.walk(testing.io, tmp.dir);
+    try testing.expectEqual(@as(i32, 39), snapshot.find(34).?.priority);
+    try testing.expectEqual(@as(i32, 19), snapshot.find(34).?.nice);
+}
+
+test "file syscalls: a process with all five files costs exactly 15" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    inline for (.{ "41", "42", "43", "44" }) |pid| try putProcess(tmp.dir, pid, "full");
+    var snapshot: Snapshot = .init(testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.walk(testing.io, tmp.dir);
+    try testing.expectEqual(@as(u32, 4), snapshot.counts.listed);
+    // openat + pread + close for stat, status, schedstat, io and cgroup
+    try testing.expectEqual(@as(u32, 4 * 15), snapshot.counts.file_syscalls);
+}
+
+test "file syscalls: the captured tree costs 15 a process with io and 13 without" {
+    var root = try openFixtures();
+    defer root.close(testing.io);
+    var snapshot: Snapshot = .init(testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.walk(testing.io, root);
+    // Two processes have io (15 each); three do not, and the failed openat of
+    // the missing file is the only call for it (13 each).
+    try testing.expectEqual(@as(u32, 2 * 15 + 3 * 13), snapshot.counts.file_syscalls);
+    // and a second walk with the reused snapshot costs the same, not more
+    try snapshot.walk(testing.io, root);
+    try testing.expectEqual(@as(u32, 2 * 15 + 3 * 13), snapshot.counts.file_syscalls);
+}
+
 test "fuzz: a walk over arbitrary walk file contents never panics or leaks" {
     try testing.fuzz({}, struct {
         fn run(_: void, smith: *testing.Smith) anyerror!void {
@@ -439,7 +585,7 @@ test "fuzz: a walk over arbitrary walk file contents never panics or leaks" {
             defer tmp.cleanup();
             try tmp.dir.createDirPath(testing.io, "5");
             var content: [192]u8 = undefined;
-            inline for (.{ "stat", "status", "schedstat", "cgroup" }) |name| {
+            inline for (.{ "stat", "status", "schedstat", "io", "cgroup" }) |name| {
                 const length = smith.slice(&content);
                 try put(tmp.dir, "5/" ++ name, content[0..length]);
             }

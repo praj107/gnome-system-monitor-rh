@@ -7,12 +7,12 @@
 #   capture-fixtures.sh DEST --standard  pid 1, pid 2, one kernel worker, and a
 #                                        sleep and a shell started here
 #
-# The fixtures are PUBLIC files, so only the four files the collector reads
-# are ever copied. Any other name is refused: never cmdline, environ, maps or
+# The fixtures are PUBLIC files, so only the five files the collector reads
+# are ever copied (`io` holds only seven counters). Any other name is refused: never cmdline, environ, maps or
 # fd (session environments carry tokens). Run it unprivileged.
 set -euo pipefail
 
-readonly ALLOWED_FILES=(stat status schedstat cgroup)
+readonly ALLOWED_FILES=(stat status schedstat io cgroup)
 
 usage() {
   echo "usage: $0 DEST PID... | $0 DEST --standard" >&2

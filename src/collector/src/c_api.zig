@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! The C interface of the collector (include/gsmcollect.h, version 1): a
+//! The C interface of the collector (include/gsmcollect.h, layout 2): a
 //! collector handle that reuses its buffers, and immutable snapshots made of
 //! plain structs. The types and the `known` bits come from the header itself
 //! (translated at build time), so the Zig side and the C side cannot drift.
@@ -9,6 +9,10 @@
 //!    the consumer's allocator and not libc's;
 //!  - a field the kernel did not give is a clear `known` bit and a zero value;
 //!  - a process or cgroup that vanished mid-read has no record and is counted;
+//!  - `GSM_COLLECT_API_VERSION` counts record layouts and a layout only appends
+//!    to the one before; a consumer that opens with an older `api_version`
+//!    gets records at that layout's size and stride, holding that layout's
+//!    fields only (the full record is built, its first `size` bytes handed over);
 //!  - errors are negative errno values, and one reader failing while another
 //!    works is not an error of the sample (it is in `reader_errno`).
 const std = @import("std");
@@ -86,10 +90,43 @@ comptime {
     }
 }
 
-const api_version: u32 = 1;
+const api_version: u32 = c.GSM_COLLECT_API_VERSION;
 const max_root_bytes = 4095;
 // A meminfo is about 1.5 KiB; a read that fills the buffer is refused.
 const scratch_bytes = 8192;
+
+/// The sizes of the records that differ between layouts, and the `known`
+/// bits a layout has. A layout only appends, so the size of layout N is the
+/// offset of the first field layout N+1 appended (read from the header, so it
+/// cannot drift); memory, pressure and cgroup records are the same in every
+/// layout and use `@sizeOf`.
+const Layout = struct {
+    /// Where the last field of the layout ends, and the record size: that end
+    /// rounded up to the record's alignment (layout 1 ends at 212 and is 216
+    /// bytes, the last 4 being padding).
+    process_fields_bytes: u32,
+    process_bytes: u32,
+    stats_bytes: u32,
+    process_known_mask: u64,
+};
+
+fn makeLayout(comptime process_fields_bytes: u32, comptime stats_bytes: u32, comptime known_mask: u64) Layout {
+    return .{
+        .process_fields_bytes = process_fields_bytes,
+        .process_bytes = std.mem.alignForward(u32, process_fields_bytes, @alignOf(c.gsm_process)),
+        .stats_bytes = stats_bytes,
+        .process_known_mask = known_mask,
+    };
+}
+
+const layouts = [api_version]Layout{
+    makeLayout(@offsetOf(c.gsm_process, "priority"), @offsetOf(c.gsm_sample_stats, "process_io_unreadable"), ~@as(u64, c.GSM_PROCESS_HAS_IO)),
+    makeLayout(@sizeOf(c.gsm_process), @sizeOf(c.gsm_sample_stats), ~@as(u64, 0)),
+};
+
+fn layoutOf(requested_version: u32) Layout {
+    return layouts[requested_version - 1];
+}
 
 const reader_processes = 0;
 const reader_memory = 1;
@@ -121,6 +158,16 @@ const schedstat_rows = [_]Row{
     row("run_ns", "run_ns", c.GSM_PROCESS_HAS_RUN_NS),
     row("run_delay_ns", "run_delay_ns", c.GSM_PROCESS_HAS_RUN_DELAY_NS),
     row("timeslices", "timeslices", c.GSM_PROCESS_HAS_TIMESLICES),
+};
+
+const io_rows = [_]Row{
+    row("io_rchar_bytes", "rchar_bytes", c.GSM_PROCESS_HAS_IO),
+    row("io_wchar_bytes", "wchar_bytes", c.GSM_PROCESS_HAS_IO),
+    row("io_syscr", "syscr", c.GSM_PROCESS_HAS_IO),
+    row("io_syscw", "syscw", c.GSM_PROCESS_HAS_IO),
+    row("io_read_bytes", "read_bytes", c.GSM_PROCESS_HAS_IO),
+    row("io_write_bytes", "write_bytes", c.GSM_PROCESS_HAS_IO),
+    row("io_cancelled_write_bytes", "cancelled_write_bytes", c.GSM_PROCESS_HAS_IO),
 };
 
 const meminfo_rows = [_]Row{
@@ -218,7 +265,10 @@ fn zeroed(comptime T: type) T {
 // ---- the snapshot ----
 
 const Snapshot = struct {
-    processes: []c.gsm_process = &.{},
+    /// Process records at the consumer's layout: `processes_count` records
+    /// of `process_stride` bytes each.
+    processes: []align(@alignOf(c.gsm_process)) u8 = &.{},
+    processes_count: usize = 0,
     cgroups: []c.gsm_cgroup = &.{},
     memory: [1]c.gsm_memory = undefined,
     memory_count: usize = 0,
@@ -244,6 +294,8 @@ fn snapshotOf(pointer: *const c.gsm_snapshot) *const Snapshot {
 const Collector = struct {
     threaded: Io.Threaded,
     readers: u32,
+    /// The record layout the consumer asked for (1 to `api_version`).
+    layout: u32,
     procfs_root: []u8,
     cgroupfs_root: []u8,
     /// Read buffer for the files this file reads itself (meminfo, pressure),
@@ -279,11 +331,13 @@ export fn gsm_collect_open(config: ?*const c.gsm_collect_config, out: ?*?*c.gsm_
     out_pointer.* = null;
 
     var readers: u32 = c.GSM_READ_ALL;
+    var layout: u32 = api_version;
     var procfs_root: []const u8 = "/proc";
     var cgroupfs_root: []const u8 = "/sys/fs/cgroup";
     if (config) |given| {
         if (given.struct_size < @sizeOf(c.gsm_collect_config)) return errnoValue(.INVAL);
         if (given.api_version > api_version) return errnoValue(.INVAL);
+        if (given.api_version != 0) layout = given.api_version;
         if (given.readers & ~@as(u32, c.GSM_READ_ALL) != 0) return errnoValue(.INVAL);
         if (given.readers != 0) readers = given.readers;
         if (given.procfs_root) |text| procfs_root = std.mem.span(text);
@@ -311,6 +365,7 @@ export fn gsm_collect_open(config: ?*const c.gsm_collect_config, out: ?*?*c.gsm_
     collector.* = .{
         .threaded = .init_single_threaded,
         .readers = readers,
+        .layout = layout,
         .procfs_root = procfs_copy,
         .cgroupfs_root = cgroupfs_copy,
         .scratch = scratch,
@@ -392,7 +447,7 @@ export fn gsm_collect_sample(handle: ?*c.gsm_collector, out: ?*?*c.gsm_snapshot)
 /// reader failed. The caller destroys the snapshot on anything but 0.
 fn sampleInto(collector: *Collector, snapshot: *Snapshot) error{OutOfMemory}!i32 {
     snapshot.stats = zeroed(c.gsm_sample_stats);
-    snapshot.stats.struct_size = @sizeOf(c.gsm_sample_stats);
+    snapshot.stats.struct_size = layoutOf(collector.layout).stats_bytes;
     snapshot.stats.readers_run = collector.readers;
     snapshot.stats.sampled_at_ns = nowNs();
 
@@ -597,16 +652,31 @@ fn readProcesses(collector: *Collector, io: Io, snapshot: *Snapshot, table: *std
 
     collector.processes.walk(io, root) catch |err| return errnoOf(err);
     const counts = collector.processes.counts;
+    const layout = layoutOf(collector.layout);
     snapshot.stats.processes_exited = counts.exited;
-    for (counts.unreadable) |n| snapshot.stats.process_files_unreadable +|= n;
+    // A refused or absent `io` is the normal case for other users' processes:
+    // it has its own counter (layout 2) and is not "something unexpected".
+    for (counts.unreadable, 0..) |n, file| {
+        if (file == @intFromEnum(walk.File.io)) {
+            if (collector.layout >= 2) snapshot.stats.process_io_unreadable = n;
+            continue;
+        }
+        snapshot.stats.process_files_unreadable +|= n;
+    }
     for (counts.malformed) |n| snapshot.stats.process_files_malformed +|= n;
 
     const listed = collector.processes.processes.items;
-    const records = try gpa.alloc(c.gsm_process, listed.len);
-    snapshot.processes = records;
-    for (listed, records) |process, *record| {
-        record.* = zeroed(c.gsm_process);
-        record.struct_size = @sizeOf(c.gsm_process);
+    const stride: usize = layout.process_bytes;
+    const bytes = try gpa.alignedAlloc(u8, .of(c.gsm_process), listed.len * stride);
+    snapshot.processes = bytes;
+    snapshot.processes_count = listed.len;
+    for (listed, 0..) |process, index| {
+        // The full record is built, then its first `stride` bytes are kept:
+        // an older layout is a prefix of a newer one.
+        var full = zeroed(c.gsm_process);
+        const record = &full;
+        defer @memcpy(bytes[index * stride ..][0..stride], std.mem.asBytes(&full)[0..stride]);
+        record.struct_size = layout.process_bytes;
         record.pid = process.pid;
         record.start_ticks = process.start_ticks;
         record.ppid = process.ppid;
@@ -617,18 +687,24 @@ fn readProcesses(collector: *Collector, io: Io, snapshot: *Snapshot, table: *std
         record.num_threads = process.num_threads;
         record.utime_ticks = process.utime_ticks;
         record.stime_ticks = process.stime_ticks;
+        record.priority = process.priority;
+        record.nice = process.nice;
         record.state = process.state;
         record.comm_len = process.comm_len;
         // comm_bytes is zero-filled past comm_len, so the buffer is a C string.
         @memcpy(std.mem.asBytes(&record.comm)[0..process.comm_len], process.comm());
         if (process.status) |status| fill(record, status, &status_rows);
         if (process.schedstat) |schedstat| copyKnown(record, schedstat, &schedstat_rows);
+        if (process.io) |counters| copyKnown(record, counters, &io_rows);
         if (process.cgroup_path) |path| {
             const interned = try intern(collector, table, path);
             record.cgroup_offset = interned.offset;
             record.cgroup_len = interned.len;
             record.known |= c.GSM_PROCESS_HAS_CGROUP;
         }
+        record.known &= layout.process_known_mask;
+        // Bytes past the layout's last field are padding: hand them over zero.
+        @memset(std.mem.asBytes(&full)[layout.process_fields_bytes..stride], 0);
     }
     return 0;
 }
@@ -637,8 +713,8 @@ fn readProcesses(collector: *Collector, io: Io, snapshot: *Snapshot, table: *std
 
 export fn gsm_snapshot_processes(handle: *const c.gsm_snapshot, count: *usize) ?[*]const c.gsm_process {
     const snapshot = snapshotOf(handle);
-    count.* = snapshot.processes.len;
-    return if (snapshot.processes.len == 0) null else snapshot.processes.ptr;
+    count.* = snapshot.processes_count;
+    return if (snapshot.processes_count == 0) null else @ptrCast(snapshot.processes.ptr);
 }
 
 export fn gsm_snapshot_cgroups(handle: *const c.gsm_snapshot, count: *usize) ?[*]const c.gsm_cgroup {
@@ -877,6 +953,119 @@ test "gsm_collect_open says why it failed, and gsm_collect_new is the same witho
     try testing.expectEqual(errnoValue(.INVAL), gsm_collect_open(&config, &collector));
     try testing.expectEqual(errnoValue(.INVAL), gsm_collect_open(null, null));
     try testing.expect(gsm_collect_new(&config) == null);
+}
+
+fn layoutCollector(layout: u32, readers: u32) ?*c.gsm_collector {
+    var config = zeroed(c.gsm_collect_config);
+    config.struct_size = @sizeOf(c.gsm_collect_config);
+    config.api_version = layout;
+    config.readers = readers;
+    config.procfs_root = fixture_proc;
+    config.cgroupfs_root = fixture_cgroup;
+    return gsm_collect_new(&config);
+}
+
+/// Record `index` of a snapshot read at `stride` bytes a record, copied into a
+/// zeroed full record: only the first `stride` bytes are the consumer's.
+fn recordAt(snapshot: *c.gsm_snapshot, stride: usize, index: usize) c.gsm_process {
+    var count: usize = 0;
+    const base: [*]const u8 = @ptrCast(gsm_snapshot_processes(snapshot, &count).?);
+    std.debug.assert(index < count);
+    var record = zeroed(c.gsm_process);
+    @memcpy(std.mem.asBytes(&record)[0..stride], base[index * stride ..][0..stride]);
+    return record;
+}
+
+test "the layouts' sizes are the header's: 216 and 64 bytes for layout 1, no hidden padding in layout 2" {
+    try testing.expectEqual(@as(u32, 216), layoutOf(1).process_bytes);
+    try testing.expectEqual(@as(u32, 64), layoutOf(1).stats_bytes);
+    try testing.expectEqual(@as(u32, 280), layoutOf(2).process_bytes);
+    try testing.expectEqual(@as(u32, 72), layoutOf(2).stats_bytes);
+    try testing.expectEqual(@sizeOf(c.gsm_process), @offsetOf(c.gsm_process, "io_cancelled_write_bytes") + 8);
+    try testing.expectEqual(@sizeOf(c.gsm_sample_stats), @offsetOf(c.gsm_sample_stats, "reserved3") + 4);
+    try testing.expectEqual(@as(u32, 2), gsm_collect_api_version());
+}
+
+test "a layout-1 consumer sees the same processes at layout 1's size and stride" {
+    const old = layoutCollector(1, c.GSM_READ_PROCESSES).?;
+    defer gsm_collect_free(old);
+    const new = layoutCollector(2, c.GSM_READ_PROCESSES).?;
+    defer gsm_collect_free(new);
+    var old_snapshot: ?*c.gsm_snapshot = null;
+    var new_snapshot: ?*c.gsm_snapshot = null;
+    try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(old, &old_snapshot));
+    defer gsm_snapshot_free(old_snapshot);
+    try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(new, &new_snapshot));
+    defer gsm_snapshot_free(new_snapshot);
+
+    var old_count: usize = 0;
+    var new_count: usize = 0;
+    _ = gsm_snapshot_processes(old_snapshot.?, &old_count);
+    _ = gsm_snapshot_processes(new_snapshot.?, &new_count);
+    try testing.expectEqual(@as(usize, 5), old_count);
+    try testing.expectEqual(new_count, old_count);
+
+    for (0..old_count) |index| {
+        const before = recordAt(old_snapshot.?, 216, index);
+        const after = recordAt(new_snapshot.?, 280, index);
+        try testing.expectEqual(@as(u32, 216), before.struct_size);
+        try testing.expectEqual(@as(u32, 280), after.struct_size);
+        try testing.expectEqual(after.pid, before.pid);
+        try testing.expectEqual(after.start_ticks, before.start_ticks);
+        try testing.expectEqualStrings(std.mem.sliceTo(&after.comm, 0), std.mem.sliceTo(&before.comm, 0));
+        try testing.expectEqual(after.rss_anon_bytes, before.rss_anon_bytes);
+        try testing.expectEqual(after.run_ns, before.run_ns);
+        try testing.expectEqualStrings(
+            pathOf(new_snapshot.?, after.cgroup_offset, after.cgroup_len),
+            pathOf(old_snapshot.?, before.cgroup_offset, before.cgroup_len),
+        );
+        // layout 1 has no io bit, even where the file was read
+        try testing.expectEqual(@as(u64, 0), before.known & c.GSM_PROCESS_HAS_IO);
+        try testing.expectEqual(after.known & ~@as(u64, c.GSM_PROCESS_HAS_IO), before.known);
+    }
+    try testing.expectEqual(@as(u32, 64), gsm_snapshot_stats(old_snapshot.?).struct_size);
+    try testing.expectEqual(@as(u32, 72), gsm_snapshot_stats(new_snapshot.?).struct_size);
+}
+
+test "layout 2 carries nice, priority and io: known for the processes that have the file, unknown for the rest" {
+    const collector = layoutCollector(2, c.GSM_READ_PROCESSES).?;
+    defer gsm_collect_free(collector);
+    var snapshot: ?*c.gsm_snapshot = null;
+    try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
+    defer gsm_snapshot_free(snapshot);
+
+    const shell = try processFor(snapshot.?, 344261);
+    try testing.expectEqual(@as(i32, 20), shell.priority);
+    try testing.expectEqual(@as(i32, 0), shell.nice);
+    try testing.expect(shell.known & c.GSM_PROCESS_HAS_IO != 0);
+    try testing.expectEqual(@as(u64, 1048576), shell.io_rchar_bytes);
+    try testing.expectEqual(@as(u64, 524288), shell.io_wchar_bytes);
+    try testing.expectEqual(@as(u64, 812), shell.io_syscr);
+    try testing.expectEqual(@as(u64, 301), shell.io_syscw);
+    try testing.expectEqual(@as(u64, 262144), shell.io_read_bytes);
+    try testing.expectEqual(@as(u64, 131072), shell.io_write_bytes);
+    try testing.expectEqual(@as(u64, 4096), shell.io_cancelled_write_bytes);
+
+    // pid 1, pid 2 and the kworker have no io file in the capture
+    for ([_]u32{ 1, 2, 103116 }) |pid| {
+        const record = try processFor(snapshot.?, pid);
+        try testing.expectEqual(@as(u64, 0), record.known & c.GSM_PROCESS_HAS_IO);
+        try testing.expectEqual(@as(u64, 0), record.io_write_bytes);
+        try testing.expectEqual(@as(i32, 20), record.priority); // stat is always there
+    }
+    const stats = gsm_snapshot_stats(snapshot.?);
+    try testing.expectEqual(@as(u32, 3), stats.process_io_unreadable);
+    try testing.expectEqual(@as(u32, 0), stats.process_files_unreadable);
+    try testing.expectEqual(@as(u32, 0), stats.processes_exited);
+}
+
+test "an api_version of 0 asks for the newest layout" {
+    const collector = layoutCollector(0, c.GSM_READ_PROCESSES).?;
+    defer gsm_collect_free(collector);
+    var snapshot: ?*c.gsm_snapshot = null;
+    try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
+    defer gsm_snapshot_free(snapshot);
+    try testing.expectEqual(@as(u32, 280), (try processFor(snapshot.?, 1)).struct_size);
 }
 
 test "no function here keeps a large array on the stack" {

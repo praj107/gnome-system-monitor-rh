@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * gsmcollect.h: the C interface of the collector, version 1.
+ * gsmcollect.h: the C interface of the collector, layout 2.
  *
  * The collector reads the kernel's own counters (proc_pid_stat(5),
  * proc_pid_status(5), /proc/meminfo, the pressure files of
@@ -12,10 +12,15 @@
  *
  *  - A collector is used from one thread at a time. A snapshot is read-only
  *    and may be read from any thread once returned, until it is freed.
- *  - Every record starts with `uint32_t struct_size`. The library fills
- *    records in the layout of the api_version the consumer asked for, so a
- *    consumer built against this header indexes the arrays directly; a later
- *    version only appends fields (and `known` bits).
+ *  - Every record starts with `uint32_t struct_size`. GSM_COLLECT_API_VERSION
+ *    counts record layouts, and a layout only appends fields (and `known`
+ *    bits) to the one before. The library fills records in the layout of the
+ *    api_version the consumer asked for in gsm_collect_config: a consumer
+ *    built against layout 1 sets api_version = 1 and gets arrays whose
+ *    stride and struct_size are layout 1's, holding exactly layout 1's
+ *    fields; one built against this header sets GSM_COLLECT_API_VERSION and
+ *    indexes the arrays directly. The first `struct_size` bytes of a record
+ *    are always valid.
  *  - Unknown is a bit, not a sentinel. Each record has `uint64_t known`,
  *    one bit per optional field. A field whose bit is clear was not
  *    available (file absent, unreadable or malformed, or the kernel does
@@ -44,7 +49,10 @@
 extern "C" {
 #endif
 
-#define GSM_COLLECT_API_VERSION 1
+/* The newest record layout. Layout 1: the first release. Layout 2: gsm_process
+ * gains priority, nice and the /proc/<pid>/io counters, gsm_sample_stats gains
+ * process_io_unreadable. */
+#define GSM_COLLECT_API_VERSION 2
 
 /* The version the library was built with; compare with the macro above. */
 uint32_t gsm_collect_api_version (void);
@@ -65,7 +73,8 @@ typedef struct gsm_snapshot gsm_snapshot;
 typedef struct gsm_collect_config
 {
   uint32_t struct_size;        /* sizeof (gsm_collect_config) */
-  uint32_t api_version;        /* GSM_COLLECT_API_VERSION */
+  uint32_t api_version;        /* the record layout wanted, 1 to GSM_COLLECT_API_VERSION;
+                                  0 means GSM_COLLECT_API_VERSION */
   uint32_t readers;            /* GSM_READ_* mask; 0 means GSM_READ_ALL */
   uint32_t reserved;
   const char *procfs_root;     /* NULL: "/proc" */
@@ -75,7 +84,7 @@ typedef struct gsm_collect_config
 
 /* Makes a collector. NULL config means all defaults; the paths are copied.
  * Returns 0 and the collector in *out, or a negative errno and NULL in *out:
- * -EINVAL (struct_size too small, api_version newer than the library's,
+ * -EINVAL (struct_size too small, api_version newer than the library's layout,
  * unknown reader bits, an empty or over-long root, NULL out) or -ENOMEM. */
 int             gsm_collect_open (const gsm_collect_config *config,
                                   gsm_collector           **out);
@@ -111,6 +120,10 @@ const char *    gsm_collect_strerror (int err);
 #define GSM_PROCESS_HAS_RUN_DELAY_NS  (1ULL << 7)  /* schedstat field 2 */
 #define GSM_PROCESS_HAS_TIMESLICES    (1ULL << 8)  /* schedstat field 3 */
 #define GSM_PROCESS_HAS_CGROUP        (1ULL << 9)  /* cgroup v2 path in the string table */
+/* Layout 2: all seven io_* counters together (proc_pid_io(5)). Clear when the
+ * file is absent (no task I/O accounting) or refused, which is the normal case
+ * for other users' processes. */
+#define GSM_PROCESS_HAS_IO            (1ULL << 10)
 
 /* gsm_process.flags: the kernel's task flags (proc_pid_stat(5), field 9). */
 #define GSM_PF_KTHREAD 0x00200000u
@@ -144,6 +157,20 @@ typedef struct gsm_process
   uint8_t comm_len;
   uint8_t reserved[6];
   char comm[64];               /* NUL-terminated; up to 63 bytes, may hold spaces */
+  /* ---- layout 2 starts here, at offset 212: layout 1's last 4 bytes were
+   * trailing padding, so its 216-byte records never held anything there ---- */
+  int32_t priority;            /* proc_pid_stat(5) field 18: 20 at nice 0, negative for real-time */
+  int32_t nice;                /* proc_pid_stat(5) field 19: -20 to 19; priority and nice are
+                                  always valid in a layout-2 record, `stat` being the key */
+  uint32_t reserved2;          /* explicit padding: the counters below are 8-byte aligned */
+  uint64_t io_rchar_bytes;     /* proc_pid_io(5) rchar: bytes passed to read(2) and similar,
+                                  page cache included; valid with HAS_IO, as are the next six */
+  uint64_t io_wchar_bytes;     /* wchar: bytes passed to write(2) and similar */
+  uint64_t io_syscr;           /* syscr: read-like calls, a count */
+  uint64_t io_syscw;           /* syscw: write-like calls, a count */
+  uint64_t io_read_bytes;      /* read_bytes: bytes the storage layer was asked to fetch */
+  uint64_t io_write_bytes;     /* write_bytes: bytes sent to the storage layer */
+  uint64_t io_cancelled_write_bytes;  /* cancelled_write_bytes: writes undone by truncation */
 } gsm_process;
 
 /* ---- system memory ---------------------------------------------------- */
@@ -340,6 +367,11 @@ typedef struct gsm_sample_stats
   int32_t reader_errno[GSM_READER_COUNT];  /* 0, or the negative errno that stopped the
                                               reader (indexed by the bit position of GSM_READ_*) */
   uint32_t reserved[2];
+  /* ---- layout 2 starts here (offset 64) ---- */
+  uint32_t process_io_unreadable;    /* processes whose /proc/<pid>/io was refused or absent:
+                                        normal for other users' processes, so not part of
+                                        process_files_unreadable */
+  uint32_t reserved3;
 } gsm_sample_stats;
 
 /* The record arrays: a pointer valid until gsm_snapshot_free and the number

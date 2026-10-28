@@ -14,14 +14,15 @@ Readers: [processes](#processes) · [system memory](#system-memory) ·
 
 ### What it reads
 
-For each process, four files, each opened, read with one `pread` and closed
-(12 syscalls per process, nothing else):
+For each process, five files, each opened, read with one `pread` and closed
+(at most 15 syscalls per process, nothing else; 13 when `io` is refused):
 
 | File | Fields kept | Source of the definition |
 |---|---|---|
-| `stat` | pid, comm, state, ppid, pgrp, session, tty_nr, flags, utime/stime (ticks), num_threads, starttime (ticks) | `proc_pid_stat(5)` |
+| `stat` | pid, comm, state, ppid, pgrp, session, tty_nr, flags, utime/stime (ticks), priority and nice (fields 18 and 19), num_threads, starttime (ticks) | `proc_pid_stat(5)` |
 | `status` | `RssAnon`, `RssFile`, `RssShmem`, `VmSwap`, `VmSize` (kB to bytes), real uid | `proc_pid_status(5)` |
 | `schedstat` | run time ns, run delay ns, timeslices | `Documentation/scheduler/sched-stats.rst` |
+| `io` | `rchar`, `wchar`, `syscr`, `syscw`, `read_bytes`, `write_bytes`, `cancelled_write_bytes`, known together | `proc_pid_io(5)` |
 | `cgroup` | the cgroup v2 path (`0::`); v1 lines ignored | `Documentation/admin-guide/cgroup-v2.rst` |
 
 A record is keyed by `(pid, start_ticks)`: a reused pid has a new start time.
@@ -38,12 +39,22 @@ Nothing else is read: no `cmdline`, `environ`, `maps` or `fd`.
   Unknown is never zero.
 - `stat` is the key. If it cannot be read or parsed the process is not listed
   and the failure is counted.
-- `schedstat` is absent without `CONFIG_SCHED_INFO`; a missing one is
-  `null`, not an exit (the `cgroup` read comes last and catches a vanish).
+- `schedstat` is absent without `CONFIG_SCHED_INFO`, and `io` without
+  `CONFIG_TASK_IO_ACCOUNTING`; a missing one is `null`, not an exit (the
+  `cgroup` read comes last and catches a vanish).
+- `io` is refused (EACCES at the open) for other users' processes, about two
+  thirds of them on a workstation. That is the normal case: the counters are
+  unknown (not zero) and the refusal is counted in `unreadable[io]`, which
+  the C interface reports as `process_io_unreadable`, apart from the
+  unexpected `process_files_unreadable`. A refused open is one syscall.
 - `comm` is parsed from the **last** `)`: it may hold spaces and parentheses,
   and a kworker's is longer than 15 bytes (up to 63).
 - Malformed input is an error value; the parsers never panic (fuzz tested).
 - The walk takes a root directory, so tests run against captured trees.
+- `Counts.file_syscalls` counts the `openat`, `pread` and `close` calls of the
+  per-process reads (a failed `openat` counts; the directory listing does
+  not), and a test asserts it per process: exactly 15 with all five files, 13
+  where `io` is absent or refused.
 
 ### Cost
 
@@ -53,6 +64,44 @@ a walk takes about 5.8 ms (5 runs: 5.6 to 6.1 ms), 12.0 syscalls per process
 for 483 entries), no subprocess, and **0 bytes written**. A reused
 `Snapshot` allocates nothing on later walks unless the process count grows.
 `statm` is not read: `status` carries `VmSize` and the Rss split.
+
+Measured again 2026-10-29 with `io` added (16-thread laptop, 523 processes,
+ReleaseSafe): **13.8 file syscalls per process** (`strace -c -f` on
+`gsmcollect-probe --once`: 2616 `openat`, 327 of them the refused `io` of
+other users' processes, 2288 `preadv`, 2289 `close`, 9 `getdents64`; the
+probe's own `file_syscalls` counter says 7191 for 523 processes). A refused
+`io` costs 1 syscall and a read one 3, so the figure sits between 13 and 15.
+Still **0 bytes written**, no subprocess.
+
+The walk's CPU time (thread CPU time, median of five walks) depends on the
+machine's state, not only on the code. Per 500 processes, 2026-10-29:
+
+| Condition | ms per 500 |
+|---|---:|
+| quiet machine | 8.3 |
+| load average about 5, unpinned | 10.4 to 13.3 |
+| load 4.7, pinned to a P-core (cores at 3.1 of 4.9 GHz) | 15.5 to 16.1 |
+| load 4.7, pinned to an E-core | 24.2 to 25.0 |
+
+So the 10 ms per 500 processes is a design target for a quiet machine, and
+the figure is reported, not asserted. Both budgets are tests:
+
+- `zig build test` asserts the file syscalls per process over the fixture
+  tree: exactly 15 with all five files, 13 where `io` is absent or refused.
+- `zig build budget` (ReleaseSafe on the live `/proc`; skipped under 100
+  processes or when the thread CPU clock cannot be read) asserts the walk
+  costs **at most 1.3 times a baseline measured in the same run**: the
+  baseline makes the syscalls the walk cannot avoid, the listing of `/proc`
+  and an open, one pread and a close of the same five files of the same
+  processes, and parses nothing, so the ratio is the collector's own work
+  over the kernel's. Walk and baseline alternate on one thread pinned to
+  the CPU it started on (its own affinity, restored afterwards), and the
+  median of 9 per-pair ratios is asserted. Each run prints both absolute
+  medians and the ratio. Measured on 2026-10-29 at load average 5.9: ratios
+  1.15 to 1.21 over five runs (walk 18.9 to 20.2 ms per 500, baseline 15.9
+  to 16.8). Without the listing in the baseline the ratios were 1.22 to
+  1.28: listing `/proc` is about 6% of the kernel's share. Meson runs the
+  step as the suite `collector-budget`.
 
 ## System memory
 
@@ -135,7 +184,7 @@ show where you can.
 ## C interface
 
 `include/gsmcollect.h` (C11, `<stdint.h>` and `<stddef.h>` only,
-`GSM_COLLECT_API_VERSION 1`) is the contract; the Zig side takes its types
+`GSM_COLLECT_API_VERSION 2`) is the contract; the Zig side takes its types
 and `known` bits from the header at build time, so they cannot drift.
 
 ```c
@@ -153,8 +202,15 @@ gsm_snapshot_free(snap); gsm_collect_free(c);
   collector reuses its walk buffers between samples.
 - **Records** are arrays of plain structs (`gsm_process`, `gsm_cgroup`,
   `gsm_memory`, `gsm_pressure`), each starting with `uint32_t struct_size`.
-  The library fills the layout of the `api_version` the caller asked for;
-  later versions only append fields.
+  `GSM_COLLECT_API_VERSION` counts record layouts and a layout only appends
+  to the one before. The library fills the layout of the `api_version` the
+  caller asked for (0 means the newest): a layout-1 caller gets `gsm_process`
+  records of 216 bytes and a `gsm_sample_stats` with `struct_size` 64,
+  holding exactly layout 1's fields; layout 2 adds `priority` and `nice`
+  (`stat` fields 18 and 19) and the seven `/proc/<pid>/io` counters under
+  `GSM_PROCESS_HAS_IO` (280 bytes), and `process_io_unreadable` in the stats.
+  The library writes the full record and hands over its first `struct_size`
+  bytes at that stride.
 - **Unknown is a bit, not a sentinel.** Each record has `uint64_t known`;
   a field whose bit is clear is 0 and must not be shown as 0. A kernel
   thread has no `GSM_PROCESS_HAS_RSS_ANON`; a cgroup without a memory
@@ -178,7 +234,8 @@ gsm_snapshot_free(snap); gsm_collect_free(c);
 - **Build:** Meson runs `zig build library` (Zig exactly 0.16.0, checked at
   configure time) for `x86_64-linux-gnu`, `-Dcpu=baseline` (only SSE2 is
   required, so a packaged binary runs on any x86-64 machine), `ReleaseSafe`,
-  position-independent, and registers two test suites, `collector-zig` and
+  position-independent, and registers three test suites, `collector-zig`, `collector-budget` (the
+  overhead budgets on the live machine) and
   `collector-c` (a plain C program that links the library and checks a
   snapshot over the fixture trees, `tests/c/fixture/proc` and
   `testdata/cgroup`, then once over the live `/proc`). Nothing is installed.
@@ -197,8 +254,9 @@ gsm_snapshot_free(snap); gsm_collect_free(c);
 - **Cost** of one full `gsm_collect_sample` (all four readers), measured
   2026-10-28 on the 16-thread laptop with 492 processes and 127 cgroups,
   ReleaseSafe, best of 20 in one process: 12.4 ms (3 runs: 12.43, 12.44, 12.57).
-  That is about 1.2% of one CPU at a one-second refresh. The snapshot holds
-  216 bytes per process, 376 per cgroup and a 6.4 KB string table, about
+  That is about 1.2% of one CPU at a one-second refresh. The snapshot then held
+  216 bytes per process (280 in layout 2, so about 29% more for the process
+  array: 143 KB for 510 processes), 376 per cgroup and a 6.4 KB string table, about
   190 KB in all; there is no subprocess and **0 bytes are written**.
 
 ## Build and test
@@ -208,6 +266,7 @@ export ZIG_LOCAL_CACHE_DIR=/dev/shm/gsmcollect-cache   # optional: build cache i
 zig build library                   # zig-out/lib/libgsmcollect.a and zig-out/include/gsmcollect.h
 zig build test                      # every test, over testdata/
 zig build test -Dtest-filter=NAME   # only tests whose name contains NAME
+zig build budget                    # the walk's CPU time on the live /proc (ReleaseSafe)
 zig build -Doptimize=ReleaseFast    # zig-out/bin/gsmcollect-probe
 zig-out/bin/gsmcollect-probe --once [--root DIR] [--show PID]
 zig-out/bin/gsmcollect-probe --memory [--root DIR]
@@ -248,8 +307,10 @@ CGROUP_PATH...`, which copies each path and its ancestors and only the 12
 files the collector reads. The vanished-group and unreadable-file cases are
 built in a temporary directory, because git does not keep empty directories.
 
-`testdata/proc/<pid>/{stat,status,schedstat,cgroup}` was captured with
+`testdata/proc/<pid>/{stat,status,schedstat,io,cgroup}` was captured with
 `tools/capture-fixtures.sh DEST --standard` (pid 1, pid 2, a kworker, and a
-`sleep` and a shell the script starts and stops itself). The script refuses
+`sleep` and a shell the script starts and stops itself). Only the two own-user
+processes have an `io` file, as for any unprivileged capture: the other
+three (pid 1, pid 2, a kworker) exercise the unknown case. The script refuses
 any other file name. The fixtures are public: never add `cmdline`,
 `environ`, `maps` or `fd`.

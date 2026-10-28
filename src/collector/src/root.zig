@@ -6,6 +6,7 @@ pub const numbers = @import("numbers.zig");
 pub const stat = @import("stat.zig");
 pub const status = @import("status.zig");
 pub const schedstat = @import("schedstat.zig");
+pub const proc_io = @import("proc_io.zig");
 pub const cgroup = @import("cgroup.zig");
 pub const walk = @import("walk.zig");
 pub const readfile = @import("readfile.zig");
