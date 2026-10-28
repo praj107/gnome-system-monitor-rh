@@ -13,6 +13,13 @@ pub const meminfo = @import("meminfo.zig");
 pub const pressure = @import("pressure.zig");
 pub const cgroup_files = @import("cgroup_files.zig");
 pub const cgroup_tree = @import("cgroup_tree.zig");
+pub const c_api = @import("c_api.zig");
+
+// The exported gsm_* functions of the C interface; referencing the file keeps
+// them in the static library.
+comptime {
+    _ = c_api;
+}
 
 pub const Snapshot = walk.Snapshot;
 pub const Process = walk.Process;

@@ -3,7 +3,10 @@
 // Build graph of the collector: the library that turns procfs into records,
 // its tests and fuzz tests, and the gsmcollect-probe measuring tool.
 //
-//   zig build                       gsmcollect-probe into zig-out/bin
+//   zig build library               only libgsmcollect.a and gsmcollect.h
+//   zig build                       gsmcollect-probe into zig-out/bin, the static
+//                                   library into zig-out/lib and the C header
+//                                   into zig-out/include
 //   zig build test                  every test, over the fixture tree in testdata/
 //   zig build test --fuzz           the same, with Zig's coverage-guided fuzzer
 //   zig build run -- --once         run the probe (args after --)
@@ -16,11 +19,48 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The C header is the contract; the Zig side takes its types and `known`
+    // bits from it (translated here), so the two cannot drift apart. The
+    // translation only supplies declarations: the library itself does not link libc.
+    const header = b.addTranslateC(.{
+        .root_source_file = b.path("include/gsmcollect.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+
     const collector = b.addModule("gsmcollect", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        // The static library is linked into position-independent programs.
+        .pic = true,
+        // No libc inside the library: it talks to the kernel directly and
+        // allocates with Zig's own allocator. Only memcpy/memset/getauxval
+        // and TLS are left for the final link to resolve from the host's libc.
+        .link_libc = false,
+        .imports = &.{.{ .name = "gsm_c", .module = header.createModule() }},
     });
+
+    const library = b.addLibrary(.{
+        .name = "gsmcollect",
+        .linkage = .static,
+        .root_module = collector,
+    });
+    // The archive holds only the collector's own object, so `nm` shows gsm_*
+    // and nothing else. Stack probes use a local copy of Zig's probe (see
+    // c_api.zig), since compiler-rt is not bundled; the helpers it calls
+    // (__divti3) come from
+    // the final link's libgcc or compiler-rt.
+    const install_library = b.addInstallArtifact(library, .{});
+    const install_header = b.addInstallFile(b.path("include/gsmcollect.h"), "include/gsmcollect.h");
+    b.getInstallStep().dependOn(&install_library.step);
+    b.getInstallStep().dependOn(&install_header.step);
+    // `zig build library`: just the static library and the header, which is
+    // what the Meson build asks for (the probe is not needed there).
+    const library_step = b.step("library", "Build libgsmcollect.a and install it with gsmcollect.h");
+    library_step.dependOn(&install_library.step);
+    library_step.dependOn(&install_header.step);
 
     const probe = b.addExecutable(.{
         .name = "gsmcollect-probe",

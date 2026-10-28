@@ -3,12 +3,12 @@
 A small Zig 0.16 library that reads the kernel's own counters: one record per
 live process from `/proc`, the system memory partition from `/proc/meminfo`,
 pressure stall information, and the whole cgroup v2 tree. It is meant to
-replace libgtop's per-process walk; it has no C header yet and is built on
-its own. Every reader takes a root directory, so tests run against captured
-trees.
+replace libgtop's per-process walk, and reaches C and C++ code through the
+[C interface](#c-interface) in `include/gsmcollect.h`. Every reader takes a
+root directory, so tests run against captured trees.
 
 Readers: [processes](#processes) · [system memory](#system-memory) ·
-[pressure](#pressure) · [cgroup tree](#cgroup-tree)
+[pressure](#pressure) · [cgroup tree](#cgroup-tree) · [C interface](#c-interface)
 
 ## Processes
 
@@ -132,10 +132,80 @@ records and path strings, reused by a later walk. A refresh of the whole
 tree every second would use about 1% of one CPU; walk only the subtree you
 show where you can.
 
+## C interface
+
+`include/gsmcollect.h` (C11, `<stdint.h>` and `<stddef.h>` only,
+`GSM_COLLECT_API_VERSION 1`) is the contract; the Zig side takes its types
+and `known` bits from the header at build time, so they cannot drift.
+
+```c
+gsm_collector *c = gsm_collect_new(NULL);            /* defaults: /proc, /sys/fs/cgroup, all readers */
+gsm_snapshot *snap;
+int err = gsm_collect_sample(c, &snap);              /* 0, or a negative errno */
+size_t n; const gsm_process *p = gsm_snapshot_processes(snap, &n);
+/* p[i].known & GSM_PROCESS_HAS_RSS_ANON says whether p[i].rss_anon_bytes is a measurement */
+gsm_snapshot_free(snap); gsm_collect_free(c);
+```
+
+- **A collector is used from one thread at a time**; a snapshot is
+  read-only and may be read from any thread until it is freed. Snapshots are
+  allocated and freed by the library (Zig's own allocator, never libc's), and a
+  collector reuses its walk buffers between samples.
+- **Records** are arrays of plain structs (`gsm_process`, `gsm_cgroup`,
+  `gsm_memory`, `gsm_pressure`), each starting with `uint32_t struct_size`.
+  The library fills the layout of the `api_version` the caller asked for;
+  later versions only append fields.
+- **Unknown is a bit, not a sentinel.** Each record has `uint64_t known`;
+  a field whose bit is clear is 0 and must not be shown as 0. A kernel
+  thread has no `GSM_PROCESS_HAS_RSS_ANON`; a cgroup without a memory
+  controller has no `GSM_CGROUP_HAS_MEMORY_CURRENT`; `memory.max` of `max` is
+  `GSM_CGROUP_MEMORY_MAX_UNLIMITED`, a different bit from a finite limit.
+- **Raw counters plus `sampled_at_ns`** (CLOCK_MONOTONIC, taken before the
+  reads). Rates and stall shares are computed from two snapshots with the
+  header's `gsm_rate_per_s` and `gsm_pressure_share`, which return 0 (unknown)
+  for an empty window or a counter that went backwards. A process is the same
+  across snapshots when `(pid, start_ticks)` match.
+- **Strings:** `comm` is a NUL-terminated `char[64]`; a cgroup path is an
+  offset and length into `gsm_snapshot_strings()` (also NUL-terminated;
+  a process in a cgroup of the tree shares the tree's string). Bytes, not
+  assumed UTF-8.
+- **Errors** are negative errno values. A process or cgroup that vanished
+  mid-read is not an error (`gsm_sample_stats.processes_exited`,
+  `cgroups_vanished`). One reader failing while another works is not an error
+  of the sample either: its records are absent and its errno is in
+  `reader_errno`; only when every requested reader fails does
+  `gsm_collect_sample` return it. `gsm_collect_strerror` names the values.
+- **Build:** Meson runs `zig build library` (Zig exactly 0.16.0, checked at
+  configure time) for `x86_64-linux-gnu`, `-Dcpu=baseline` (only SSE2 is
+  required, so a packaged binary runs on any x86-64 machine), `ReleaseSafe`,
+  position-independent, and registers two test suites, `collector-zig` and
+  `collector-c` (a plain C program that links the library and checks a
+  snapshot over the fixture trees, `tests/c/fixture/proc` and
+  `testdata/cgroup`, then once over the live `/proc`). Nothing is installed.
+- **Link notes:** the archive holds one object and exports only `gsm_*`
+  symbols. It has no libc inside: the final link supplies `memcpy`, `memmove`,
+  `memset`, `getauxval` and `__tls_get_addr` from the C library and `__divti3`
+  from libgcc or compiler-rt, as for any C code. Stack probes stay on: Zig's
+  probe routine is carried in the object as a local (not exported) symbol,
+  because Zig's compiler-rt is not bundled.
+- **Opening:** `gsm_collect_open(config, &collector)` returns 0 or a negative
+  errno (`-EINVAL` for a bad configuration, `-ENOMEM`); `gsm_collect_new` is
+  the same without the reason. The collector owns the read buffer of the
+  files `c_api.zig` reads itself; the process and cgroup walkers still keep
+  their 8 and 16 KiB read buffers, and the process sort its cache, on the
+  stack, which is why the probes matter.
+- **Cost** of one full `gsm_collect_sample` (all four readers), measured
+  2026-10-28 on the 16-thread laptop with 492 processes and 127 cgroups,
+  ReleaseSafe, best of 20 in one process: 12.4 ms (3 runs: 12.43, 12.44, 12.57).
+  That is about 1.2% of one CPU at a one-second refresh. The snapshot holds
+  216 bytes per process, 376 per cgroup and a 6.4 KB string table, about
+  190 KB in all; there is no subprocess and **0 bytes are written**.
+
 ## Build and test
 
 ```sh
 export ZIG_LOCAL_CACHE_DIR=/dev/shm/gsmcollect-cache   # optional: build cache in RAM
+zig build library                   # zig-out/lib/libgsmcollect.a and zig-out/include/gsmcollect.h
 zig build test                      # every test, over testdata/
 zig build test -Dtest-filter=NAME   # only tests whose name contains NAME
 zig build -Doptimize=ReleaseFast    # zig-out/bin/gsmcollect-probe
