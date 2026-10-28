@@ -1,0 +1,61 @@
+Name:	bash
+Umask:	0002
+State:	S (sleeping)
+Tgid:	344261
+Ngid:	0
+Pid:	344261
+PPid:	344259
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	256
+Groups:	4 24 27 30 46 100 105 125 130 984 985 986 993 1000 
+NStgid:	344261
+NSpid:	344261
+NSpgid:	344259
+NSsid:	344253
+Kthread:	0
+VmPeak:	    9956 kB
+VmSize:	    9956 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	    3664 kB
+VmRSS:	    3664 kB
+RssAnon:	     288 kB
+RssFile:	    3376 kB
+RssShmem:	       0 kB
+VmData:	     304 kB
+VmStk:	     136 kB
+VmExe:	     956 kB
+VmLib:	    1828 kB
+VmPTE:	      56 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	0/126447
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000010000
+SigIgn:	0000000000000006
+SigCgt:	0000000000010000
+CapInh:	0000000800000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	0
+Seccomp_filters:	0
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	ffff
+Cpus_allowed_list:	0-15
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	1
+nonvoluntary_ctxt_switches:	0
+x86_Thread_features:	
+x86_Thread_features_locked:	
