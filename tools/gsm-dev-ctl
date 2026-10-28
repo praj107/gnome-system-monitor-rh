@@ -18,7 +18,14 @@ window is buried behind your editor, and it cannot photograph the wrong window.
   gsm-dev-ctl toggle 'Track wear'  # flip a switch row by its title
   gsm-dev-ctl text                 # dump the visible text (assert on it)
   gsm-dev-ctl shot /tmp/out.png    # save a PNG of the window as it is now
+  gsm-dev-ctl action win.show-page::processes   # activate an app/window action
+  gsm-dev-ctl set show-whose-processes all      # write a GSettings key
+  gsm-dev-ctl select systemd       # select the first process row matching
+  gsm-dev-ctl close                # close the main window, as its button does
   gsm-dev-ctl quit
+
+Set GSM_DEV_IPC_SOCKET to the socket path the app was started with to drive
+one of several instances; without it the per-user default is used.
 """
 
 import os
@@ -29,6 +36,9 @@ SOCKET_NAME = "gnome-system-monitor-rh-dev.sock"
 
 
 def socket_path() -> str:
+    override = os.environ.get("GSM_DEV_IPC_SOCKET")
+    if override:
+        return override
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     return os.path.join(runtime, SOCKET_NAME)
 

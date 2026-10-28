@@ -35,6 +35,15 @@ unless GSM_DEV_IPC=1 is set at run time. A default build contains none of it
     ninja -C build
     GSM_DEV_IPC=1 ./build/src/gnome-system-monitor-rh &
 
+Several instances can run side by side: give each its own socket with
+GSM_DEV_IPC_SOCKET=/path/to/ipc.sock (the app and gsm-dev-ctl both read it).
+Verbs beyond tab/shot/text: `action NAME[::PARAM]` (activate an app. or win.
+action), `set KEY VALUE` (write a key of the app's schema), `select TEXT`
+(select the first process row containing TEXT) and `close` (close the main
+window). GSM_DEV_SANDBOX=1, also dev-IPC builds only, refuses every
+privileged prompt and every process action (end, kill, stop, continue, renice,
+affinity) with "disabled in a sandboxed developer session".
+
     tools/gsm-dev-ctl tab                  # list tabs, show current
     tools/gsm-dev-ctl tab health
     tools/gsm-dev-ctl size 1150x1050

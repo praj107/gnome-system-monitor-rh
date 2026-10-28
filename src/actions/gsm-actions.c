@@ -16,6 +16,35 @@
 
 #include "gsm-actions.h"
 
+/* Developer sandbox (dev IPC builds only): see src/dev-ipc.h. This library
+ * links no GTK, so it reads the switch itself rather than including that
+ * header; a release build compiles both to nothing. */
+#ifdef HAVE_DEV_IPC
+static gboolean
+gsm_dev_sandbox_enabled (void)
+{
+  return g_strcmp0 (g_getenv ("GSM_DEV_SANDBOX"), "1") == 0;
+}
+
+static const char *
+gsm_dev_sandbox_reason (void)
+{
+  return "disabled in a sandboxed developer session";
+}
+#else
+static inline gboolean
+gsm_dev_sandbox_enabled (void)
+{
+  return FALSE;
+}
+
+static inline const char *
+gsm_dev_sandbox_reason (void)
+{
+  return NULL;
+}
+#endif
+
 
 struct _GsmActions {
   GObject parent;
@@ -40,6 +69,9 @@ gsm_actions_init (G_GNUC_UNUSED GsmActions *self)
 static inline gboolean
 multi_root_check (const char *command)
 {
+  if (gsm_dev_sandbox_enabled ())
+    return FALSE;
+
   if (procman_has_pkexec ()) {
     return gsm_pkexec_create_root_password_dialog (command);
   }
@@ -116,6 +148,12 @@ gsm_actions_kill (GsmActions          *self,
   Kill *data;
 
   g_return_if_fail (GSM_IS_ACTIONS (self));
+
+  if (gsm_dev_sandbox_enabled ()) {
+    g_task_return_new_error (task, G_FILE_ERROR, G_FILE_ERROR_FAILED, "%s",
+                             gsm_dev_sandbox_reason ());
+    return;
+  }
 
   data = g_new0 (Kill, 1);
   data->pid = pid;
@@ -257,6 +295,12 @@ gsm_actions_set_affinity (GsmActions          *self,
 
   g_return_if_fail (GSM_IS_ACTIONS (self));
 
+  if (gsm_dev_sandbox_enabled ()) {
+    g_task_return_new_error (task, G_FILE_ERROR, G_FILE_ERROR_FAILED, "%s",
+                             gsm_dev_sandbox_reason ());
+    return;
+  }
+
   data = g_new0 (SetAffinity, 1);
   data->pid = pid;
   data->n_cpus = n_cpus;
@@ -343,6 +387,12 @@ gsm_actions_set_priority (GsmActions          *self,
   Priority *data;
 
   g_return_if_fail (GSM_IS_ACTIONS (self));
+
+  if (gsm_dev_sandbox_enabled ()) {
+    g_task_return_new_error (task, G_FILE_ERROR, G_FILE_ERROR_FAILED, "%s",
+                             gsm_dev_sandbox_reason ());
+    return;
+  }
 
   data = g_new0 (Priority, 1);
   data->pid = pid;

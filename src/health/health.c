@@ -21,6 +21,7 @@
 #include "gsm-procio.h"
 #include "gsm-udisks.h"
 #include "health.h"
+#include "dev-ipc.h"
 #include "settings-keys.h"
 
 #define SAMPLER_UNIT "gnome-system-monitor-health-sampler.service"
@@ -598,6 +599,11 @@ on_unlock_clicked (GtkButton *button,
 
   if (device == NULL)
     return;
+
+  if (gsm_dev_sandbox_enabled ()) {
+    gtk_widget_set_tooltip_text (GTK_WIDGET (button), gsm_dev_sandbox_reason ());
+    return;
+  }
 
   gtk_widget_set_sensitive (GTK_WIDGET (button), FALSE);
 
@@ -1210,6 +1216,11 @@ on_enable_io_accounting (GsmHealthView *self)
   g_autoptr (GError) error = NULL;
   g_autofree char *helper =
     g_build_filename (GSM_LIBEXEC_DIR, "gsm-io-accounting", NULL);
+
+  if (gsm_dev_sandbox_enabled ()) {
+    adw_banner_set_title (self->io_accounting_banner, gsm_dev_sandbox_reason ());
+    return;
+  }
 
   proc = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_SILENCE,
                            &error,

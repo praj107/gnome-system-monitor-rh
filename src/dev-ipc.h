@@ -26,11 +26,28 @@ G_BEGIN_DECLS
  */
 #ifdef HAVE_DEV_IPC
 void gsm_dev_ipc_init (GtkWindow *window);
+
+/* GSM_DEV_SANDBOX=1: refuse every privileged or process-affecting action, so a
+ * developer session can never signal a real process or raise a prompt. */
+gboolean    gsm_dev_sandbox_enabled (void);
+const char *gsm_dev_sandbox_reason (void);
 #else
 static inline void
 gsm_dev_ipc_init (GtkWindow *window)
 {
   (void) window;
+}
+
+static inline gboolean
+gsm_dev_sandbox_enabled (void)
+{
+  return FALSE;
+}
+
+static inline const char *
+gsm_dev_sandbox_reason (void)
+{
+  return NULL;
 }
 #endif
 
