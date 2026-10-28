@@ -114,6 +114,12 @@ void percentage_cell_data_func (GtkTreeViewColumn *col,
                                 GtkTreeIter       *iter,
                                 gpointer           user_data);
 
+void cpu_percentage_cell_data_func (GtkTreeViewColumn *col,
+                                    GtkCellRenderer   *renderer,
+                                    GtkTreeModel      *model,
+                                    GtkTreeIter       *iter,
+                                    gpointer           user_data);
+
 void status_cell_data_func (GtkTreeViewColumn *col,
                             GtkCellRenderer   *renderer,
                             GtkTreeModel      *model,

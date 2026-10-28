@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include "procinfo.h"
+#include "cpurate.h"
 
 #include <map>
 #include <string>
@@ -126,14 +127,26 @@ ProcInfo::ProcInfo(pid_t pid)
   info->arguments = make_string (g_strescape (tooltip.c_str (), "\\\""));
   g_strfreev (arguments);
 
-  guint64 cpu_time = proctime.rtime;
-  auto it = GsmApplication::get ().processes.cpu_times.find (pid);
+  const guint64 time_fields = (1ULL << GLIBTOP_PROC_TIME_RTIME) |
+                              (1ULL << GLIBTOP_PROC_TIME_START_TIME);
+  const bool time_read_ok = (proctime.flags & time_fields) == time_fields;
 
-  if (it != GsmApplication::get ().processes.cpu_times.end ())
-    if (proctime.rtime >= it->second)
-      cpu_time = it->second;
-  info->cpu_time = cpu_time;
-  info->start_time = proctime.start_time;
+  // Only a counter kept from an earlier refresh is a baseline (same process,
+  // not behind). The reading taken here is in the same refresh as the first
+  // update_info, so on its own it spans no interval: the rate of a process
+  // seen for the first time stays unknown until its next refresh.
+  const auto &kept = GsmApplication::get ().processes.cpu_times;
+  auto it = kept.find (pid);
+  const bool carried = it != kept.end ()
+                       && gsm_cpu_baseline_carries (time_read_ok,
+                                                    it->second.start_time,
+                                                    it->second.cpu_ticks,
+                                                    proctime.start_time,
+                                                    proctime.rtime);
+
+  info->cpu_time = carried ? it->second.cpu_ticks : (time_read_ok ? proctime.rtime : 0);
+  info->start_time = time_read_ok ? proctime.start_time : 0;
+  info->cpu_baseline_valid = carried;
 
   gsm_proc_info_load_cgroups (info);
   gsm_proc_info_load_selinux (info);

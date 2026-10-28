@@ -30,6 +30,8 @@ struct MutableProcInfo
     disk_write_bytes_current (0ULL),
     status (0U),
     pcpu (0),
+    cpu_known (false),
+    cpu_baseline_valid (false),
     nice (0),
     num_threads (0U),
     io_readable (false),
@@ -64,6 +66,11 @@ struct MutableProcInfo
   guint64 disk_write_bytes_current;
   guint status;
   gdouble pcpu;
+  // pcpu is a rate between two readings of the CPU counter: unknown on the
+  // first sample, after a failed read, a backwards counter or a reused pid.
+  bool cpu_known;
+  // the stored cpu_time / start_time come from a good reading of this process
+  bool cpu_baseline_valid;
   gint nice;
   guint num_threads;
   // /proc/<pid>/io is readable only for the user's own processes; an

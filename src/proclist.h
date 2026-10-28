@@ -15,7 +15,15 @@ class ProcList
   List data;
   std::mutex data_lock;
   public:
-  std::map<pid_t, unsigned long> cpu_times;
+  // The last good CPU counter of each pid with the start time of the process
+  // it belonged to, so a rebuilt ProcInfo inherits it only if it is the same
+  // process; a reused pid starts over.
+  struct CpuCounter
+  {
+    guint64 cpu_ticks;
+    guint64 start_time;
+  };
+  std::map<pid_t, CpuCounter> cpu_times;
   typedef List::iterator Iterator;
   Iterator
   begin ()

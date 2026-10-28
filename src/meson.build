@@ -19,6 +19,7 @@ system_monitor_sources = [
   'mem-map.c',
   'meminfo.c',
   'cputopology.c',
+  'cpurate.c',
   'diskstats.c',
   'netif.c',
   'nvml.c',
@@ -189,6 +190,17 @@ test(
     dependencies: [glib],
   ),
   args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
+)
+
+test(
+  'cpurate',
+  executable(
+    'test-cpurate',
+    ['cpurate.c', 'tests/test-cpurate.c'],
+    include_directories: rootInclude,
+    dependencies: [glib],
+  ),
   protocol: 'tap',
 )
 

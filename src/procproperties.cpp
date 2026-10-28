@@ -86,7 +86,8 @@ fill_proc_properties (GtkBuilder *builder,
   g_free (text);
 
   label = GTK_LABEL (gtk_builder_get_object (builder, "cpu_label"));
-  text = g_strdup_printf ("%.2f%%", info->pcpu);
+  /* No rate yet (first sample, failed read, reused pid): not a 0 %. */
+  text = info->cpu_known ? g_strdup_printf ("%.2f%%", info->pcpu) : g_strdup ("—");
   gtk_label_set_label (label, text);
   g_free (text);
 

@@ -50,6 +50,7 @@
 #include "interface.h"
 #include "nvml.h"
 #include "procinfo.h"
+#include "cpurate.h"
 #include "gsm-selinux.h"
 #include "settings-keys.h"
 #include "gsm-cgroups.h"
@@ -527,7 +528,7 @@ proctable_new (GsmApplication * const app)
 
           case COL_CPU:
             gtk_tree_view_column_set_cell_data_func (col, cell,
-                                                     &procman::percentage_cell_data_func,
+                                                     &procman::cpu_percentage_cell_data_func,
                                                      GUINT_TO_POINTER (i),
                                                      NULL);
             break;
@@ -813,7 +814,8 @@ update_info_mutable_cols (ProcInfo *info)
   tree_store_update (model, &info->node, COL_VMSIZE, info->vmsize);
   tree_store_update (model, &info->node, COL_MEMRES, info->memres);
   tree_store_update (model, &info->node, COL_MEMSHARED, info->memshared);
-  tree_store_update (model, &info->node, COL_CPU, info->pcpu);
+  // Unknown sorts below every known value (0 and up).
+  tree_store_update (model, &info->node, COL_CPU, info->cpu_known ? info->pcpu : -1.0);
   tree_store_update (model, &info->node, COL_CPU_TIME, info->cpu_time);
   tree_store_update (model, &info->node, COL_DISK_READ_TOTAL, info->disk_read_bytes_total);
   tree_store_update (model, &info->node, COL_DISK_WRITE_TOTAL, info->disk_write_bytes_total);
@@ -1090,22 +1092,43 @@ update_info (GsmApplication *app,
 
   info->set_user (procstate.uid);
 
-  // if the cpu time has increased reset the status to running
-  // regardless of kernel state (#606579)
-  guint64 difference = proctime.rtime - info->cpu_time;
+  // libgtop leaves flags at 0 when /proc/PID/stat could not be read (the
+  // process exited, or the read failed): rtime is then 0, not a counter.
+  const guint64 time_fields = (1ULL << GLIBTOP_PROC_TIME_RTIME) |
+                              (1ULL << GLIBTOP_PROC_TIME_START_TIME);
+  const bool time_read_ok = (proctime.flags & time_fields) == time_fields;
 
-  if (difference > 0)
-    info->status = GLIBTOP_PROCESS_RUNNING;
+  // A different start time under the same pid is a different process: its
+  // counter says nothing about the previous one's.
+  const bool same_process = info->cpu_baseline_valid
+                            && proctime.start_time == info->start_time;
 
   guint cpu_scale = 100;
 
   if (not app->config.solaris_mode)
     cpu_scale *= app->config.num_cpus;
 
-  info->pcpu = (gdouble)difference * cpu_scale / app->cpu_total_time;
-  info->pcpu = MIN (info->pcpu, cpu_scale);
+  const GsmCpuRate cpu_rate = gsm_cpu_rate (time_read_ok, same_process,
+                                            info->cpu_time, proctime.rtime,
+                                            app->cpu_total_time, cpu_scale);
 
-  app->processes.cpu_times[info->pid] = info->cpu_time = proctime.rtime;
+  info->cpu_known = cpu_rate.known;
+  info->pcpu = cpu_rate.known ? cpu_rate.percent : 0.0;
+
+  // if the cpu time has increased reset the status to running
+  // regardless of kernel state (#606579)
+  if (cpu_rate.known && cpu_rate.percent > 0.0)
+    info->status = GLIBTOP_PROCESS_RUNNING;
+
+  // The baseline moves only with a good reading; after a failed one the next
+  // reading starts a new baseline rather than spanning two intervals.
+  info->cpu_baseline_valid = time_read_ok;
+  if (time_read_ok)
+    {
+      info->cpu_time = proctime.rtime;
+      info->start_time = proctime.start_time;
+      app->processes.cpu_times[info->pid] = { proctime.rtime, proctime.start_time };
+    }
   info->nice = procuid.nice;
 
   update_disk_io (info, procio);
@@ -1239,7 +1262,8 @@ proctable_refresh_summary_headers(GsmApplication * app)
       return;
 
     total_mem += proc->mem;
-    total_cpu += round(proc->pcpu * 10.0f) / 10.0f;
+    if (proc->cpu_known)
+      total_cpu += round(proc->pcpu * 10.0f) / 10.0f;
     total_memres += proc->memres;
     total_vmsize += proc->vmsize;
     total_memshared += proc->memshared;
@@ -1555,6 +1579,7 @@ proctable_update (GsmApplication *app)
 void
 proctable_free_table (GsmApplication * const app)
 {
+  // cpu_times is kept: a rebuilt table seeds from it by process identity.
   app->processes.clear ();
 }
 

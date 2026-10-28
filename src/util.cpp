@@ -482,6 +482,25 @@ io_total_cell_data_func (GtkTreeViewColumn *col,
   size_na_cell_data_func (col, renderer, model, iter, user_data);
 }
 
+/* CPU %: "—" when the counter gave no rate (first sample, failed read,
+ * backwards counter, reused pid). */
+void
+cpu_percentage_cell_data_func (GtkTreeViewColumn *col,
+                               GtkCellRenderer   *renderer,
+                               GtkTreeModel      *model,
+                               GtkTreeIter       *iter,
+                               gpointer           user_data)
+{
+  const ProcInfo *info = proc_info_of_row (model, iter);
+
+  if (info != NULL && !info->cpu_known)
+    {
+      g_object_set (renderer, "text", UNKNOWN_FIGURE, NULL);
+      return;
+    }
+  percentage_cell_data_func (col, renderer, model, iter, user_data);
+}
+
 /* GPU memory: "—" unless NVML reported the process. */
 void
 gpu_memory_cell_data_func (GtkTreeViewColumn *col,

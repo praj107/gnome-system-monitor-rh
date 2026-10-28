@@ -111,6 +111,62 @@ get_stack (DevIpc *self)
 /* ------------------------------------------------------------------ */
 
 /*
+ * Let the frame clock run one full cycle (style, layout, paint) so that
+ * whatever the previous command changed has reached the widgets' render
+ * state. A widget paintable snapshots the tree as it is *now*; a changed
+ * state such as the view switcher's selected button only reaches its style
+ * and render node in the next frame's update phase, so a snapshot taken
+ * right after `tab` would otherwise show the old page selected next to the
+ * new content.
+ *
+ * Nested main loop iterations are fine here: the harness sends one command
+ * at a time and waits for its reply. A window that is not being painted
+ * (unmapped, suspended) never finishes a frame, hence the timeout.
+ */
+#define FRAME_WAIT_TIMEOUT_MS 500
+
+static void
+on_frame_painted (G_GNUC_UNUSED GdkFrameClock *clock,
+                  gpointer                     user_data)
+{
+  *(gboolean *) user_data = TRUE;
+}
+
+static gboolean
+on_frame_wait_timeout (gpointer user_data)
+{
+  *(gboolean *) user_data = TRUE;
+  return G_SOURCE_REMOVE;
+}
+
+static void
+wait_for_next_frame (GtkWidget *widget)
+{
+  GdkFrameClock *clock = gtk_widget_get_frame_clock (widget);
+  gboolean painted = FALSE;
+  gboolean timed_out = FALSE;
+  gulong handler;
+  guint timeout;
+
+  if (clock == NULL)
+    return;
+
+  handler = g_signal_connect (clock, "after-paint",
+                              G_CALLBACK (on_frame_painted), &painted);
+  timeout = g_timeout_add (FRAME_WAIT_TIMEOUT_MS,
+                           on_frame_wait_timeout, &timed_out);
+
+  gtk_widget_queue_draw (widget);
+  while (!painted && !timed_out)
+    g_main_context_iteration (NULL, TRUE);
+
+  g_signal_handler_disconnect (clock, handler);
+  if (!timed_out)
+    g_source_remove (timeout);
+}
+
+
+/*
  * Render the window straight from its widget tree into a PNG.
  *
  * Deliberately not an X11/Wayland screen grab: this reads the same render
@@ -132,6 +188,8 @@ cmd_shot (DevIpc     *self,
 
   if (path == NULL || *path == '\0')
     return g_strdup ("ERR shot needs a path\n");
+
+  wait_for_next_frame (widget);
 
   width = gtk_widget_get_width (widget);
   height = gtk_widget_get_height (widget);
@@ -690,6 +748,15 @@ gsm_dev_ipc_init (GtkWindow *window)
 
   g_signal_connect (self->service, "incoming", G_CALLBACK (on_incoming), self);
   g_socket_service_start (self->service);
+
+  /*
+   * A header switcher button fades its highlight over a couple of hundred
+   * milliseconds (a CSS transition), so a screenshot taken right after a
+   * `tab` caught both pages half selected. The developer build runs without
+   * animations, which also makes every screenshot reproducible.
+   */
+  g_object_set (gtk_settings_get_for_display (gtk_widget_get_display (GTK_WIDGET (window))),
+                "gtk-enable-animations", FALSE, NULL);
 
   the_ipc = self;
 
