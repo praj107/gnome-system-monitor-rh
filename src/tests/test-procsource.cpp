@@ -9,6 +9,8 @@
 
 #include <string.h>
 
+#include <string>
+
 #include <glib.h>
 #include <glibtop/procstate.h>
 
@@ -344,6 +346,163 @@ test_the_cgroup_path_points_into_the_string_table (void)
   g_assert_null (figures_of (window, record).cgroup_path);
 }
 
+/* A record with a layout-3 class, unit, user unit and session, over this
+ * string table. */
+static const char label_strings[] =
+  "user@1000.service" "app-gnome\\x2dtweaks.scope" "session-3.scope" "org.gnome.Tweaks";
+
+static gsm_process
+make_classified_record (void)
+{
+  gsm_process record = make_record ();
+
+  record.known |= GSM_PROCESS_HAS_CLASS | GSM_PROCESS_HAS_UNIT | GSM_PROCESS_HAS_USER_UNIT
+                  | GSM_PROCESS_HAS_SESSION | GSM_PROCESS_HAS_OWNER_UID | GSM_PROCESS_HAS_VM_SWAP;
+  record.workload_class = GSM_CLASS_APPLICATIONS;
+  record.class_confidence = GSM_CONFIDENCE_HIGH;
+  record.class_rule = 0;
+  record.owner_uid = 1000;
+  record.vm_swap_bytes = 12 * kB;
+  record.unit_offset = 0;
+  record.unit_length = 17;
+  record.user_unit_offset = 17;
+  record.user_unit_length = 25;
+  record.login_session_offset = 42;
+  record.login_session_length = 15;
+  record.class_key_offset = 57;
+  record.class_key_length = 16;
+  return record;
+}
+
+static GsmProcLabels
+labels_of (const gsm_process &record)
+{
+  GsmProcWindow window = make_window (NULL);
+  GsmProcLabels labels;
+
+  window.strings = label_strings;
+  window.strings_len = sizeof (label_strings) - 1;
+  gsm_proc_labels_from_record (&window, &record, &labels);
+  return labels;
+}
+
+static void
+test_class_name_and_tooltip_come_from_the_record (void)
+{
+  gsm_process record = make_classified_record ();
+  GsmProcLabels labels = labels_of (record);
+  const std::string rule = gsm_class_rule_name (record.class_rule);
+
+  g_assert_true (labels.class_known);
+  g_assert_cmpuint (labels.workload_class, ==, GSM_CLASS_APPLICATIONS);
+  g_assert_cmpstr (labels.class_name.c_str (), ==, "Applications");
+  g_assert_cmpstr (labels.class_rule.c_str (), ==, rule.c_str ());
+  const std::string wanted = "Rule: " + rule + " \u00b7 Confidence: high \u00b7 Key: org.gnome.Tweaks";
+
+  g_assert_cmpstr (labels.class_tooltip.c_str (), ==, wanted.c_str ());
+}
+
+static void
+test_a_classifier_that_did_not_run_gives_no_class (void)
+{
+  gsm_process record = make_classified_record ();
+
+  record.known &= ~GSM_PROCESS_HAS_CLASS;
+  g_assert_false (labels_of (record).class_known);
+}
+
+static void
+test_an_empty_key_reads_none_and_an_agent_shows_its_pid (void)
+{
+  gsm_process record = make_classified_record ();
+  guint rule = 0;
+
+  record.class_key_length = 0;
+  g_assert_nonnull (strstr (labels_of (record).class_tooltip.c_str (), "Key: none"));
+  g_assert_null (strstr (labels_of (record).class_tooltip.c_str (), "Agent pid"));
+
+  for (guint i = 0; i < gsm_class_rule_count (); i++)
+    if (strcmp (gsm_class_rule_name (i), "agent ancestry") == 0)
+      rule = i;
+  g_assert_cmpstr (gsm_class_rule_name (rule), ==, "agent ancestry");
+
+  record.class_rule = rule;
+  record.known |= GSM_PROCESS_HAS_AGENT;
+  record.agent_pid = 777;
+  g_assert_nonnull (strstr (labels_of (record).class_tooltip.c_str (), "Agent pid: 777"));
+}
+
+static void
+test_the_shown_unit_is_the_innermost_one (void)
+{
+  gsm_process record = make_classified_record ();
+  GsmProcLabels labels = labels_of (record);
+
+  g_assert_cmpstr (labels.unit.c_str (), ==, "user@1000.service");
+  g_assert_cmpstr (labels.user_unit.c_str (), ==, "app-gnome-tweaks.scope");
+  g_assert_cmpstr (labels.shown_unit.c_str (), ==, "app-gnome-tweaks.scope");
+  g_assert_cmpstr (labels.session.c_str (), ==, "session-3.scope");
+  g_assert_cmpstr (labels.unit_tooltip.c_str (), ==,
+                   "Unit: app-gnome-tweaks.scope\nOwned by: user@1000.service\nSession: session-3.scope");
+
+  /* a system service has no user unit: the unit that owns the path is shown */
+  record.known &= ~(GSM_PROCESS_HAS_USER_UNIT | GSM_PROCESS_HAS_SESSION);
+  labels = labels_of (record);
+  g_assert_cmpstr (labels.shown_unit.c_str (), ==, "user@1000.service");
+  g_assert_cmpstr (labels.unit_tooltip.c_str (), ==, "Unit: user@1000.service");
+
+  /* nothing in the cgroup path names a unit */
+  record.known &= ~GSM_PROCESS_HAS_UNIT;
+  labels = labels_of (record);
+  g_assert_cmpstr (labels.shown_unit.c_str (), ==, "");
+  g_assert_cmpstr (labels.unit_tooltip.c_str (), ==, "Unit: none");
+}
+
+static void
+test_a_slice_outside_the_string_table_is_not_followed (void)
+{
+  gsm_process record = make_classified_record ();
+
+  record.unit_offset = 50;
+  record.unit_length = 100;
+  g_assert_cmpstr (labels_of (record).unit.c_str (), ==, "");
+}
+
+static void
+test_owner_and_swap_are_unknown_without_their_bits (void)
+{
+  gsm_process record = make_classified_record ();
+  GsmProcLabels labels = labels_of (record);
+
+  g_assert_true (labels.owner_known);
+  g_assert_cmpuint (labels.owner_uid, ==, 1000);
+  g_assert_true (labels.swap_known);
+  g_assert_cmpuint (labels.swap_bytes, ==, 12 * kB);
+
+  /* a process with nothing swapped out is 0 with its bit set, not unknown */
+  record.vm_swap_bytes = 0;
+  labels = labels_of (record);
+  g_assert_true (labels.swap_known);
+  g_assert_cmpuint (labels.swap_bytes, ==, 0);
+
+  record.known &= ~(GSM_PROCESS_HAS_OWNER_UID | GSM_PROCESS_HAS_VM_SWAP);
+  labels = labels_of (record);
+  g_assert_false (labels.owner_known);
+  g_assert_false (labels.swap_known);
+  g_assert_false (figures_of (make_window (NULL), record).swap_known);
+}
+
+static void
+test_swap_reaches_the_figures (void)
+{
+  gsm_process record = make_classified_record ();
+  GsmProcFigures figures = figures_of (make_window (NULL), record);
+
+  g_assert_true (figures.swap_known);
+  g_assert_cmpuint (figures.swap_bytes, ==, 12 * kB);
+  g_assert_nonnull (figures.record);
+}
+
 static void
 test_whose_processes_selects_like_libgtop (void)
 {
@@ -485,6 +644,13 @@ main (int    argc,
   g_test_add_func ("/procsource/io/rate-unknown", test_disk_rate_is_unknown_for_a_reused_pid_or_a_backwards_counter);
   g_test_add_func ("/procsource/state", test_state_letters_map_like_libgtop);
   g_test_add_func ("/procsource/cgroup", test_the_cgroup_path_points_into_the_string_table);
+  g_test_add_func ("/procsource/labels/class", test_class_name_and_tooltip_come_from_the_record);
+  g_test_add_func ("/procsource/labels/no-class", test_a_classifier_that_did_not_run_gives_no_class);
+  g_test_add_func ("/procsource/labels/key-and-agent", test_an_empty_key_reads_none_and_an_agent_shows_its_pid);
+  g_test_add_func ("/procsource/labels/innermost-unit", test_the_shown_unit_is_the_innermost_one);
+  g_test_add_func ("/procsource/labels/outside-table", test_a_slice_outside_the_string_table_is_not_followed);
+  g_test_add_func ("/procsource/labels/owner-swap", test_owner_and_swap_are_unknown_without_their_bits);
+  g_test_add_func ("/procsource/swap", test_swap_reaches_the_figures);
   g_test_add_func ("/procsource/whose", test_whose_processes_selects_like_libgtop);
   g_test_add_func ("/procsource/fixture", test_a_captured_proc_tree_gives_the_documented_figures);
   g_test_add_func ("/procsource/missing-root", test_a_missing_proc_root_does_not_sample);

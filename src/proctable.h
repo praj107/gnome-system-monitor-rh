@@ -57,6 +57,10 @@ enum
   COL_GPU_MEM,
   COL_PRIORITY,
   COL_THREADS,
+  // appended after the others: a column's id keys its saved width and
+  // visibility, so the ids of the older columns must not move
+  COL_CLASS,
+  COL_SWAP,
   COL_ICON,
   COL_POINTER,
   COL_TOOLTIP,

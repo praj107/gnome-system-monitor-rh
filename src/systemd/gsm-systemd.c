@@ -4,6 +4,7 @@
 
 #include "config.h"
 
+#include <errno.h>
 #include <unistd.h>
 
 #include <glib/gstdio.h>
@@ -29,6 +30,41 @@ gsm_systemd_is_running (void)
   }
 
   return status == RUNNING;
+}
+
+
+/* The seat of a login session never changes while the session exists (logind
+ * assigns it at creation, sd_session_get_seat(3)), so one lookup per session
+ * id serves the life of the program. A session without a seat (a remote
+ * login) is remembered as the empty string. A failed lookup (the session
+ * ended, logind is busy) is not remembered, so the next refresh asks again.
+ * The caller runs on the main thread, so the table needs no lock. */
+const char *
+gsm_systemd_get_session_seat (const char *session)
+{
+  static GHashTable *seats = NULL;
+  char *seat = NULL;
+  const char *known;
+  int r;
+
+  if (session == NULL || session[0] == '\0' || !gsm_systemd_is_running ())
+    return "";
+
+  if (seats == NULL)
+    seats = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+
+  if (g_hash_table_lookup_extended (seats, session, NULL, (gpointer *) &known))
+    return known;
+
+  r = sd_session_get_seat (session, &seat);
+  if (r < 0 && r != -ENODATA)
+    return "";
+
+  g_hash_table_insert (seats, g_strdup (session), g_strdup (r >= 0 ? seat : ""));
+  free (seat);
+
+  g_hash_table_lookup_extended (seats, session, NULL, (gpointer *) &known);
+  return known;
 }
 
 

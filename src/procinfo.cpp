@@ -148,9 +148,10 @@ ProcInfo::ProcInfo(pid_t pid)
   info->start_time = time_read_ok ? proctime.start_time : 0;
   info->cpu_baseline_valid = carried;
 
-  gsm_proc_info_load_cgroups (info);
+  // The cgroup and the systemd fields are filled by the first refresh, by
+  // whichever source the list reads: loading them here as well would repeat
+  // the per-process lookups the collector path avoids.
   gsm_proc_info_load_selinux (info);
-  gsm_proc_info_load_systemd (info);
 }
 
 
@@ -213,6 +214,9 @@ gsm_proc_info_load_systemd (ProcInfo *self)
                                     &sd_seat,
                                     &sd_owner)) {
     self->unit = make_string (g_steal_pointer (&sd_unit));
+    self->unit_label = self->unit;
+    self->user_unit.clear ();
+    self->unit_tooltip.clear ();
     self->session = make_string (g_steal_pointer (&sd_session));
     self->seat = make_string (g_steal_pointer (&sd_seat));
     self->owner = self->lookup_user (sd_owner);

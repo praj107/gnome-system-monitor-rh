@@ -313,7 +313,7 @@
     </key>
 
     <key name="columns-order" type="ai">
-      <default>[ 0, 12 ]
+      <default>[ 0, 30, 12 ]
       </default>
       <summary>Process view columns order
       </summary>
@@ -744,6 +744,35 @@
       <summary>Show process "Threads" column on startup
       </summary>
     </key>
+
+    <key name="col-30-width" type="i">
+      <default>150
+      </default>
+      <summary>Width of process "Class" column
+      </summary>
+    </key>
+
+    <key name="col-30-visible" type="b">
+      <default>true
+      </default>
+      <summary>Show process "Class" column on startup
+      </summary>
+    </key>
+
+    <key name="col-31-width" type="i">
+      <default>100
+      </default>
+      <summary>Width of process "Swap" column
+      </summary>
+    </key>
+
+    <key name="col-31-visible" type="b">
+      <default>false
+      </default>
+      <summary>Show process "Swap" column on startup
+      </summary>
+    </key>
+
 
 
   </schema>

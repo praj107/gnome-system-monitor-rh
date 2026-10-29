@@ -45,7 +45,11 @@ struct MutableProcInfo
     gpu_percent (0.0),
     gpu_mem (0UL),
     gpu_percent_known (false),
-    gpu_mem_known (false)
+    gpu_mem_known (false),
+    class_known (false),
+    workload_class (0),
+    swap_known (false),
+    swap (0UL)
   {
   }
 
@@ -99,7 +103,27 @@ struct MutableProcInfo
   bool gpu_mem_known;
   std::string cgroup_name;
 
+  // The workload class the collector's rules give the process (a
+  // GSM_CLASS_* value). Unknown on the libgtop path, which has no classifier.
+  bool class_known;
+  guint workload_class;
+  std::string class_name;
+  std::string class_rule;
+  // VmSwap; unknown unless the collector read it.
+  bool swap_known;
+  gulong swap;
+
+  // The unit that owns the cgroup path (systemd's cg_path_get_unit): the
+  // definition both sources share, and what the row comparison reads.
   std::string unit;
+  // The innermost unit, shown in the Unit column: the unit inside the user
+  // manager or login session when there is one. On the libgtop path it is
+  // `unit`, as libsystemd's per-process call gives only that.
+  std::string unit_label;
+  std::string user_unit;
+  // Hover text of the Unit and Class cells; empty on the libgtop path.
+  std::string unit_tooltip;
+  std::string class_tooltip;
   std::string session;
   std::string seat;
 

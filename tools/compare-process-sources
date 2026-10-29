@@ -5,7 +5,7 @@ machine this runs on.
 
 The application (a developer build, -Ddev_ipc=true) runs in a private headless
 Weston with in-memory settings, the way src/tests/test-headless-crashes.py runs
-it. With the same window showing the same processes it dumps the rows three
+it. With the same window showing the same processes it dumps the rows four
 times, through the `rows` verb of the control socket:
 
     A1  process-source=libgtop
@@ -23,7 +23,8 @@ back agree every time (the definitions match; the dumps caught the process
 at different moments). A constant offset between the two files read
 together is never skipped.
 
-  * exact fields: ppid, start time, name, user (uid), nice, cgroup, unit;
+  * exact fields: ppid, start time, name, user (uid), nice, cgroup, unit
+    (the system unit that owns the cgroup path), session;
   * stable fields (threads, the four memory figures, disk read total): only
     where A1 equals A2, and then B must equal them;
   * status: the same, for a process whose CPU-time counter did not move in
@@ -39,6 +40,14 @@ A difference is "expected" when the collector's documented definition makes
 it different (the user's real uid against the owner of /proc/PID, which is
 root for a process that is not dumpable; the disk-write definition), and
 "unexplained" otherwise. The exit status is 1 if anything is unexplained.
+
+The whole four-dump cycle runs twice. A busy process can oscillate between
+two values and line up with the dumps of one cycle; a wrong mapping gives
+the same difference every time. A first-cycle difference therefore counts as
+unexplained only when, in the second cycle, the same pid with the same start
+time differs again in the same field, each source being self-consistent
+(libgtop's two dumps equal, the collector's two dumps equal). The report says
+how many first-cycle differences the second cycle cleared.
 
 Usage: compare-process-sources BUILD_DIR [--whose all,user] [--settle SECONDS]
 
@@ -63,7 +72,8 @@ TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(TOOLS_DIR)
 HARNESS = os.path.join(REPO_DIR, "src", "tests", "test-headless-crashes.py")
 
-EXACT_FIELDS = ("ppid", "start_time_s", "name", "uid", "nice", "cgroup", "unit")
+EXACT_FIELDS = ("ppid", "start_time_s", "name", "uid", "nice", "cgroup", "unit",
+                "session")
 STABLE_FIELDS = ("status", "threads", "private_bytes", "resident_bytes",
                  "shared_bytes", "virtual_bytes", "disk_read_bytes")
 
@@ -91,6 +101,11 @@ class Tally:
         self.fields = {name: {"compared": 0, "equal": 0, "expected": [],
                               "unexplained": [], "skipped": 0}
                        for name in TABLE_FIELDS}
+        # (field, pid, start time) of each unexplained difference, in step
+        # with the examples; the second cycle confirms or clears them
+        self.keys = {name: [] for name in TABLE_FIELDS}
+        self.current = None
+        self.cleared = []
 
     def equal(self, field):
         entry = self.fields[field]
@@ -106,6 +121,23 @@ class Tally:
         entry = self.fields[field]
         entry["compared"] += 1
         entry["unexplained"].append(example)
+        self.keys[field].append(self.current)
+
+    def confirm_with(self, second):
+        """Keep only the unexplained differences the second cycle repeats:
+        the same field of the same pid with the same start time. One with no
+        pid (none exists today) is kept."""
+        for name in TABLE_FIELDS:
+            again = set(second.keys[name])
+            kept, kept_keys = [], []
+            for example, key in zip(self.fields[name]["unexplained"], self.keys[name]):
+                if key is None or key in again:
+                    kept.append(example)
+                    kept_keys.append(key)
+                else:
+                    self.cleared.append("%s: %s" % (name, example))
+            self.fields[name]["unexplained"] = kept
+            self.keys[name] = kept_keys
 
     def skip(self, field):
         self.fields[field]["skipped"] += 1
@@ -133,6 +165,10 @@ class Tally:
             for name in TABLE_FIELDS:
                 for example in self.fields[name][kind][:EXAMPLES]:
                     print("  %s %s: %s" % (kind, name, example))
+        if self.cleared:
+            print("  cleared by the second cycle: %d" % len(self.cleared))
+            for example in self.cleared[:EXAMPLES]:
+                print("    cleared %s" % example)
         for name in self.unjudged():
             print("  unjudged %s: skipped %d, compared only %d" % (
                 name, self.fields[name]["skipped"], self.fields[name]["compared"]))
@@ -244,6 +280,7 @@ def compare(whose, dumps, taken_at, cancelled):
         row = (b.get(pid) or a1.get(pid) or a2.get(pid))
         label = describe(pid, row)
         ipid = int(pid)
+        tally.current = (pid, row.get("start_time_s"))
 
         if in_a1 and in_a2 and a1[pid]["start_time_s"] != a2[pid]["start_time_s"]:
             tally.skip("presence")      # the pid was reused between A1 and A2
@@ -299,6 +336,9 @@ def compare(whose, dumps, taken_at, cancelled):
                 continue
             if rb[field] == r1[field]:
                 tally.equal(field)
+                continue
+            if b2.get(pid) is not None and b2[pid][field] != rb[field]:
+                tally.skip(field)       # the collector itself changed it between dumps
                 continue
             if field == "uid":
                 uids = proc_status_uids(ipid)
@@ -406,6 +446,40 @@ def set_key(harness, session, ctl_path, key, value):
         raise AssertionError("set %s %s: %s" % (key, value, out))
 
 
+def one_cycle(harness, session, ctl_path, whose, settle_s, tag):
+    """A1 (libgtop), B (collector), A2 (libgtop), B2 (collector); the Tally."""
+    directory = session.root
+    set_key(harness, session, ctl_path, "process-source", "libgtop")
+    time.sleep(settle_s)
+    (c1, a1), t_a1 = dump(harness, session, ctl_path, directory, "%s-%s-a1" % (whose, tag))
+
+    set_key(harness, session, ctl_path, "process-source", "collector")
+    time.sleep(settle_s)
+    # cancelled_write_bytes just before and just after the collector's dump
+    pids = list(a1)
+    before = {pid: cancelled_write_bytes(int(pid)) for pid in pids}
+    (cb, b), t_b = dump(harness, session, ctl_path, directory, "%s-%s-b" % (whose, tag))
+    after = {pid: cancelled_write_bytes(int(pid)) for pid in pids}
+    cancelled = {pid: (before[pid], after[pid]) for pid in pids}
+
+    set_key(harness, session, ctl_path, "process-source", "libgtop")
+    time.sleep(settle_s)
+    (c2, a2), t_a2 = dump(harness, session, ctl_path, directory, "%s-%s-a2" % (whose, tag))
+
+    set_key(harness, session, ctl_path, "process-source", "collector")
+    time.sleep(settle_s)
+    (cb2, b2), t_b2 = dump(harness, session, ctl_path, directory, "%s-%s-b2" % (whose, tag))
+
+    for comment, source in ((c1, "libgtop"), (cb, "collector"), (c2, "libgtop"),
+                            (cb2, "collector")):
+        if "process-source=%s" % source not in comment:
+            raise AssertionError("dump says %r, expected %s" % (comment, source))
+        if "show-whose-processes=%s" % whose not in comment:
+            raise AssertionError("dump says %r, expected %s" % (comment, whose))
+
+    return compare(whose, (a1, b, a2, b2), (t_a1, t_b, t_a2), cancelled)
+
+
 def run_mode(harness, session, app, ctl_path, whose, settle_s):
     proc, _ = session.start_app(app, "compare-%s.log" % whose)
     try:
@@ -416,38 +490,17 @@ def run_mode(harness, session, app, ctl_path, whose, settle_s):
         set_key(harness, session, ctl_path, "update-interval", str(UPDATE_INTERVAL_MS))
         set_key(harness, session, ctl_path, "show-whose-processes", whose)
 
-        directory = session.root
-        set_key(harness, session, ctl_path, "process-source", "libgtop")
-        time.sleep(settle_s)
-        (c1, a1), t_a1 = dump(harness, session, ctl_path, directory, whose + "-a1")
-
-        set_key(harness, session, ctl_path, "process-source", "collector")
-        time.sleep(settle_s)
-        # cancelled_write_bytes just before and just after the collector's dump
-        pids = list(a1)
-        before = {pid: cancelled_write_bytes(int(pid)) for pid in pids}
-        (cb, b), t_b = dump(harness, session, ctl_path, directory, whose + "-b")
-        after = {pid: cancelled_write_bytes(int(pid)) for pid in pids}
-        cancelled = {pid: (before[pid], after[pid]) for pid in pids}
-
-        set_key(harness, session, ctl_path, "process-source", "libgtop")
-        time.sleep(settle_s)
-        (c2, a2), t_a2 = dump(harness, session, ctl_path, directory, whose + "-a2")
-
-        set_key(harness, session, ctl_path, "process-source", "collector")
-        time.sleep(settle_s)
-        (cb2, b2), t_b2 = dump(harness, session, ctl_path, directory, whose + "-b2")
-
-        for comment, source in ((c1, "libgtop"), (cb, "collector"), (c2, "libgtop"),
-                                (cb2, "collector")):
-            if "process-source=%s" % source not in comment:
-                raise AssertionError("dump says %r, expected %s" % (comment, source))
-            if "show-whose-processes=%s" % whose not in comment:
-                raise AssertionError("dump says %r, expected %s" % (comment, whose))
+        first = one_cycle(harness, session, ctl_path, whose, settle_s, "c1")
+        before = first.unexplained_count()
+        if first.unexplained_count() > 0:
+            second = one_cycle(harness, session, ctl_path, whose, settle_s, "c2")
+            first.confirm_with(second)
+        print("\nshow-whose-processes=%s: %d first-cycle unexplained, %d cleared by the "
+              "second cycle" % (whose, before, len(first.cleared)))
 
         harness.ctl(session, ctl_path, "close")
         proc.wait(timeout=harness.APP_EXIT_TIMEOUT_S)
-        return compare(whose, (a1, b, a2, b2), (t_a1, t_b, t_a2), cancelled)
+        return first
     finally:
         if proc.poll() is None:
             proc.kill()

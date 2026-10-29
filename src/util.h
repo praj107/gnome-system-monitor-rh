@@ -120,6 +120,14 @@ void cpu_percentage_cell_data_func (GtkTreeViewColumn *col,
                                     GtkTreeIter       *iter,
                                     gpointer           user_data);
 
+/* Class: the workload class name, "—" when the row has no class (the
+ * libgtop path has no classifier). */
+void class_cell_data_func (GtkTreeViewColumn *col,
+                           GtkCellRenderer   *renderer,
+                           GtkTreeModel      *model,
+                           GtkTreeIter       *iter,
+                           gpointer           user_data);
+
 void status_cell_data_func (GtkTreeViewColumn *col,
                             GtkCellRenderer   *renderer,
                             GtkTreeModel      *model,

@@ -447,6 +447,9 @@ memory_figure_known (const ProcInfo *info,
       case COL_MEM:
         return info->mem_known;
 
+      case COL_SWAP:
+        return info->swap_known;
+
       default:
         return true;
     }
@@ -513,6 +516,21 @@ io_total_cell_data_func (GtkTreeViewColumn *col,
       return;
     }
   size_na_cell_data_func (col, renderer, model, iter, user_data);
+}
+
+void
+class_cell_data_func (GtkTreeViewColumn *,
+                      GtkCellRenderer   *renderer,
+                      GtkTreeModel      *model,
+                      GtkTreeIter       *iter,
+                      gpointer)
+{
+  const ProcInfo *info = proc_info_of_row (model, iter);
+
+  if (info == NULL || !info->class_known)
+    g_object_set (renderer, "text", UNKNOWN_FIGURE, NULL);
+  else
+    g_object_set (renderer, "text", info->class_name.c_str (), NULL);
 }
 
 /* CPU %: "—" when the counter gave no rate (first sample, failed read,

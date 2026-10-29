@@ -22,12 +22,25 @@
  *                   cancellation without ever having been charged for them
  *   Start time      boot time (btime of /proc/stat) + start_ticks / CLK_TCK
  *
+ *   Swap            VmSwap
+ *   Class           the workload class the collector's rules give the process
+ *                   (kernel, init, system services, ...), with the rule that
+ *                   decided, how sure it is and what it is keyed by
+ *   Unit            the innermost systemd unit named by the cgroup path: the
+ *                   unit inside the user manager or login session when the
+ *                   process runs under one, else the unit that owns the path
+ *                   (systemd.resource-control(5), systemd.slice(5): a user's
+ *                   applications all sit under user@UID.service, which tells
+ *                   an operator nothing)
+ *
  * A figure the kernel did not provide (a clear `known` bit) or that needs two
  * snapshots of the same process and has only one is flagged unknown in the
  * result; it is never 0.
  */
 
 #pragma once
+
+#include <string>
 
 #include <glib.h>
 #include <sys/types.h>
@@ -84,6 +97,15 @@ typedef struct
    * NUL-terminated at path_len); NULL when the kernel did not give one. */
   const char *cgroup_path;
   gsize       cgroup_path_len;
+
+  gboolean  swap_known;
+  guint64   swap_bytes;
+
+  /* The record and the string table it points into, valid until the next
+   * sample: gsm_proc_labels_from_record reads the class and unit from them. */
+  const gsm_process *record;
+  const char        *strings;
+  gsize              strings_len;
 } GsmProcFigures;
 
 /* What the mapping needs besides the record itself. */
@@ -137,3 +159,31 @@ guint          gsm_proc_source_figures (GsmProcSource  *source,
 gint64         gsm_proc_source_boot_time_s (GsmProcSource *source);
 
 G_END_DECLS
+
+/* What a layout-3 record says about a row besides its numbers. Strings are
+ * decoded (systemd writes "-" in a cgroup directory name as "\x2d") and empty
+ * when the record has none; "unit" is the unit that owns the cgroup path. */
+struct GsmProcLabels
+{
+  bool        class_known = false;
+  guint       workload_class = 0;     /* GSM_CLASS_*, valid with class_known */
+  std::string class_name;
+  std::string class_rule;             /* the name of the rule that decided */
+  std::string class_tooltip;          /* "Rule: R · Confidence: C · Key: K" */
+
+  std::string unit;
+  std::string user_unit;
+  std::string session;
+  std::string shown_unit;             /* the innermost: user_unit, else unit */
+  std::string unit_tooltip;
+
+  bool        owner_known = false;
+  guint       owner_uid = 0;
+
+  bool        swap_known = false;
+  guint64     swap_bytes = 0;
+};
+
+void gsm_proc_labels_from_record (const GsmProcWindow *window,
+                                  const gsm_process   *record,
+                                  GsmProcLabels       *labels);

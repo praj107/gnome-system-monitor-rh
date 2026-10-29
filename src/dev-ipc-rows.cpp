@@ -77,7 +77,7 @@ write_row (GtkTreeModel *model,
 
   std::fprintf (dump->out,
                 "%d\t%d\t%s\t%s\t%u\t%u\t%d\t%u\t%s\t%" G_GUINT64_FORMAT
-                "\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                "\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                 (int) info->pid, (int) info->ppid,
                 bytes_or_unknown (info->start_time_known, info->start_time).c_str (),
                 tsv_text (info->name).c_str (),
@@ -90,7 +90,12 @@ write_row (GtkTreeModel *model,
                 bytes_or_unknown (info->io_readable, info->disk_read_bytes_total).c_str (),
                 bytes_or_unknown (info->io_readable, info->disk_write_bytes_total).c_str (),
                 tsv_text (info->cgroup_name).c_str (),
-                tsv_text (info->unit).c_str ());
+                tsv_text (info->unit).c_str (),
+                info->class_known ? tsv_text (info->class_name).c_str () : "unknown",
+                info->class_known ? tsv_text (info->class_rule).c_str () : "unknown",
+                tsv_text (info->user_unit).c_str (),
+                tsv_text (info->session).c_str (),
+                bytes_or_unknown (info->swap_known, info->swap).c_str ());
   dump->rows++;
   return FALSE;
 }
@@ -141,7 +146,7 @@ gsm_dev_ipc_write_rows (GtkTreeModel *store,
   std::fputs ("pid\tppid\tstart_time_s\tname\tuid\tstatus\tnice\tthreads\t"
               "cpu_percent\tcpu_time_ticks\tprivate_bytes\tresident_bytes\t"
               "shared_bytes\tvirtual_bytes\tdisk_read_bytes\tdisk_write_bytes\t"
-              "cgroup\tunit\n", dump.out);
+              "cgroup\tunit\tclass\trule\tuser_unit\tsession\tswap_bytes\n", dump.out);
 
   gtk_tree_model_foreach (store, write_row, &dump);
 

@@ -332,6 +332,59 @@ cb_show_whose_processes_changed (Gio::Settings&,
     }
 }
 
+/* Hover text of the Class and Unit cells: the rule behind the class, and the
+ * units and session behind the shown unit. Any other cell shows the row's
+ * command line, as the tree view's own tooltip column does. */
+static gboolean
+cb_proctree_query_tooltip (GtkWidget  *widget,
+                           int         x,
+                           int         y,
+                           gboolean    keyboard_tip,
+                           GtkTooltip *tooltip,
+                           gpointer)
+{
+  GtkTreeView *view = GTK_TREE_VIEW (widget);
+  GtkTreeModel *model = NULL;
+  GtkTreePath *path = NULL;
+  GtkTreeIter iter;
+  GtkTreeViewColumn *column = NULL;
+  gboolean shown = FALSE;
+  int bin_x, bin_y;
+
+  if (keyboard_tip)
+    return FALSE;
+
+  gtk_tree_view_convert_widget_to_bin_window_coords (view, x, y, &bin_x, &bin_y);
+  if (!gtk_tree_view_get_path_at_pos (view, bin_x, bin_y, &path, &column, NULL, NULL))
+    return FALSE;
+
+  if (gtk_tree_view_get_tooltip_context (view, x, y, FALSE, &model, NULL, &iter))
+    {
+      gpointer pointer = NULL;
+
+      gtk_tree_model_get (model, &iter, COL_POINTER, &pointer, -1);
+      const ProcInfo *info = static_cast<const ProcInfo *>(pointer);
+      const int column_id = gtk_tree_view_column_get_sort_column_id (column);
+      const std::string *text = NULL;
+
+      if (info != NULL && column_id == COL_CLASS && !info->class_tooltip.empty ())
+        text = &info->class_tooltip;
+      else if (info != NULL && column_id == COL_UNIT && !info->unit_tooltip.empty ())
+        text = &info->unit_tooltip;
+
+      if (text != NULL)
+        {
+          gtk_tooltip_set_text (tooltip, text->c_str ());
+          gtk_tree_view_set_tooltip_cell (view, tooltip, path, column, NULL);
+          shown = TRUE;
+        }
+    }
+
+  gtk_tree_path_free (path);
+  return shown;
+}
+
+
 GsmTreeView *
 proctable_new (GsmApplication * const app)
 {
@@ -377,6 +430,8 @@ proctable_new (GsmApplication * const app)
     N_("GPU Memory"),
     N_("Priority"),
     N_("Threads"),
+    N_("Class"),
+    N_("Swap"),
     NULL,
     "POINTER"
   };
@@ -414,6 +469,8 @@ proctable_new (GsmApplication * const app)
                               G_TYPE_ULONG,         /* GPU Memory   */
                               G_TYPE_STRING,        /* Priority     */
                               G_TYPE_UINT,          /* Threads      */
+                              G_TYPE_INT,           /* Class (number, -1 unknown) */
+                              G_TYPE_ULONG,         /* Swap         */
                               GDK_TYPE_TEXTURE,     /* Icon         */
                               G_TYPE_POINTER,       /* ProcInfo     */
                               G_TYPE_STRING         /* Sexy tooltip */
@@ -426,6 +483,9 @@ proctable_new (GsmApplication * const app)
 
   proctree = gsm_tree_view_new (settings, TRUE);
   gtk_tree_view_set_model (GTK_TREE_VIEW (proctree), GTK_TREE_MODEL (model_sort));
+  // connected first: the first handler to return TRUE wins, and the tooltip
+  // column's own handler (below) would answer every cell
+  g_signal_connect (proctree, "query-tooltip", G_CALLBACK (cb_proctree_query_tooltip), NULL);
   gtk_tree_view_set_tooltip_column (GTK_TREE_VIEW (proctree), COL_TOOLTIP);
   gtk_tree_view_set_show_expanders (GTK_TREE_VIEW (proctree), app->settings->get_boolean (GSM_SETTING_SHOW_DEPENDENCIES));
   gtk_tree_view_set_enable_search (GTK_TREE_VIEW (proctree), FALSE);
@@ -457,7 +517,7 @@ proctable_new (GsmApplication * const app)
 
   gtk_tree_view_column_set_expand (column, TRUE);
 
-  for (i = COL_USER; i <= COL_THREADS; i++)
+  for (i = COL_USER; i <= COL_SWAP; i++)
     {
       GtkWidget *box;
       GtkWidget *title_label;
@@ -516,8 +576,16 @@ proctable_new (GsmApplication * const app)
           case COL_MEMRES:
           case COL_MEMSHARED:
           case COL_MEM:
+          case COL_SWAP:
             gtk_tree_view_column_set_cell_data_func (col, cell,
                                                      &procman::size_na_cell_data_func,
+                                                     GUINT_TO_POINTER (i),
+                                                     NULL);
+            break;
+
+          case COL_CLASS:
+            gtk_tree_view_column_set_cell_data_func (col, cell,
+                                                     &procman::class_cell_data_func,
                                                      GUINT_TO_POINTER (i),
                                                      NULL);
             break;
@@ -601,6 +669,7 @@ proctable_new (GsmApplication * const app)
           case COL_MEMRES:
           case COL_MEMSHARED:
           case COL_MEM:
+          case COL_SWAP:
           case COL_CPU:
           case COL_CPU_TIME:
           case COL_DISK_READ_TOTAL:
@@ -629,6 +698,7 @@ proctable_new (GsmApplication * const app)
           case COL_MEMRES:
           case COL_MEMSHARED:
           case COL_MEM:
+          case COL_SWAP:
           case COL_CPU:
           case COL_CPU_TIME:
           case COL_DISK_READ_TOTAL:
@@ -673,6 +743,7 @@ proctable_new (GsmApplication * const app)
           case COL_DISK_WRITE_CURRENT:
           case COL_CPU_TIME:
           case COL_MEM:
+          case COL_SWAP:
             g_object_set (G_OBJECT (cell), "xalign", 1.0f, NULL);
             break;
         }
@@ -829,11 +900,13 @@ update_info_mutable_cols (ProcInfo *info)
   tree_store_update (model, &info->node, COL_MEM, info->mem);
   tree_store_update (model, &info->node, COL_WCHAN, info->wchan.c_str ());
   tree_store_update (model, &info->node, COL_CGROUP, info->cgroup_name.c_str ());
-  tree_store_update (model, &info->node, COL_UNIT, info->unit.c_str ());
+  tree_store_update (model, &info->node, COL_UNIT, info->unit_label.c_str ());
   tree_store_update (model, &info->node, COL_SESSION, info->session.c_str ());
   tree_store_update (model, &info->node, COL_SEAT, info->seat.c_str ());
   tree_store_update (model, &info->node, COL_OWNER, info->owner.c_str ());
   tree_store_update (model, &info->node, COL_THREADS, info->num_threads);
+  tree_store_update (model, &info->node, COL_CLASS, info->class_known ? (gint) info->workload_class : -1);
+  tree_store_update (model, &info->node, COL_SWAP, info->swap);
   tree_store_update (model, &info->node, COL_GPU, info->gpu_percent);
   tree_store_update (model, &info->node, COL_GPU_MEM, info->gpu_mem);
 }
@@ -1113,6 +1186,11 @@ update_info (GsmApplication *app,
   get_process_memory_info (info);
   info->vmsize_known = info->memres_known = info->memshared_known = info->mem_known = true;
   info->start_time_known = true;
+  // libgtop has no classifier and no VmSwap: both are unknown here
+  info->class_known = false;
+  info->class_tooltip.clear ();
+  info->swap_known = false;
+  info->swap = 0;
 
   info->set_user (procstate.uid);
 
@@ -1172,6 +1250,43 @@ update_info (GsmApplication *app,
   info->process_type = get_process_type (info);
 
   update_gpu_figures (info);
+}
+
+
+/* Class, swap, unit, session and owner from the collector's record, in place
+ * of libsystemd's per-process calls (each of which re-reads /proc/PID/cgroup).
+ * Only the seat is looked up, once per login session. */
+static void
+apply_record_labels (ProcInfo             *info,
+                     const GsmProcFigures &figures)
+{
+  GsmProcWindow window = {};
+  GsmProcLabels labels;
+
+  window.strings = figures.strings;
+  window.strings_len = figures.strings_len;
+  gsm_proc_labels_from_record (&window, figures.record, &labels);
+
+  info->class_known = labels.class_known;
+  info->workload_class = labels.workload_class;
+  info->class_name = labels.class_name;
+  info->class_rule = labels.class_rule;
+  info->class_tooltip = labels.class_tooltip;
+
+  info->swap_known = figures.swap_known;
+  info->swap = figures.swap_known ? figures.swap_bytes : 0;
+
+  info->unit = labels.unit;
+  info->user_unit = labels.user_unit;
+  info->unit_label = labels.shown_unit;
+  info->unit_tooltip = labels.unit_tooltip;
+  info->session = labels.session;
+  info->owner = labels.owner_known ? info->lookup_user (labels.owner_uid) : std::string ();
+#ifdef HAVE_SYSTEMD
+  info->seat = gsm_systemd_get_session_seat (labels.session.c_str ());
+#else
+  info->seat.clear ();
+#endif
 }
 
 
@@ -1249,7 +1364,7 @@ update_info_from_collector (ProcInfo             *info,
   else
     info->cgroup_name.clear ();
 
-  gsm_proc_info_load_systemd (info);
+  apply_record_labels (info, figures);
 
   info->process_type = get_process_type (info);
 

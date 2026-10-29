@@ -150,7 +150,91 @@ fill_io (const GsmProcWindow *window,
   figures->disk_write_bytes_per_s = (guint64) write_per_s;
 }
 
+/* A slice of the snapshot's string table, with the `\xNN` escapes of a
+ * cgroup directory name decoded. Empty when the slice is empty or outside the
+ * table. */
+std::string
+decoded_slice (const GsmProcWindow *window,
+               guint32              offset,
+               guint32              length)
+{
+  if (length == 0 || (gsize) offset + length > window->strings_len)
+    return std::string ();
+
+  /* Decoding only shortens, so length + 1 always holds the result. */
+  std::string buffer (length + 1, '\0');
+  const long decoded = gsm_unescape_name (window->strings + offset, length,
+                                          &buffer[0], buffer.size ());
+
+  if (decoded < 0)
+    return std::string ();
+  buffer.resize ((size_t) decoded);
+  return buffer;
+}
+
+std::string
+class_tooltip_text (const gsm_process *record,
+                    const std::string &key)
+{
+  const char *rule = gsm_class_rule_name (record->class_rule);
+  std::string text = std::string ("Rule: ") + rule
+                     + " \u00b7 Confidence: " + gsm_confidence_name (record->class_confidence)
+                     + " \u00b7 Key: " + (key.empty () ? "none" : key);
+
+  if (has (record, GSM_PROCESS_HAS_AGENT) && strcmp (rule, "agent ancestry") == 0)
+    text += " \u00b7 Agent pid: " + std::to_string (record->agent_pid);
+  return text;
+}
+
+std::string
+unit_tooltip_text (const GsmProcLabels &labels)
+{
+  std::string text = "Unit: " + (labels.shown_unit.empty () ? std::string ("none") : labels.shown_unit);
+
+  if (!labels.user_unit.empty () && !labels.unit.empty ())
+    text += "\nOwned by: " + labels.unit;
+  if (!labels.session.empty ())
+    text += "\nSession: " + labels.session;
+  return text;
+}
+
 }  /* namespace */
+
+
+void
+gsm_proc_labels_from_record (const GsmProcWindow *window,
+                             const gsm_process   *record,
+                             GsmProcLabels       *labels)
+{
+  *labels = GsmProcLabels ();
+
+  if (has (record, GSM_PROCESS_HAS_CLASS))
+    {
+      labels->class_known = true;
+      labels->workload_class = record->workload_class;
+      labels->class_name = gsm_class_name (record->workload_class);
+      labels->class_rule = gsm_class_rule_name (record->class_rule);
+      labels->class_tooltip = class_tooltip_text (record,
+                                                  decoded_slice (window, record->class_key_offset,
+                                                                 record->class_key_length));
+    }
+
+  if (has (record, GSM_PROCESS_HAS_UNIT))
+    labels->unit = decoded_slice (window, record->unit_offset, record->unit_length);
+  if (has (record, GSM_PROCESS_HAS_USER_UNIT))
+    labels->user_unit = decoded_slice (window, record->user_unit_offset, record->user_unit_length);
+  if (has (record, GSM_PROCESS_HAS_SESSION))
+    labels->session = decoded_slice (window, record->login_session_offset,
+                                     record->login_session_length);
+  labels->shown_unit = labels->user_unit.empty () ? labels->unit : labels->user_unit;
+  labels->unit_tooltip = unit_tooltip_text (*labels);
+
+  labels->owner_known = has (record, GSM_PROCESS_HAS_OWNER_UID);
+  labels->owner_uid = labels->owner_known ? record->owner_uid : 0;
+
+  labels->swap_known = has (record, GSM_PROCESS_HAS_VM_SWAP);
+  labels->swap_bytes = labels->swap_known ? record->vm_swap_bytes : 0;
+}
 
 
 void
@@ -182,6 +266,14 @@ gsm_proc_figures_from_record (const GsmProcWindow *window,
       figures->cgroup_path = window->strings + record->cgroup_offset;
       figures->cgroup_path_len = record->cgroup_len;
     }
+
+  figures->record = record;
+  figures->strings = window->strings;
+  figures->strings_len = window->strings_len;
+
+  figures->swap_known = has (record, GSM_PROCESS_HAS_VM_SWAP);
+  if (figures->swap_known)
+    figures->swap_bytes = record->vm_swap_bytes;
 
   fill_memory (record, figures);
   fill_cpu (window, record, figures);
