@@ -81,9 +81,30 @@ uint64_t           gsm_drive_get_rated_tbw          (GsmDrive *self);
 GsmEnduranceSource gsm_drive_get_endurance_source   (GsmDrive *self);
 
 /*
- * True when the controller's own wear estimate and the datasheet rating tell
- * materially different stories (as they do on e.g. a WD SN740). The UI says
- * so out loud rather than quietly picking one.
+ * The maker's published rating for this exact model and capacity, in bytes,
+ * or 0 when none is published, with the short name and URL of the document
+ * it comes from (NULL when 0). Kept apart from gsm_drive_get_rated_tbw(),
+ * which is the figure the projection follows.
+ */
+uint64_t        gsm_drive_get_maker_rated_tbw    (GsmDrive *self);
+const char     *gsm_drive_get_maker_source_label (GsmDrive *self);
+const char     *gsm_drive_get_maker_source_url   (GsmDrive *self);
+
+/*
+ * The endurance range (bytes) the drive's own whole-percent wear implies,
+ * or FALSE when it has worn too little to bound; see
+ * gsm_drive_spec_implied_endurance().
+ */
+gboolean        gsm_drive_get_implied_endurance  (GsmDrive *self,
+                                                  uint64_t *low_bytes,
+                                                  uint64_t *high_bytes);
+
+/*
+ * True when the controller's own wear estimate and the maker's rating tell
+ * materially different stories (as they do on this workstation's WD SN740:
+ * rated 400 TBW, 54 % of it written, the drive says 12 % used): the maker's
+ * figure lies at least 2x outside the implied range. The UI says so out loud
+ * rather than quietly picking one. FALSE when either side is unknown.
  */
 gboolean        gsm_drive_endurance_is_conflicted (GsmDrive *self);
 
@@ -148,5 +169,15 @@ void  gsm_drive_set_last_seen (GsmDrive *self,
 void  gsm_drive_set_endurance (GsmDrive           *self,
                                uint64_t            rated_tbw,
                                GsmEnduranceSource  source);
+
+/* The maker's rating (0 and NULLs clear it) and the implied range
+ * (0, 0 clears it). The strings are copied. */
+void  gsm_drive_set_maker_rating (GsmDrive   *self,
+                                  uint64_t    rated_tbw,
+                                  const char *source_label,
+                                  const char *source_url);
+void  gsm_drive_set_implied_endurance (GsmDrive *self,
+                                       uint64_t  low_bytes,
+                                       uint64_t  high_bytes);
 
 G_END_DECLS

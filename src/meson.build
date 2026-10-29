@@ -305,6 +305,20 @@ test(
   timeout: 120,
 )
 
+# The endurance table: every row, the models that must say "not published",
+# this workstation's two drives, and the wear range.
+test(
+  'drive-spec',
+  executable(
+    'test-drive-spec',
+    ['tests/test-drive-spec.c'],
+    include_directories: rootInclude,
+    dependencies: [libgsm_health_dep, glib],
+  ),
+  protocol: 'tap',
+  timeout: 60,
+)
+
 gsm_app = executable('gnome-system-monitor-rh',
   ['main.cpp'],
   dependencies: libgsm_dep,

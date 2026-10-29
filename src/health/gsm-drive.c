@@ -46,6 +46,12 @@ struct _GsmDrive {
 
   uint64_t rated_tbw;
   GsmEnduranceSource endurance_source;
+
+  uint64_t maker_rated_tbw;
+  char *maker_source_label;
+  char *maker_source_url;
+  uint64_t implied_low_bytes;
+  uint64_t implied_high_bytes;
 };
 
 G_DEFINE_FINAL_TYPE (GsmDrive, gsm_drive, G_TYPE_OBJECT)
@@ -77,6 +83,8 @@ gsm_drive_finalize (GObject *object)
   g_clear_pointer (&self->firmware, g_free);
   g_clear_pointer (&self->device, g_free);
   g_clear_pointer (&self->connection, g_free);
+  g_clear_pointer (&self->maker_source_label, g_free);
+  g_clear_pointer (&self->maker_source_url, g_free);
 
   G_OBJECT_CLASS (gsm_drive_parent_class)->finalize (object);
 }
@@ -364,6 +372,32 @@ gsm_drive_set_endurance (GsmDrive           *self,
 }
 
 
+void
+gsm_drive_set_maker_rating (GsmDrive   *self,
+                            uint64_t    rated_tbw,
+                            const char *source_label,
+                            const char *source_url)
+{
+  g_return_if_fail (GSM_IS_DRIVE (self));
+
+  self->maker_rated_tbw = rated_tbw;
+  g_set_str (&self->maker_source_label, rated_tbw > 0 ? source_label : NULL);
+  g_set_str (&self->maker_source_url, rated_tbw > 0 ? source_url : NULL);
+}
+
+
+void
+gsm_drive_set_implied_endurance (GsmDrive *self,
+                                 uint64_t  low_bytes,
+                                 uint64_t  high_bytes)
+{
+  g_return_if_fail (GSM_IS_DRIVE (self));
+
+  self->implied_low_bytes = low_bytes;
+  self->implied_high_bytes = high_bytes;
+}
+
+
 /* ------------------------------------------------------------------ */
 /* Health verdict                                                      */
 /* ------------------------------------------------------------------ */
@@ -404,28 +438,44 @@ gsm_drive_get_health (GsmDrive *self)
 }
 
 
+gboolean
+gsm_drive_get_implied_endurance (GsmDrive *self,
+                                 uint64_t *low_bytes,
+                                 uint64_t *high_bytes)
+{
+  g_return_val_if_fail (GSM_IS_DRIVE (self), FALSE);
+
+  if (self->implied_high_bytes == 0)
+    return FALSE;
+
+  if (low_bytes != NULL)
+    *low_bytes = self->implied_low_bytes;
+  if (high_bytes != NULL)
+    *high_bytes = self->implied_high_bytes;
+
+  return TRUE;
+}
+
+
 /*
- * Consider the drive's own wear estimate and the datasheet rating to be
- * telling different stories when the endurance they imply differs by more
- * than 2x. Below ~5% wear the controller's figure is too coarsely quantised
- * to draw any conclusion from, so we say nothing rather than cry wolf.
+ * The drive's own wear and the maker's rating are telling different stories
+ * when the rating lies at least 2x above the top of the endurance the wear
+ * implies, or at least 2x below the bottom of it. The range exists only once
+ * the controller's whole-percent figure is coarse enough to bound (5 % wear
+ * or more), so below that we say nothing rather than cry wolf.
  */
 gboolean
 gsm_drive_endurance_is_conflicted (GsmDrive *self)
 {
-  double implied, rated, ratio;
-
   g_return_val_if_fail (GSM_IS_DRIVE (self), FALSE);
 
-  if (self->percent_used < 5 || self->bytes_written == 0 || self->rated_tbw == 0)
+  if (self->maker_rated_tbw == 0 || self->implied_high_bytes == 0)
     return FALSE;
 
-  implied = (double) self->bytes_written / ((double) self->percent_used / 100.0);
-  rated = (double) self->rated_tbw;
+  if (self->maker_rated_tbw >= self->implied_high_bytes)
+    return self->maker_rated_tbw / 2 >= self->implied_high_bytes;
 
-  ratio = implied > rated ? implied / rated : rated / implied;
-
-  return ratio >= 2.0;
+  return self->implied_low_bytes / 2 >= self->maker_rated_tbw;
 }
 
 
@@ -465,5 +515,8 @@ GSM_DRIVE_GETTER (int, temperature, temperature, -1)
 GSM_DRIVE_GETTER (int, percent_used, percent_used, -1)
 GSM_DRIVE_GETTER (int, spare_percent, spare_percent, -1)
 GSM_DRIVE_GETTER (uint64_t, rated_tbw, rated_tbw, 0)
+GSM_DRIVE_GETTER (uint64_t, maker_rated_tbw, maker_rated_tbw, 0)
+GSM_DRIVE_GETTER (const char *, maker_source_label, maker_source_label, NULL)
+GSM_DRIVE_GETTER (const char *, maker_source_url, maker_source_url, NULL)
 GSM_DRIVE_GETTER (GsmEnduranceSource, endurance_source, endurance_source,
                   GSM_ENDURANCE_UNKNOWN)
