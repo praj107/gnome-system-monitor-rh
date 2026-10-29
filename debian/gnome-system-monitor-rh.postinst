@@ -1,0 +1,25 @@
+#!/bin/sh
+# The health sampler's user unit is installed but never enabled by the
+# package: each user enables it from the Health tab when they choose to keep
+# the record of which applications write how much.
+#
+# 50.0+rh.1 enabled it for every user (dh_installsystemduser's default links
+# the unit into /etc/systemd/user/default.target.wants). When upgrading from
+# an earlier version, remove exactly that: the system-wide link and the state
+# deb-systemd-helper(1) keeps for it under /var/lib/systemd. A unit a user
+# enabled for themselves is linked in that user's own systemd configuration
+# and is not touched; this script never reads or writes anything of a user's.
+#
+# This runs before the debhelper section: its snippet would otherwise find
+# the old state and enable the unit again.
+set -e
+
+unit=gnome-system-monitor-health-sampler.service
+
+if [ "$1" = "configure" ] && [ -n "$2" ] && dpkg --compare-versions "$2" lt 50.0+rh.2; then
+	deb-systemd-helper --user purge "$unit" >/dev/null || true
+fi
+
+#DEBHELPER#
+
+exit 0

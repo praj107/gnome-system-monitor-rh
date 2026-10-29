@@ -40,6 +40,13 @@ override_dh_auto_test:
 	-dh_auto_test -- --suite formatting >/dev/null 2>&1 \
 		|| echo "WARNING: the formatting suite fails (uncrustify version drift); not a gate"
 
+# The health sampler's user unit is installed but not enabled: enabling it
+# records which applications write how much, so the user opts in from the
+# Health tab (systemctl --user enable). See debian/*.postinst for the upgrade
+# from the version that enabled it for everyone.
+override_dh_installsystemduser:
+	dh_installsystemduser --no-enable
+
 override_dh_auto_install:
 	dh_auto_install --destdir=$(DESTDIR)
 	sh debian/gate-check.sh symbols $(DESTDIR)

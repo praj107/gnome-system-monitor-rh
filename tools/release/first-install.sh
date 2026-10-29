@@ -17,7 +17,7 @@
 #      moved, not deleted),
 #   6. installs the package with apt (which removes the distribution's
 #      gnome-system-monitor: Conflicts/Replaces), and
-#   7. verifies the result.
+#   7. verifies the result (check-install.sh).
 # Every step is printed before it runs; --dry-run prints them all and changes
 # nothing. If anything fails, rollback.sh undoes it.
 #
@@ -184,10 +184,10 @@ fi
 # ---------------------------------------------------------------- 7 verify
 step "Verify"
 if "$dry"; then
-    say "    would check: $GSM_RH_PACKAGE $version installed and $GSM_RH_DISTRO_PACKAGE not;"
-    say "    command -v gnome-system-monitor is /usr/bin/gnome-system-monitor; pkaction names"
-    say "    /usr/libexec/gnome-system-monitor helpers; the system D-Bus service file names"
-    say "    /usr/bin; no user D-Bus service file remains; /usr/bin/gnome-system-monitor-rh --help runs"
+    say "    would run: $here/check-install.sh --version $version --home $home_dir"
+    say "    (package installed and the distribution's gone; /usr/bin wins on PATH; pkaction names"
+    say "    the /usr/libexec helpers; the system D-Bus service file names /usr/bin; the sampler is"
+    say "    not enabled system-wide; nothing in ~/.local/share shadows the package; --help runs)"
     exit 0
 fi
 if [[ -n "$sysroot" ]]; then
@@ -196,23 +196,9 @@ if [[ -n "$sysroot" ]]; then
     say "    simulation: $GSM_RH_DISTRO_PACKAGE removed, $GSM_RH_PACKAGE $version installed (nothing was installed)"
     exit 0
 fi
+# The checks live in check-install.sh (read-only, also usable on its own).
 fail=0
-[[ "$(dpkg-query -W -f='${Version}' "$GSM_RH_PACKAGE" 2>/dev/null)" == "$version" ]] && say "    ok: $GSM_RH_PACKAGE $version installed" || { say "    FAILED: $GSM_RH_PACKAGE $version is not installed"; fail=1; }
-if dpkg-query -W -f='${Status}' "$GSM_RH_DISTRO_PACKAGE" 2>/dev/null | grep -q 'ok installed'; then say "    FAILED: $GSM_RH_DISTRO_PACKAGE is still installed"; fail=1; else say "    ok: $GSM_RH_DISTRO_PACKAGE is gone"; fi
-hash -r
-found="$(command -v gnome-system-monitor || true)"
-[[ "$found" == /usr/bin/gnome-system-monitor ]] && say "    ok: gnome-system-monitor resolves to $found" || { say "    FAILED: gnome-system-monitor resolves to '${found:-nothing}', not /usr/bin"; fail=1; }
-policy=/usr/share/polkit-1/actions/org.gnome.gnome-system-monitor.policy
-while read -r action; do
-    exec_path="$(pkaction --verbose --action-id "$action" 2>/dev/null | sed -n 's/.*exec\.path -> //p')"
-    [[ "$exec_path" == /usr/libexec/gnome-system-monitor/* ]] && say "    ok: pkaction $action -> $exec_path" || { say "    FAILED: pkaction $action -> '${exec_path:-unknown}'"; fail=1; }
-done < <(sed -n 's/.*<action id="\([^"]*\)".*/\1/p' "$policy")
-grep -q '^Exec=/usr/bin/gnome-system-monitor' /usr/share/dbus-1/services/org.gnome.SystemMonitor.service \
-    && say "    ok: the system D-Bus service file runs /usr/bin" || { say "    FAILED: the system D-Bus service file does not run /usr/bin"; fail=1; }
-[[ ! -e "$home_dir/.local/share/dbus-1/services/org.gnome.SystemMonitor.service" ]] \
-    && say "    ok: no user D-Bus service file shadows it" || { say "    FAILED: a user D-Bus service file shadows it"; fail=1; }
-timeout 20 /usr/bin/gnome-system-monitor-rh --help >/dev/null 2>&1 \
-    && say "    ok: /usr/bin/gnome-system-monitor-rh --help runs" || { say "    FAILED: /usr/bin/gnome-system-monitor-rh --help"; fail=1; }
+"$here/check-install.sh" --version "$version" --home "$home_dir" || fail=1
 if ((fail)); then
     say ""; say "Some checks failed. To go back: $here/rollback.sh"
     exit 1

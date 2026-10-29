@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # build-deb.sh — build the gated gnome-system-monitor-rh .deb from a git revision.
 #
-#   build-deb.sh [--rev REV] [--dev] [--overlay PATH...]
+#   build-deb.sh [--rev REV] [--dev] [--out DIR] [--distribution NAME] [--overlay PATH...]
 #
 # Exports REV (default HEAD) with `git archive` into a scratch directory, copies
 # the given working-tree paths over it, runs dpkg-buildpackage there, and copies
 # the .deb and .buildinfo files to <repo>/build-release/. The working tree is
 # never built in place. --dev stamps a development version
 # (<release>~dev.<commit date>.g<short sha>, which sorts below the release)
-# into the export's changelog; the tracked changelog is never touched. Nothing is installed: the install command is left
+# into the export's changelog; the tracked changelog is never touched.
+# --out DIR puts the .deb and .buildinfo files in DIR instead of
+# <repo>/build-release/ (a test package must not land beside the installed
+# release's). --distribution NAME replaces UNRELEASED in the export's newest
+# changelog entry, so a package that is still unreleased in git can be
+# published to a test repository. Nothing is installed: the install command is left
 # for the owner, since installing needs root and a build script must never
 # raise an authentication prompt. Every temporary file, logs included, lives
 # inside the scratch directory and goes away with it.
@@ -39,17 +44,21 @@ repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 rev=HEAD
 overlay=()
 dev=false
+out=""
+distribution=""
 
 while (($#)); do
     case "$1" in
         --rev) rev="${2:?--rev needs a revision}"; shift 2 ;;
         --dev) dev=true; shift ;;
+        --out) out="${2:?--out needs a directory}"; shift 2 ;;
+        --distribution) distribution="${2:?--distribution needs a name}"; shift 2 ;;
         --overlay)
             shift
             while (($#)) && [[ "$1" != --* ]]; do overlay+=("$1"); shift; done
             ((${#overlay[@]})) || die "--overlay needs at least one path"
             ;;
-        *) die "usage: build-deb.sh [--rev REV] [--dev] [--overlay PATH...]" ;;
+        *) die "usage: build-deb.sh [--rev REV] [--dev] [--out DIR] [--distribution NAME] [--overlay PATH...]" ;;
     esac
 done
 
@@ -124,6 +133,12 @@ if "$dev"; then
     printf 'build-deb.sh: development version %s\n' "$dev_version" >&2
 fi
 
+if [[ -n "$distribution" ]]; then
+    [[ "$distribution" =~ ^[a-z][a-z0-9-]*$ ]] || die "--distribution must be a plain name such as noble"
+    head -n 1 -- "$src/debian/changelog" | grep -qF " UNRELEASED;" || die "the newest changelog entry is not UNRELEASED; nothing to stamp"
+    sed -i "1s/ UNRELEASED;/ $distribution;/" "$src/debian/changelog"
+fi
+
 # The formatting test asks git for the file list; give the export a repository.
 git -C "$src" init --quiet
 git -C "$src" add -A
@@ -147,7 +162,7 @@ if [[ -f "$scratch/time.txt" ]]; then
 fi
 ((status == 0)) || { printf 'build-deb.sh: dpkg-buildpackage failed (exit %d)\n' "$status" >&2; exit "$status"; }
 
-out="$repo/build-release"
+[[ -n "$out" ]] || out="$repo/build-release"
 mkdir -p -- "$out"
 shopt -s nullglob
 files=("$scratch"/*.deb "$scratch"/*.buildinfo)

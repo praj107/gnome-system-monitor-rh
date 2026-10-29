@@ -6,11 +6,12 @@ and use `sudo` only where it is printed first:
 
 | Script | What it does |
 |---|---|
-| `build-deb.sh` | Builds the gated `.deb` from a git revision into `build-release/`. `--dev` stamps a development version. |
+| `build-deb.sh` | Builds the gated `.deb` from a git revision into `build-release/` (`--out DIR` elsewhere). `--dev` stamps a development version. |
 | `dev-channel.sh` | User-prefix A/B install: versioned builds, atomic switch, rollback. The pipeline's testbed. |
 | `publish.sh` | Turns `.deb` files into a signed local flat apt repository. |
 | `first-install.sh` | The owner's one-time install: publish, root setup, retire the old `~/.local` install, `apt install`, verify. |
-| `release.sh` | A later release: build, publish, print the one `sudo` copy command. |
+| `release.sh` | A later release in one run: build, publish, copy into the repository, refresh apt, then stop (Update Manager offers it) or `--install`. |
+| `check-install.sh` | Read-only checks of an installed release (no `sudo`); used by `first-install.sh` and `release.sh --install`. |
 | `rollback.sh` | Back to the distribution's package and the old `~/.local` install. |
 | `retire-user-install.sh` | Moves an old `~/.local` install aside, with a manifest; `--restore` puts it back. |
 | `release.conf` | Key fingerprint, repository, key and source paths shared by the above. |
@@ -54,11 +55,12 @@ tools/release/first-install.sh             # the real thing
 5. Retire the old `~/.local` install (below).
 6. `sudo apt-get install gnome-system-monitor-rh`, which removes the
    distribution's `gnome-system-monitor`.
-7. Verify: the package is installed and the distribution's is gone,
-   `gnome-system-monitor` resolves to `/usr/bin`, `pkaction` shows the helpers
-   under `/usr/libexec/gnome-system-monitor`, the system D-Bus service file
-   runs `/usr/bin`, no user D-Bus service file shadows it, and the binary runs
-   `--help`.
+7. Verify with `check-install.sh`: the package is installed and the
+   distribution's is gone, `gnome-system-monitor` resolves to `/usr/bin`,
+   `pkaction` shows the helpers under `/usr/libexec/gnome-system-monitor`, the
+   system D-Bus service file runs `/usr/bin`, the health sampler is not enabled
+   system-wide, nothing in `~/.local/share` (schemas, D-Bus service, desktop
+   files) shadows the package, and the binary runs `--help`.
 
 If a step fails, run `rollback.sh`. Upgrades afterwards arrive through
 `apt upgrade` or the update manager and ask for your password; nothing upgrades
@@ -107,13 +109,39 @@ the source); remove them yourself if you want them gone.
 ## Later releases
 
 1. Edit `debian/changelog` (a new entry, a real distribution) and commit.
-2. `tools/release/release.sh` builds `HEAD`, publishes into the staging
-   repository (gpg asks for the passphrase), and prints the one `sudo` command
-   that copies it into `/srv/gsm-rh-apt`. `publish.sh` refuses a version that is
-   already published with different contents, and re-checks the `.deb` for dev
-   IPC symbols. It never changes a version itself.
-3. Run the printed command, then `sudo apt update && sudo apt install
-   gnome-system-monitor-rh`, or wait for the update manager.
+2. `tools/release/release.sh --dry-run` prints every step; then
+   `tools/release/release.sh`. It checks the version is newer than the
+   installed one, builds `HEAD`, publishes into the staging repository (gpg asks
+   for the passphrase), copies package files, then indexes, then signatures into
+   `/srv/gsm-rh-apt` (nothing is deleted; `sudo` is printed before it is used),
+   refreshes apt's list for that one source and shows the simulated upgrade
+   (`Inst gnome-system-monitor-rh [old] (new ...`). `publish.sh` refuses a
+   version that is already published with different contents, and re-checks the
+   `.deb` for dev IPC symbols. It never changes a version itself.
+3. By default it stops there: open Update Manager, which should offer the new
+   version (that is the check that upgrades reach this machine). Or run
+   `release.sh --install`: it quits a running app with its own quit action,
+   runs `sudo apt-get install gnome-system-monitor-rh` and then
+   `check-install.sh --version <new>`.
+
+`release.sh --deb FILE` publishes an already built package instead of
+building `HEAD`.
+
+### The health sampler is opt-in
+
+The package installs the sampler's user unit but enables it for nobody
+(`dh_installsystemduser --no-enable`); each user enables it from the Health tab,
+which is when they consent to a record of which applications write how much.
+`50.0+rh.1` enabled it for every user (a link under
+`/etc/systemd/user/default.target.wants`), which the Health tab's off switch
+cannot undo. Upgrading from a version below `50.0+rh.2` runs
+`deb-systemd-helper --user purge` for the unit in the postinst: it removes that
+system-wide link and the helper's enabled-state for it, and nothing else. A
+user's own link in `~/.config/systemd/user` is not touched, so a sampler the
+owner switched on stays on. To see that the migration ran,
+`check-install.sh` fails while any link to the unit remains under
+`/etc/systemd/user`. Rolling back to `50.0+rh.1` would enable the sampler for
+everyone again.
 
 `build-deb.sh` builds in a RAM scratch directory with `dpkg-buildpackage`; the
 build is a release profile (`buildtype=release`, `dev_ipc=false`,
@@ -127,7 +155,11 @@ proves the gate can fail.
 `first-install.sh --sysroot DIR --home DIR --key FPR --gnupghome DIR` writes the
 root-owned parts under `DIR`, signs with a throwaway key, retires a fake home
 and replaces `apt install` with an `apt-get -s` simulation; `rollback.sh
---sysroot DIR --home DIR` simulates the way back. These options exist for
+--sysroot DIR --home DIR` simulates the way back; `release.sh --sysroot DIR --key FPR
+--gnupghome DIR --deb FILE [--install]` runs a later release against a sysroot that
+already holds a repository and its apt source. `build-deb.sh --out DIR
+--distribution noble` builds a test package of an UNRELEASED changelog entry
+without touching `build-release/`. These options exist for
 tests; the real key is fixed in `release.conf` and the install scripts refuse a
 different one outside a sysroot.
 
@@ -153,6 +185,9 @@ directory for both.
   (meson options read back, `nm` and `GSM_DEV_IPC` over the installed ELF
   files). `--test` also runs the test suites except formatting. Building a
   version that exists is a no-op.
+- `switch` is refused while the package is installed by dpkg and the export is the
+  real user data directory: the exported schema, D-Bus and desktop files would
+  hide the installed release. `plan` says so.
 - `switch` points `<root>/current` at the version with one `ln -s` and one
   `mv -T`, then exports the desktop files, the D-Bus service file and the schema
   files into the export directory, rewritten to name `<root>/current`, and

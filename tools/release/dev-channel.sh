@@ -7,7 +7,10 @@
 #     build [--rev REV] [--test]  release-profile build of REV (default HEAD),
 #                                 installed to <root>/<version>
 #     switch VERSION              make VERSION current; export its desktop,
-#                                 D-Bus and schema files
+#                                 D-Bus and schema files; refused while
+#                                 the dpkg package is installed (the export
+#                                 would shadow it) when the export is the
+#                                 real user data directory
 #     rollback                    switch to the previous version
 #     status                      what is installed, current, exported
 #     prune [VERSION|DIR...]      remove versions that are neither current
@@ -315,8 +318,26 @@ export_current() {
 
 # ---------------------------------------------------------------- commands
 
+# The channel exports desktop, D-Bus and schema files into the user's data
+# directory, and those take precedence over the installed package's
+# (desktop-entry and basedir specs; dbus-daemon(1) for session services). The
+# schema id is the same, so a stale user schema also aborts the installed app
+# on a missing key. So while the dpkg package is installed, a switch into the
+# real user data directory is refused. A scratch --export is not.
+# Prints the reason and returns 0 when a switch must be refused.
+package_shadow_reason() {
+    local pkg=gnome-system-monitor-rh data real_export version
+    data="$(realpath -m -- "${XDG_DATA_HOME:-$HOME/.local/share}")"
+    real_export="$(realpath -m -- "$export_dir")"
+    [[ "$real_export" == "$data" ]] || return 1
+    version="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)" || return 1
+    [[ -n "$version" ]] || return 1
+    printf '%s %s is installed by dpkg; exporting this channel into %s would hide it behind user files (schemas, D-Bus service, desktop files). Remove the package first, or use a scratch --export.' "$pkg" "$version" "$export_dir"
+}
+
 cmd_switch() {
-    local target="${1:-}" now
+    local target="${1:-}" now reason
+    if reason="$(package_shadow_reason)"; then die "switch refused: $reason"; fi
     [[ -n "$target" ]] || die "usage: dev-channel.sh switch VERSION"
     valid_version "$target" || die "unusable version: $target"
     installed "$target" || die "$target is not an installed version under $root (see: status)"
@@ -400,7 +421,7 @@ cmd_prune() {
 }
 
 cmd_plan() {
-    local version entry rel verdict
+    local version entry rel verdict reason
     version="$(dev_version "$rev")"
     printf 'PLAN — nothing is written by this command.\n'
     printf 'root: %s\nexport: %s\n\n' "$root" "$export_dir"
@@ -420,6 +441,7 @@ cmd_plan() {
     printf '  The menu entry, D-Bus activation and schemas would stop using it; rollback or the\n'
     printf '  saved copy in %s/%s brings the old files back.\n\n' "$root" "$BACKUP_NAME"
     printf 'NEVER   /usr, /etc, apt, polkit, systemd units, a running instance.\n'
+    if reason="$(package_shadow_reason)"; then printf '\nREFUSED switch (and rollback) is refused: %s\n' "$reason"; fi
 }
 
 case "$command" in
