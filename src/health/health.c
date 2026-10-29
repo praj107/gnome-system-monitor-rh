@@ -1098,7 +1098,7 @@ place_proxy_group (ProxyGroup       *group,
 
 
 /*
- * Split the stored rows into the two lists of ADR 0012: what the kernel
+ * Split the stored rows into two lists: what the kernel
  * charged to each cgroup (exact rows, residues included, summed per name, the
  * biggest first, the tail folded into one line), and under the proxy writers
  * their on-behalf rows. Charged rows add up to the drive's own counter; the
