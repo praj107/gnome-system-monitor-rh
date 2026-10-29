@@ -1,0 +1,6 @@
+# Read a USB disk's SMART data as soon as it appears, instead of at the next
+# tick of gsm-smart-reader.timer. Whole disks only (not partitions), and only
+# the "add" event: "change" fires on media changes and after writes, and would
+# start a read each time. SYSTEMD_WANTS takes effect only with the "systemd"
+# tag (systemd.device(5)). ID_BUS is set by 60-persistent-storage.rules.
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_BUS}=="usb", TAG+="systemd", ENV{SYSTEMD_WANTS}+="gsm-smart-reader.service"

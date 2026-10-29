@@ -14,6 +14,11 @@
 #   - the health sampler's user unit is not enabled for every user (no link to
 #     it anywhere under /etc/systemd/user: it is opt-in, enabled per user from
 #     the Health tab);
+#   - the SMART reader for USB drives is installed as designed: the reader
+#     under the helpers' directory, its service and timer, the udev rule, the
+#     timer enabled (a link in timers.target.wants; live, also running), the
+#     service static (no [Install]), and nothing of the retired pkexec SMART
+#     helper (its binary or its polkit action);
 #   - nothing in the user's own data directory shadows the package: no
 #     glib-2.0/schemas/gschemas.compiled (a stale one aborts the app on a
 #     missing key), no D-Bus service file, no desktop file of the app;
@@ -102,6 +107,42 @@ else bad "the system D-Bus service file does not run /usr/bin ($service)"; fi
 links="$(find "$sysroot/etc/systemd/user" -name "$unit" -type l 2>/dev/null || true)"
 if [[ -z "$links" ]]; then ok "the health sampler is not enabled system-wide (no link under /etc/systemd/user)"
 else bad "the health sampler is enabled system-wide, so the Health tab's off switch cannot keep it off: $(echo $links)"; fi
+
+# --- the SMART reader service
+libexec="$sysroot/usr/libexec/gnome-system-monitor"
+units_dir="$sysroot/usr/lib/systemd/system"
+reader_service="$units_dir/gsm-smart-reader.service"
+reader_timer="$units_dir/gsm-smart-reader.timer"
+reader_rule="$sysroot/usr/lib/udev/rules.d/70-gnome-system-monitor-rh-smart.rules"
+if [[ -x "$libexec/gsm-smart-reader" ]]; then ok "the SMART reader is installed ($libexec/gsm-smart-reader)"
+else bad "no executable SMART reader at $libexec/gsm-smart-reader"; fi
+if [[ -f "$reader_service" ]] && grep -qx 'ExecStart=/usr/libexec/gnome-system-monitor/gsm-smart-reader' "$reader_service"; then
+    ok "the SMART reader service runs the installed reader"
+else bad "no SMART reader service at $reader_service that runs /usr/libexec/gnome-system-monitor/gsm-smart-reader"; fi
+if [[ -f "$reader_service" ]] && ! grep -q '^\[Install\]' "$reader_service"; then ok "the SMART reader service is static (started by its timer and udev only)"
+else bad "the SMART reader service has an [Install] section or is missing"; fi
+if [[ -f "$reader_timer" ]] && grep -qx 'WantedBy=timers.target' "$reader_timer" && grep -qx 'OnUnitActiveSec=10min' "$reader_timer"; then
+    ok "the SMART reader timer is installed (every 10 minutes)"
+else bad "no SMART reader timer at $reader_timer (WantedBy=timers.target, OnUnitActiveSec=10min)"; fi
+if grep -q 'SYSTEMD_WANTS}+="gsm-smart-reader.service"' "$reader_rule" 2>/dev/null; then ok "the udev rule starts the SMART reader for a USB disk"
+else bad "no udev rule that starts gsm-smart-reader.service at $reader_rule"; fi
+# The timer is enabled by the package's install script (a link in
+# timers.target.wants). An administrator may have disabled it on purpose;
+# that is reported, not hidden.
+timer_link="$sysroot/etc/systemd/system/timers.target.wants/gsm-smart-reader.timer"
+if [[ -L "$timer_link" ]]; then ok "the SMART reader timer is enabled ($timer_link)"
+else bad "the SMART reader timer is not enabled: no link at $timer_link (the package enables it on install; systemctl disable --now gsm-smart-reader.timer removes it)"; fi
+if [[ -z "$sysroot" ]]; then
+    if systemctl is-active --quiet gsm-smart-reader.timer 2>/dev/null; then ok "the SMART reader timer is running"
+    else bad "the SMART reader timer is not running"; fi
+else
+    note "whether the timer is running is not checked under --sysroot"
+fi
+# The pkexec SMART helper is gone, with its polkit action.
+if [[ -e "$libexec/gsm-smart" ]]; then bad "the retired pkexec SMART helper is still installed: $libexec/gsm-smart"
+else ok "no pkexec SMART helper (gsm-smart)"; fi
+if grep -q 'org.gnome.gnome-system-monitor.smart"' "$policy" 2>/dev/null; then bad "polkit still has the retired SMART action org.gnome.gnome-system-monitor.smart"
+else ok "polkit has no SMART action"; fi
 
 # --- nothing shadows the package
 data="$home_dir/.local/share"

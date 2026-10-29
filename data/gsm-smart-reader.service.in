@@ -1,0 +1,66 @@
+[Unit]
+Description=Read SMART health data from USB-attached drives (read-only)
+Documentation=https://github.com/praj107/gnome-system-monitor-rh
+
+[Service]
+# One read pass, then it exits: nothing privileged stays resident. Started by
+# gsm-smart-reader.timer and by the udev rule that notices a USB disk, so it
+# has no [Install] section of its own.
+Type=oneshot
+ExecStart=@pkglibexecdir@/gsm-smart-reader
+# A hung USB bridge stalls the SG_IO ioctl; systemd ends the run instead.
+TimeoutStartSec=2min
+
+# The reader sends ATA PASS-THROUGH and vendor commands with SG_IO to USB
+# disks, which the kernel allows to CAP_SYS_RAWIO (scsi_cmd_allowed). It takes
+# no argument and reads no input, so it needs no other capability.
+CapabilityBoundingSet=CAP_SYS_RAWIO
+NoNewPrivileges=yes
+
+# Block devices of the sd driver (USB mass storage is one), read-only. Every
+# other device is closed apart from /dev/null and the like.
+DevicePolicy=closed
+DeviceAllow=block-sd r
+
+# The whole file system is read-only except the runtime directory below.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# No network.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# The result must be readable by every user.
+UMask=0022
+# Preserve=yes: without it systemd removes the directory, and the result in
+# it, as soon as the oneshot stops.
+RuntimeDirectory=gnome-system-monitor-rh
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+MemoryMax=64M
+TasksMax=16
+# Never compete with the owner's work.
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle

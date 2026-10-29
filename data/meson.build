@@ -83,6 +83,41 @@ configure_file(
   install_dir: sampler_unit_dir,
 )
 
+# The SMART reader for USB-attached drives: a hardened oneshot service run
+# every 10 minutes by a timer and by a udev rule when a USB disk appears.
+# Unlike the wear sampler above, which stays opt-in and links nothing, this
+# one is enabled when the package is installed (dh_installsystemd links the
+# timer and starts it). It records nothing that persists (its file is in
+# /run, a RAM file system), takes no input and has no network.
+#
+# systemd reads system units from lib/systemd/system and udev reads rules from
+# lib/udev/rules.d, under /usr only. Under /usr the directories come from the
+# systemd and udev pkg-config files; under any other prefix they stay inside
+# the prefix so a developer install never writes to the system's directories.
+if prefix == '/usr'
+  systemd_dep = dependency('systemd', required: false)
+  udev_dep = dependency('udev', required: false)
+  smart_unit_dir = systemd_dep.found() ? systemd_dep.get_variable(pkgconfig: 'systemdsystemunitdir') : '/usr/lib/systemd/system'
+  smart_rules_dir = udev_dep.found() ? udev_dep.get_variable(pkgconfig: 'udevdir') / 'rules.d' : '/usr/lib/udev/rules.d'
+elif prefix == '/usr/local'
+  smart_unit_dir = join_paths(prefix, 'lib', 'systemd', 'system')
+  smart_rules_dir = join_paths(prefix, 'lib', 'udev', 'rules.d')
+else
+  smart_unit_dir = join_paths(prefix, 'share', 'systemd', 'system')
+  smart_rules_dir = join_paths(prefix, 'share', 'udev', 'rules.d')
+endif
+
+configure_file(
+  input: 'gsm-smart-reader.service.in',
+  output: 'gsm-smart-reader.service',
+  configuration: dataconf,
+  install: true,
+  install_dir: smart_unit_dir,
+)
+
+install_data('gsm-smart-reader.timer', install_dir: smart_unit_dir)
+install_data('70-gnome-system-monitor-rh-smart.rules', install_dir: smart_rules_dir)
+
 ################################################################################
 # Tests
 

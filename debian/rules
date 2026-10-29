@@ -47,6 +47,11 @@ override_dh_auto_test:
 override_dh_installsystemduser:
 	dh_installsystemduser --no-enable
 
+# The SMART reader's timer is enabled and started by the package (the
+# dh_installsystemd default: a unit with an [Install] section is enabled, a
+# static one is left to its timer and udev), the opposite of the sampler.
+# The reader runs as root, so its units are checked before they are packaged.
 override_dh_auto_install:
 	dh_auto_install --destdir=$(DESTDIR)
 	sh debian/gate-check.sh symbols $(DESTDIR)
+	sh debian/gate-check.sh units $(DESTDIR)

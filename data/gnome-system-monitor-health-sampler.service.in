@@ -1,6 +1,6 @@
 [Unit]
 Description=GNOME System Monitor storage wear sampler
-Documentation=man:gnome-system-monitor(1)
+Documentation=https://github.com/praj107/gnome-system-monitor-rh
 
 [Service]
 Type=simple

@@ -1,0 +1,15 @@
+[Unit]
+Description=Read SMART health data of USB-attached drives every 10 minutes
+Documentation=https://github.com/praj107/gnome-system-monitor-rh
+
+[Timer]
+# OnActiveSec runs the first read a minute after the timer is activated (at
+# boot, or when the package is installed); OnUnitActiveSec alone would never
+# fire for a service that has not run yet. Ten minutes is how often udisks
+# refreshes its own drive data.
+OnActiveSec=1min
+OnUnitActiveSec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

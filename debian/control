@@ -46,5 +46,10 @@ Description: operator-grade resource monitor (fork of GNOME System Monitor)
  .
  The binary is gnome-system-monitor-rh; /usr/bin/gnome-system-monitor is a
  symlink to it. This package replaces the distribution's gnome-system-monitor.
- Privileged actions (signals, renice, affinity, SMART reads) go through
- root-owned helpers in /usr/libexec/gnome-system-monitor, run with pkexec.
+ Privileged actions (signals, renice, affinity) go through root-owned
+ helpers in /usr/libexec/gnome-system-monitor, run with pkexec. SMART data of
+ USB-attached drives is read by a hardened, read-only system service
+ (gsm-smart-reader.service) that a timer runs every 10 minutes and that
+ needs no password; it is enabled on install and
+ "systemctl disable --now gsm-smart-reader.timer" turns it off. NVMe and
+ SATA drives are read through udisks2.

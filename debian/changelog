@@ -1,3 +1,24 @@
+gnome-system-monitor-rh (50.0+rh.3) UNRELEASED; urgency=medium
+
+  * Health: USB-attached drives are read by a system service instead of a
+    password prompt. gsm-smart-reader.service (a hardened oneshot with
+    CAP_SYS_RAWIO only, read access to sd block devices only, no network and
+    a file system that is read-only apart from /run) writes
+    /run/gnome-system-monitor-rh/smart.ini. gsm-smart-reader.timer runs it
+    a minute after it is activated and every 10 minutes, and a udev rule runs
+    it when a USB disk appears. This is the one part of the package that is
+    enabled on install, as smartmontools and udisks2 are; the health
+    sampler's user unit still is not. To turn it off for good:
+    systemctl disable --now gsm-smart-reader.timer. NVMe and SATA drives
+    stay on udisks2.
+  * The polkit action org.gnome.gnome-system-monitor.smart is removed with
+    the pkexec SMART helper it ran. Downgrading to 50.0+rh.2 brings both
+    back; the service, timer and rule are removed by the downgrade.
+  * Release gate: the service's units must verify cleanly and score at most
+    2.0 in systemd-analyze security (the reader scores 1.1).
+
+ -- Pranav <pranavrajput321@gmail.com>  Thu, 29 Oct 2026 17:30:45 +0800
+
 gnome-system-monitor-rh (50.0+rh.2) noble; urgency=medium
 
   * Packaging: the health sampler's user unit is installed but no longer
