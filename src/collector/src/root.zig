@@ -14,6 +14,8 @@ pub const meminfo = @import("meminfo.zig");
 pub const pressure = @import("pressure.zig");
 pub const cgroup_files = @import("cgroup_files.zig");
 pub const cgroup_tree = @import("cgroup_tree.zig");
+pub const unit_path = @import("unit_path.zig");
+pub const classify = @import("classify.zig");
 pub const c_api = @import("c_api.zig");
 
 // The exported gsm_* functions of the C interface; referencing the file keeps

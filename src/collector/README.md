@@ -181,6 +181,79 @@ records and path strings, reused by a later walk. A refresh of the whole
 tree every second would use about 1% of one CPU; walk only the subtree you
 show where you can.
 
+## Workload classes
+
+`src/classify.zig` puts every cgroup path and every process into one of nine
+classes (Kernel, Init, System services, Session services, Applications,
+Login session, Agent sessions, Containers and VMs, Unclassified) by an
+ordered rule table: an array of `Rule` records, first match wins, each with a
+name, a class, a confidence (high, medium, low) and the kind of key it
+extracts. The names are `classify.rules[i].name`. It is not yet part of the C
+interface: nothing in `gsmcollect.h` or the walk changes.
+
+Two passes, both pure functions of what the walk already read (**zero
+syscalls**):
+
+- `classifyPath(path)` uses the cgroup path alone, with systemd's naming:
+  the slices of systemd.special(7), `app[-LAUNCHER]-APPID-RANDOM.scope` and
+  `app[-LAUNCHER]-APPID[@RANDOM].service` from the desktop-environment
+  conventions, `session-ID.scope` from logind, and the cgroup names that
+  docker, libpod, kubepods and LXC give containers.
+- `classifyProcesses(gpa, processes, out)` classifies a whole snapshot. It
+  adds kernel threads (`PF_KTHREAD`, or pid 2), pid 1, a process with no
+  usable cgroup (the uid and the controlling terminal stand in; an unknown uid
+  is never guessed), and the **ancestry overlay**: a process whose ancestors
+  within the snapshot, or itself, run a program with `comm` `claude`,
+  `opencode` or `pi`, and whose path class is Applications, Session services
+  or Login session, becomes an Agent session keyed by the outermost such
+  ancestor's `(pid, start_ticks)`. A parent that started after its child is a
+  reused pid and is not followed; a cycle or a self-parent ends the climb.
+  Ancestry is resolved once per process (linear), through one hash map and
+  one array of `2 * n` indexes, the only allocations, made only when some
+  process is an agent program.
+
+A `Classification` holds the class, the rule index, the confidence and the
+key. Keys are slices of the input (a cgroup path or a comm), still escaped as
+the directory holds them; `unit_path.unescape` decodes `\xNN` into a caller's
+buffer. A slice whose whole subtree is one class carries that class (`system.slice`
+and the slices under it, `machine.slice`, the top-level `docker` and `lxc`,
+the user manager's `session.slice` and `background.slice`, `agents.slice`
+and `agents-P.slice` with the project as key, an application's
+`app-APPID.slice`), because memory charged to a removed unit moves to its
+parent and a class total must find it there. A node that holds several
+classes (the root, `user.slice`, `user-N.slice`, a user manager's directory,
+its `app.slice`) is **mixed**: `Classification.mixed` is set, it is neither a
+class nor Unclassified, and totals recurse into its children. A process is
+never mixed: one found in such a node is Unclassified. Units inside an
+application's slice (a terminal's `vte-spawn-*.scope`) are that application at
+medium confidence, the layout being the launcher's convention.
+
+`src/unit_path.zig` derives the unit, the user unit, the login session id and
+the owner uid from a path the way systemd does (`cg_path_get_unit`,
+`cg_path_get_user_unit`, `cg_path_get_session`, `cg_path_get_owner_uid` in
+src/basic/cgroup-util.c at v255, re-implemented), without a syscall: it
+replaces libsystemd's `sd_pid_get_unit` family, which opens `/proc/PID/cgroup`
+again for each call.
+
+Tests: table tests over `testdata/cgroup-paths.txt` (the directory paths of
+a workstation's cgroup tree, private names replaced, plus hand-written
+shapes of the cases the capture lacked), a synthetic process tree (agent
+scopes and jobs, an orphaned agent shell, a session inside an editor's scope,
+a nested `claude -p`, a ppid cycle, a reused pid), the fixture walk, an
+allocation budget, the mixed nodes and single-class slices, and three fuzz tests (arbitrary path bytes, arbitrary
+process tables, and `unit_path`'s).
+
+Cost, measured 2026-10-29 on the development workstation (ReleaseSafe, the
+live `/proc` of 510 processes walked once, then classified 200 times, median
+of 9 timings): **277 microseconds of thread CPU per 500 processes**, about 2.5%
+of the walk's own 11 ms, with two allocations per pass and none when no
+process is an agent program; 0 bytes written. That machine's processes fell
+into Kernel 237, Init 1, System services 82, Session services 39,
+Applications 30, Login session 88, Agent sessions 33, Unclassified 0; its 135
+cgroups into 4 mixed, 0 Unclassified, 1 Init, 74 System services, 33 Session
+services, 3 Applications, 2 Login session, 17 Agent sessions and 1 Containers
+and VMs.
+
 ## C interface
 
 `include/gsmcollect.h` (C11, `<stdint.h>` and `<stddef.h>` only,
