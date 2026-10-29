@@ -20,6 +20,7 @@
 #include "gsm-drive-spec.h"
 #include "gsm-health-db.h"
 #include "gsm-history-chart.h"
+#include "gsm-onbehalf.h"
 #include "gsm-procio.h"
 #include "gsm-smart-file.h"
 #include "gsm-udisks.h"
@@ -442,6 +443,56 @@ collecting_history_text (DriveCard *card)
 }
 
 
+static char *format_size_plain (uint64_t bytes);
+
+
+/* "about 1.7 years", "about 8 months": how long, for a sentence. */
+static char *
+duration_text (double years)
+{
+  if (years >= 2)
+    return g_strdup_printf (_("about %.0f years"), years);
+  if (years >= 1)
+    return g_strdup_printf (_("about %.1f years"), years);
+  if (years * 12 >= 1.5)
+    return g_strdup_printf (_("about %.0f months"), years * 12);
+
+  return g_strdup (_("under 2 months"));
+}
+
+
+/*
+ * When the maker's published rating is reached at the same write rate. The
+ * headline's lifespan comes from the drive's own wear counter; the two can
+ * disagree by years (a rating is a warranty line, the counter a wear
+ * estimate), so when a rating exists both are said. NULL when the maker
+ * publishes none or the rate is not known.
+ */
+static char *
+maker_rating_line (GsmDrive *drive,
+                   double    bytes_per_day)
+{
+  uint64_t rated = gsm_drive_get_maker_rated_tbw (drive);
+  uint64_t written = gsm_drive_get_bytes_written (drive);
+  g_autofree char *size = NULL;
+  g_autofree char *when = NULL;
+
+  if (rated == 0 || bytes_per_day <= 0)
+    return NULL;
+
+  size = format_size_plain (rated);
+
+  if (written >= rated)
+    return g_strdup_printf (_("The maker's %s rating has already been passed."),
+                            size);
+
+  when = duration_text (((double) (rated - written) / bytes_per_day) / 365.25);
+
+  return g_strdup_printf (_("At this rate the maker's %s rating is reached in %s."),
+                          size, when);
+}
+
+
 /*
  * The one number a user actually wants. Everything else on the card exists to
  * justify this line, and the line below it always states what it was computed
@@ -544,7 +595,12 @@ update_headline (DriveCard *card)
   {
     g_autofree char *per_day = g_format_size ((guint64) rate);
 
-    basis = g_strdup_printf (_("at your recent write rate of %s/day"), per_day);
+    g_autofree char *rating = maker_rating_line (drive, rate);
+
+    basis = rating != NULL
+            ? g_strdup_printf (_("at your recent write rate of %s/day.\n%s"),
+                               per_day, rating)
+            : g_strdup_printf (_("at your recent write rate of %s/day"), per_day);
     gtk_label_set_text (card->basis, basis);
   }
 }
@@ -797,6 +853,427 @@ recorded_up_to_text (GsmHealthView *self)
 /* Charts                                                              */
 /* ------------------------------------------------------------------ */
 
+/* The longest silence between two readings that still counts as one
+ * continuous line, per range: a sampler that runs writes at least hourly,
+ * and a laptop asleep overnight is not a gap worth hiding. */
+static int64_t
+chart_max_gap_seconds (GsmHistoryRange range)
+{
+  switch (range) {
+    case GSM_HISTORY_RANGE_DAY:
+      return 3 * 3600;
+    case GSM_HISTORY_RANGE_MONTH:
+      return 2 * 86400;
+    case GSM_HISTORY_RANGE_YEAR:
+    default:
+      return 3 * 86400;
+  }
+}
+
+
+/* ---- the write lists ---- */
+
+/* One row of "what writes to this drive", before it becomes a bar. */
+typedef struct {
+  char    *name;
+  char    *basis;      /* GSM_HEALTH_BASIS_*; unused for charged rows */
+  uint64_t wbytes;
+  gboolean inferred;   /* charged row: the device is inferred (/proc) */
+} WriteRow;
+
+/* The on-behalf rows of one proxy writer. */
+typedef struct {
+  char      *via;
+  uint64_t   wbytes;
+  GPtrArray *rows;     /* WriteRow*, grouped by basis */
+  gboolean   placed;   /* already listed under a charged-to row */
+} ProxyGroup;
+
+/* How many charged-to rows the list shows before folding the rest. */
+#define CHARGED_ROWS_SHOWN 12
+
+static void
+write_row_free (WriteRow *row)
+{
+  g_free (row->name);
+  g_free (row->basis);
+  g_free (row);
+}
+
+
+static void
+proxy_group_free (ProxyGroup *group)
+{
+  g_free (group->via);
+  g_ptr_array_unref (group->rows);
+  g_free (group);
+}
+
+
+static int
+compare_write_rows_by_bytes (gconstpointer a,
+                             gconstpointer b)
+{
+  const WriteRow *x = *(WriteRow *const *) a;
+  const WriteRow *y = *(WriteRow *const *) b;
+
+  return (x->wbytes < y->wbytes) - (x->wbytes > y->wbytes);
+}
+
+
+static int
+compare_proxy_groups_by_bytes (gconstpointer a,
+                               gconstpointer b)
+{
+  const ProxyGroup *x = *(ProxyGroup *const *) a;
+  const ProxyGroup *y = *(ProxyGroup *const *) b;
+
+  return (x->wbytes < y->wbytes) - (x->wbytes > y->wbytes);
+}
+
+
+/*
+ * Is this charged-to row the proxy writer `via` itself? The rows come from
+ * cgroup names (the coredump handler is "system-systemd-coredump.slice" or
+ * its template unit, journald "systemd-journald.service") and `via` from the
+ * proxy's own name, so match on the daemon's name rather than the spelling.
+ */
+static gboolean
+row_is_proxy_writer (const char *row_name,
+                     const char *via)
+{
+  if (g_strcmp0 (row_name, via) == 0)
+    return TRUE;
+  if (strstr (via, "coredump") != NULL)
+    return strstr (row_name, "systemd-coredump") != NULL;
+  if (strstr (via, "journald") != NULL)
+    return strstr (row_name, "systemd-journald") != NULL;
+
+  return FALSE;
+}
+
+
+static gboolean
+is_unknown_originator (const char *name)
+{
+  return g_str_has_prefix (name, "unknown:");
+}
+
+
+/* Within a proxy group: rows of one basis together (so one caption covers
+ * them), the rows that cannot say who last, biggest first within each. */
+static int
+compare_on_behalf_rows (gconstpointer a,
+                        gconstpointer b)
+{
+  const WriteRow *x = *(WriteRow *const *) a;
+  const WriteRow *y = *(WriteRow *const *) b;
+  gboolean x_unknown = is_unknown_originator (x->name);
+  gboolean y_unknown = is_unknown_originator (y->name);
+  int by_basis;
+
+  if (x_unknown != y_unknown)
+    return x_unknown ? 1 : -1;
+
+  by_basis = g_strcmp0 (x->basis, y->basis);
+  if (by_basis != 0)
+    return by_basis;
+
+  return compare_write_rows_by_bytes (a, b);
+}
+
+
+/* The basis of an on-behalf row in words; NULL when it has no label. */
+static const char *
+basis_phrase (const char *basis)
+{
+  if (g_strcmp0 (basis, GSM_HEALTH_BASIS_COREDUMP_PROPORTIONAL) == 0)
+    return _("estimated from core sizes");
+  if (g_strcmp0 (basis, GSM_HEALTH_BASIS_COREDUMP_EXACT) == 0)
+    return _("measured per crash");
+  if (g_strcmp0 (basis, GSM_HEALTH_BASIS_JOURNALD_LINES) == 0)
+    return _("estimated from log lines");
+
+  return NULL;
+}
+
+
+static gboolean
+basis_is_estimate (const char *basis)
+{
+  return g_strcmp0 (basis, GSM_HEALTH_BASIS_COREDUMP_EXACT) != 0;
+}
+
+
+/* "systemd-coredump wrote these bytes while storing the crashes of (measured
+ * per crash):", the line above a run of on-behalf rows. */
+static char *
+on_behalf_caption (const char *via,
+                   const char *basis)
+{
+  const char *phrase = basis_phrase (basis);
+  const char *what;
+
+  if (g_strcmp0 (via, gsm_proxy_writer_name (GSM_PROXY_COREDUMP)) == 0)
+    what = _("systemd-coredump wrote these bytes while storing the crashes of");
+  else if (g_strcmp0 (via, gsm_proxy_writer_name (GSM_PROXY_JOURNALD)) == 0)
+    what = _("systemd-journald wrote these bytes while logging for");
+  else
+    what = _("This writer wrote these bytes on behalf of");
+
+  if (phrase == NULL)
+    return g_strdup_printf ("%s:", what);
+
+  return g_strdup_printf ("%s (%s):", what, phrase);
+}
+
+
+static GsmChartBar *
+new_chart_bar (const char *label,
+               double      value,
+               gboolean    estimated,
+               int         indent,
+               gboolean    caption)
+{
+  GsmChartBar *bar = g_new0 (GsmChartBar, 1);
+
+  bar->label = g_strdup (label);
+  bar->value = value;
+  bar->estimated = estimated;
+  bar->indent = indent;
+  bar->caption = caption;
+
+  return bar;
+}
+
+
+/* What the list adds up to and which kinds of row it holds, for the note. */
+typedef struct {
+  uint64_t charged_total_bytes;
+  gboolean any_inferred;
+  gboolean any_on_behalf;
+  gboolean any_on_behalf_estimate;
+  gboolean any_row;
+} WriteListSummary;
+
+
+/* Under a proxy writer's row: its on-behalf rows, a caption before each run
+ * of one basis, and for the rows that could not say who, why. */
+static void
+place_proxy_group (ProxyGroup       *group,
+                   GPtrArray        *bars,
+                   WriteListSummary *summary)
+{
+  const char *last_basis = NULL;
+
+  summary->any_on_behalf = TRUE;
+  g_ptr_array_sort (group->rows, compare_on_behalf_rows);
+
+  for (guint r = 0; r < group->rows->len; r++) {
+    WriteRow *on_behalf = g_ptr_array_index (group->rows, r);
+    gboolean unknown = is_unknown_originator (on_behalf->name);
+    gboolean estimate = basis_is_estimate (on_behalf->basis);
+
+    if (!unknown && g_strcmp0 (last_basis, on_behalf->basis) != 0) {
+      g_autofree char *caption = on_behalf_caption (group->via, on_behalf->basis);
+
+      g_ptr_array_add (bars, new_chart_bar (caption, 0, FALSE, 1, TRUE));
+      last_basis = on_behalf->basis;
+    }
+
+    summary->any_on_behalf_estimate |= estimate && !unknown;
+    g_ptr_array_add (bars, new_chart_bar (on_behalf->name,
+                                          (double) on_behalf->wbytes,
+                                          estimate, 1, FALSE));
+
+    if (g_strcmp0 (on_behalf->name, GSM_ON_BEHALF_NO_ACCESS) == 0)
+      g_ptr_array_add (bars, new_chart_bar (_("The journal could not be "
+                                              "read: join the adm or "
+                                              "systemd-journal group to "
+                                              "see who these bytes were "
+                                              "written for."),
+                                            0, FALSE, 1, TRUE));
+  }
+}
+
+
+/*
+ * Split the stored rows into the two lists of ADR 0012: what the kernel
+ * charged to each cgroup (exact rows, residues included, summed per name, the
+ * biggest first, the tail folded into one line), and under the proxy writers
+ * their on-behalf rows. Charged rows add up to the drive's own counter; the
+ * on-behalf rows re-divide a proxy's share of it and are never added in.
+ */
+static GPtrArray *
+build_write_bars (GPtrArray        *detail,
+                  WriteListSummary *summary)
+{
+  g_autoptr (GHashTable) charged_by_name =
+    g_hash_table_new (g_str_hash, g_str_equal);
+  g_autoptr (GPtrArray) charged =
+    g_ptr_array_new_with_free_func ((GDestroyNotify) write_row_free);
+  g_autoptr (GPtrArray) groups =
+    g_ptr_array_new_with_free_func ((GDestroyNotify) proxy_group_free);
+  GPtrArray *bars =
+    g_ptr_array_new_with_free_func ((GDestroyNotify) gsm_chart_bar_free);
+  uint64_t folded_bytes = 0;
+  guint folded_count = 0;
+  gboolean folded_inferred = FALSE;
+  guint shown = 0;
+
+  memset (summary, 0, sizeof *summary);
+
+  for (guint i = 0; i < detail->len; i++) {
+    GsmBlameDetail *d = g_ptr_array_index (detail, i);
+
+    if (d->wbytes == 0)
+      continue;
+
+    if (d->via != NULL && d->via[0] != '\0') {
+      ProxyGroup *group = NULL;
+      WriteRow *row;
+
+      for (guint g = 0; g < groups->len; g++) {
+        ProxyGroup *candidate = g_ptr_array_index (groups, g);
+
+        if (g_strcmp0 (candidate->via, d->via) == 0)
+          group = candidate;
+      }
+
+      if (group == NULL) {
+        group = g_new0 (ProxyGroup, 1);
+        group->via = g_strdup (d->via);
+        group->rows = g_ptr_array_new_with_free_func ((GDestroyNotify) write_row_free);
+        g_ptr_array_add (groups, group);
+      }
+
+      row = g_new0 (WriteRow, 1);
+      row->name = g_strdup (d->name);
+      row->basis = g_strdup (d->basis);
+      row->wbytes = d->wbytes;
+      g_ptr_array_add (group->rows, row);
+      group->wbytes += d->wbytes;
+      continue;
+    }
+
+    {
+      WriteRow *row = g_hash_table_lookup (charged_by_name, d->name);
+
+      if (row == NULL) {
+        row = g_new0 (WriteRow, 1);
+        row->name = g_strdup (d->name);
+        g_ptr_array_add (charged, row);
+        g_hash_table_insert (charged_by_name, row->name, row);
+      }
+      row->wbytes += d->wbytes;
+      row->inferred |= g_strcmp0 (d->basis, GSM_HEALTH_BASIS_PROCFS) == 0;
+      summary->charged_total_bytes += d->wbytes;
+    }
+  }
+
+  g_ptr_array_sort (charged, compare_write_rows_by_bytes);
+  g_ptr_array_sort (groups, compare_proxy_groups_by_bytes);
+
+  for (guint i = 0; i < charged->len; i++) {
+    WriteRow *row = g_ptr_array_index (charged, i);
+    gboolean is_proxy = FALSE;
+
+    for (guint g = 0; g < groups->len; g++) {
+      ProxyGroup *group = g_ptr_array_index (groups, g);
+
+      is_proxy |= !group->placed && row_is_proxy_writer (row->name, group->via);
+    }
+
+    /* A proxy's row stays, whatever its size: its on-behalf rows hang from it. */
+    if (shown >= CHARGED_ROWS_SHOWN && !is_proxy) {
+      folded_bytes += row->wbytes;
+      folded_count++;
+      folded_inferred |= row->inferred;
+      continue;
+    }
+
+    shown++;
+    summary->any_row = TRUE;
+    summary->any_inferred |= row->inferred;
+    g_ptr_array_add (bars, new_chart_bar (row->name, (double) row->wbytes,
+                                          row->inferred, 0, FALSE));
+
+    for (guint g = 0; g < groups->len; g++) {
+      ProxyGroup *group = g_ptr_array_index (groups, g);
+
+      if (group->placed || !row_is_proxy_writer (row->name, group->via))
+        continue;
+
+      group->placed = TRUE;
+      place_proxy_group (group, bars, summary);
+
+    }
+  }
+
+  /* A proxy writer with no row of its own above (it wrote too little to be
+   * charged on this drive) still gets its originators listed. */
+  for (guint g = 0; g < groups->len; g++) {
+    ProxyGroup *group = g_ptr_array_index (groups, g);
+
+    if (group->placed)
+      continue;
+
+    {
+      g_autofree char *heading = g_strdup_printf (_("Written by %s:"), group->via);
+
+      g_ptr_array_add (bars, new_chart_bar (heading, 0, FALSE, 0, TRUE));
+    }
+    place_proxy_group (group, bars, summary);
+  }
+
+  if (folded_count > 0) {
+    g_autofree char *label = g_strdup_printf (ngettext ("%u smaller writer",
+                                                        "%u smaller writers",
+                                                        folded_count),
+                                              folded_count);
+
+    summary->any_row = TRUE;
+    summary->any_inferred |= folded_inferred;
+    g_ptr_array_add (bars, new_chart_bar (label, (double) folded_bytes,
+                                          folded_inferred, 0, FALSE));
+  }
+
+  return bars;
+}
+
+
+/* The note under the list: what the plain rows add up to, and how to read the
+ * indented and hatched ones. */
+static char *
+write_list_note (const WriteListSummary *summary)
+{
+  GString *note = g_string_new (NULL);
+  g_autofree char *total = g_format_size (summary->charged_total_bytes);
+
+  if (!summary->any_inferred)
+    g_string_append_printf (note, _("Rows that are not indented add up to %s, "
+                                    "the bytes the kernel counted as written "
+                                    "to this drive over this range."), total);
+  else
+    g_string_append_printf (note, _("Rows that are not indented add up to %s. "
+                                    "Hatched ones are inferred: the system "
+                                    "reports how much an app wrote, but not "
+                                    "to which drive."), total);
+
+  if (summary->any_on_behalf) {
+    g_string_append (note, " ");
+    g_string_append (note, summary->any_on_behalf_estimate
+                     ? _("Indented rows split a proxy writer's bytes among "
+                         "those it wrote for; they are not added in again, "
+                         "and the hatched ones are estimates.")
+                     : _("Indented rows split a proxy writer's bytes among "
+                         "those it wrote for; they are not added in again."));
+  }
+
+  return g_string_free (note, FALSE);
+}
+
+
 static void
 update_charts (DriveCard *card)
 {
@@ -804,9 +1281,10 @@ update_charts (DriveCard *card)
   const char *id = gsm_drive_get_id (card->drive);
   g_autoptr (GArray) history = NULL;
   g_autoptr (GArray) wear = g_array_new (FALSE, FALSE, sizeof (GsmChartPoint));
-  g_autoptr (GPtrArray) blame = NULL;
+  g_autoptr (GPtrArray) detail = NULL;
   g_autoptr (GPtrArray) bars = NULL;
-  gboolean any_estimated = FALSE;
+  WriteListSummary summary;
+  int64_t max_gap = chart_max_gap_seconds (self->range);
   double years;
 
   history = gsm_health_db_get_history (self->db, id, self->range);
@@ -825,6 +1303,7 @@ update_charts (DriveCard *card)
 
   gsm_history_chart_set_unit (GSM_HISTORY_CHART (card->wear_chart),
                               GSM_CHART_UNIT_PERCENT);
+  gsm_history_chart_set_max_gap (GSM_HISTORY_CHART (card->wear_chart), max_gap);
   gsm_history_chart_set_points (GSM_HISTORY_CHART (card->wear_chart), wear);
 
   /*
@@ -843,36 +1322,37 @@ update_charts (DriveCard *card)
                                        0, MIN (100, top * 1.4));
   }
 
-  /* Project forward to end of life, if we can say anything about the rate. */
+  /*
+   * Project forward to end of life, if we can say anything about the rate,
+   * and only from a reading that is part of a continuous run: the line starts
+   * at the last point, so if that point stands alone (the previous one is
+   * months back) the dashed stroke would hang from a single reading and
+   * suggest a trend the history does not show.
+   */
   years = gsm_drive_project_years_left (card->drive, card->write_rate);
 
-  if (years > 0 && years < 100 && wear->len > 0) {
+  if (years > 0 && years < 100 && wear->len >= 2 &&
+      g_array_index (wear, GsmChartPoint, wear->len - 1).ts -
+      g_array_index (wear, GsmChartPoint, wear->len - 2).ts <= max_gap) {
     int64_t now = g_get_real_time () / G_USEC_PER_SEC;
     int64_t end = now + (int64_t) (years * 365.25 * 86400);
+    g_autofree char *when = duration_text (years);
+    g_autofree char *label = g_strdup_printf (_("Dashed: projected at the recent "
+                                                "write rate, 100%% in %s"), when);
 
     gsm_history_chart_set_projection (GSM_HISTORY_CHART (card->wear_chart),
                                       end, 100);
+    gsm_history_chart_set_projection_label (GSM_HISTORY_CHART (card->wear_chart),
+                                            label);
   } else {
     gsm_history_chart_set_projection (GSM_HISTORY_CHART (card->wear_chart), 0, 0);
+    gsm_history_chart_set_projection_label (GSM_HISTORY_CHART (card->wear_chart),
+                                            NULL);
   }
 
   /* Blame */
-  blame = gsm_health_db_get_blame (self->db, id, self->range);
-  bars = g_ptr_array_new_with_free_func ((GDestroyNotify) gsm_chart_bar_free);
-
-  for (guint i = 0; i < blame->len && i < 10; i++) {
-    GsmBlameRow *row = g_ptr_array_index (blame, i);
-    GsmChartBar *bar = g_new0 (GsmChartBar, 1);
-
-    bar->label = g_strdup (row->name);
-    bar->value = (double) row->wbytes;
-    bar->estimated = !row->exact;
-
-    if (bar->estimated)
-      any_estimated = TRUE;
-
-    g_ptr_array_add (bars, bar);
-  }
+  detail = gsm_health_db_get_blame_detail (self->db, id, self->range);
+  bars = build_write_bars (detail, &summary);
 
   gsm_history_chart_set_bars (GSM_HISTORY_CHART (card->blame_chart), bars);
 
@@ -894,16 +1374,13 @@ update_charts (DriveCard *card)
     g_autofree char *base = NULL;
     g_autofree char *fresh = recorded_up_to_text (self);
 
-    if (blame->len == 0)
+    if (!summary.any_row)
       base = g_strdup (self->tracking_enabled
                        ? _("No writes recorded yet.")
                        : _("Turn on wear tracking to find out what writes to "
                            "this drive."));
-    else if (any_estimated)
-      base = g_strdup (_("Hatched bars are estimated: the system reports how "
-                         "much an app wrote, but not to which drive."));
     else
-      base = g_strdup (_("Measured per drive."));
+      base = write_list_note (&summary);
 
     if (fresh != NULL) {
       g_autofree char *note = g_strdup_printf ("%s %s", base, fresh);

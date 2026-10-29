@@ -31,8 +31,11 @@ typedef enum
   GSM_PROXY_COUNT,
 } GsmProxyWriter;
 
-/* The `via` column of a reassigned row: the name the proxy's own
- * charged-to row carries. */
+/* The `via` column of a reassigned row: the proxy writer's unit name. For
+ * journald that is also its charged-to row's name; systemd-coredump's bytes
+ * are charged to its instances (`systemd-coredump@.service`) and to the
+ * residue of `system-systemd-coredump.slice`, so readers group the
+ * reassigned rows under the writer by this name, not by row name. */
 const char *gsm_proxy_writer_name (GsmProxyWriter writer);
 
 /* Is this cgroup (path relative to the cgroup root, as a delta names it) the

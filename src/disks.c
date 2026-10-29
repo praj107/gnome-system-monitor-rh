@@ -4,6 +4,10 @@
 
 #include "config.h"
 
+#include <errno.h>
+#include <string.h>
+#include <sys/statvfs.h>
+
 #include <glib/gi18n.h>
 
 #include <gtk/gtk.h>
@@ -169,6 +173,26 @@ drop_leftover_directories (GsmDisksView *self,
 }
 
 
+/*
+ * Is this mount one the user may not stat? FUSE mounts such as the document
+ * portal's /run/user/UID/doc answer statvfs(2) with EPERM or EACCES to every
+ * process but the one that mounted them. libgtop would log a warning for it
+ * on every refresh, so ask first (statvfs(3), the same call it makes) and
+ * leave a refused mount alone. Anything else, including a mount that is gone
+ * or slow, still goes to libgtop as before.
+ */
+static gboolean
+mount_refuses_statvfs (const char *mountdir)
+{
+  struct statvfs probe;
+
+  if (statvfs (mountdir, &probe) == 0)
+    return FALSE;
+
+  return errno == EPERM || errno == EACCES;
+}
+
+
 static inline void
 handle_entry (GsmDisksView             *self,
               GPtrArray                *new_disks,
@@ -182,7 +206,13 @@ handle_entry (GsmDisksView             *self,
   g_autoptr (GFile) directory = g_file_new_for_path (entry->mountdir);
   GsmDisk *existing_disk = NULL;
 
-  glibtop_get_fsusage (&usage, entry->mountdir);
+  /* An unreadable mount reports no blocks, as libgtop does for a failure:
+   * it is then listed with empty sizes under "show all file systems" and
+   * hidden otherwise. */
+  if (mount_refuses_statvfs (entry->mountdir))
+    memset (&usage, 0, sizeof usage);
+  else
+    glibtop_get_fsusage (&usage, entry->mountdir);
 
   /* If this was already a known directory, save it from being cleaned up */
   g_hash_table_remove (leftover_directories, directory);

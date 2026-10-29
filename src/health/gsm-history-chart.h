@@ -41,6 +41,9 @@ typedef struct {
   char    *label;
   double   value;
   gboolean estimated;  /* drawn hatched and labelled, never just recoloured */
+  int      indent;     /* 0 for a top-level row; 1 for one that belongs to the
+                        * row above it (shifts the label, not the bar) */
+  gboolean caption;    /* a line of explanation: no bar, no value, dimmed */
 } GsmChartBar;
 
 void gsm_chart_bar_free (GsmChartBar *bar);
@@ -71,6 +74,22 @@ void       gsm_history_chart_set_value_range (GsmHistoryChart *self,
 void       gsm_history_chart_set_projection (GsmHistoryChart *self,
                                              int64_t          ts,
                                              double           value);
+
+/*
+ * Words drawn on the plot beside a projection, so the dashed line says what
+ * it is wherever the chart is seen. NULL for none.
+ */
+void       gsm_history_chart_set_projection_label (GsmHistoryChart *self,
+                                                   const char      *label);
+
+/*
+ * Line mode. Two points further apart than this are not joined by a line:
+ * the chart has no reading in between, and a straight stroke across the gap
+ * would claim one. Points are drawn as dots so a lone reading still shows.
+ * 0 (the default) joins every pair.
+ */
+void       gsm_history_chart_set_max_gap    (GsmHistoryChart *self,
+                                             int64_t          seconds);
 
 /* Bar mode. Takes a GPtrArray of GsmChartBar*, biggest first. */
 void       gsm_history_chart_set_bars       (GsmHistoryChart *self,

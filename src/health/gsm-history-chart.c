@@ -9,6 +9,7 @@
 #include <math.h>
 
 #include <glib/gi18n.h>
+#include <pango/pangocairo.h>
 
 #include "gsm-history-chart.h"
 
@@ -31,9 +32,17 @@
 #define BAR_HEIGHT        18.0
 #define BAR_GAP            8.0   /* >= 2px of surface between fills */
 #define BAR_RADIUS         4.0
-#define BAR_LABEL_W      140.0
+#define BAR_LABEL_MIN_W  140.0
+#define BAR_LABEL_MAX_SHARE 0.5  /* of the chart's width */
+#define BAR_INDENT_W      18.0
 #define BAR_VALUE_W       92.0
 #define BAR_MIN_FILL       3.0
+#define CAPTION_HEIGHT    16.0
+#define CAPTION_GAP        4.0
+
+/* Line mode */
+#define DOT_RADIUS         2.5
+#define MAX_DOTTED_POINTS 60
 
 struct _GsmHistoryChart {
   GtkWidget parent_instance;
@@ -49,6 +58,8 @@ struct _GsmHistoryChart {
 
   int64_t projection_ts;
   double projection_value;
+  char *projection_label;
+  int64_t max_gap_seconds;
 };
 
 G_DEFINE_FINAL_TYPE (GsmHistoryChart, gsm_history_chart, GTK_TYPE_WIDGET)
@@ -123,6 +134,18 @@ format_value (GsmChartUnit unit,
 /* Line mode                                                           */
 /* ------------------------------------------------------------------ */
 
+/* Are readings i and i + 1 close enough in time to draw a line between? */
+static gboolean
+points_joined (GsmHistoryChart *self,
+               guint            i)
+{
+  const GsmChartPoint *a = &g_array_index (self->points, GsmChartPoint, i);
+  const GsmChartPoint *b = &g_array_index (self->points, GsmChartPoint, i + 1);
+
+  return self->max_gap_seconds <= 0 || b->ts - a->ts <= self->max_gap_seconds;
+}
+
+
 static void
 draw_line_chart (GsmHistoryChart *self,
                  cairo_t         *cr,
@@ -145,11 +168,19 @@ draw_line_chart (GsmHistoryChart *self,
 
   has_projection = self->projection_ts > t1;
 
-  /* The projection has to fit on the same axis as the history, or the dashed
-   * line would run off the plot and silently misrepresent when the drive
-   * actually reaches end of life. */
-  if (has_projection)
-    t1 = self->projection_ts;
+  /*
+   * The projection shares the time axis with the history, but only up to the
+   * history's own length again (at least a day). A drive 15 years from its
+   * rating would otherwise squash a month of readings into the left-hand
+   * pixels, where two or three points read as a near-vertical wall. The
+   * dashed line is the projection's straight path cut off at the plot's edge;
+   * its label says where it ends.
+   */
+  if (has_projection) {
+    int64_t reach = MAX (t1 - t0, 86400);
+
+    t1 = MIN (self->projection_ts, t1 + reach);
+  }
 
   span = (double) (t1 - t0);
   if (span <= 0)
@@ -195,17 +226,40 @@ draw_line_chart (GsmHistoryChart *self,
     double x = X_FOR (p->ts);
     double y = Y_FOR (p->value);
 
-    if (i == 0)
-      cairo_move_to (cr, x, y);
-    else
+    if (i > 0 && points_joined (self, i - 1))
       cairo_line_to (cr, x, y);
+    else
+      cairo_move_to (cr, x, y);
   }
   cairo_stroke (cr);
+
+  /* Dots for readings: always when there are few, and for any reading with
+   * no neighbour to be joined to, so a lone point does not vanish. */
+  {
+    gboolean all = self->points->len <= MAX_DOTTED_POINTS;
+
+    for (guint i = 0; i < self->points->len; i++) {
+      GsmChartPoint *p = &g_array_index (self->points, GsmChartPoint, i);
+      gboolean joined = (i > 0 && points_joined (self, i - 1)) ||
+                        (i + 1 < self->points->len && points_joined (self, i));
+
+      if (!all && joined)
+        continue;
+
+      cairo_new_sub_path (cr);
+      cairo_arc (cr, X_FOR (p->ts), Y_FOR (p->value), DOT_RADIUS, 0, 2 * G_PI);
+      cairo_fill (cr);
+    }
+  }
 
   if (has_projection) {
     GsmChartPoint *last =
       &g_array_index (self->points, GsmChartPoint, self->points->len - 1);
     double dashes[] = { 4.0, 4.0 };
+    double fraction = (double) (t1 - last->ts) /
+                      (double) (self->projection_ts - last->ts);
+    double end_value = last->value +
+                       (self->projection_value - last->value) * fraction;
 
     /*
      * Dashed, and starting from a visible gap at the last real reading: this
@@ -216,9 +270,19 @@ draw_line_chart (GsmHistoryChart *self,
     set_source (cr, &accent, 0.45);
     cairo_set_dash (cr, dashes, 2, 0);
     cairo_move_to (cr, X_FOR (last->ts), Y_FOR (last->value));
-    cairo_line_to (cr, X_FOR (self->projection_ts), Y_FOR (self->projection_value));
+    cairo_line_to (cr, X_FOR (t1), Y_FOR (end_value));
     cairo_stroke (cr);
     cairo_restore (cr);
+
+    if (self->projection_label != NULL) {
+      cairo_text_extents_t extents;
+
+      set_source (cr, ink, AXIS_LABEL_ALPHA);
+      cairo_text_extents (cr, self->projection_label, &extents);
+      cairo_move_to (cr, MAX (PAD_LEFT, width - PAD_RIGHT - extents.width),
+                     PAD_TOP + extents.height + 2);
+      cairo_show_text (cr, self->projection_label);
+    }
   }
 
 #undef X_FOR
@@ -282,6 +346,93 @@ hatch_bar (cairo_t *cr,
 }
 
 
+/* A one-line Pango layout in the chart's text size, cut off with an
+ * ellipsis at `max_width_px` rather than running into its neighbour. */
+static PangoLayout *
+bar_text_layout (GsmHistoryChart *self,
+                 const char      *text,
+                 double           max_width_px)
+{
+  PangoLayout *layout = gtk_widget_create_pango_layout (GTK_WIDGET (self), text);
+  PangoFontDescription *font = pango_font_description_new ();
+
+  pango_font_description_set_absolute_size (font, FONT_SIZE * PANGO_SCALE);
+  pango_layout_set_font_description (layout, font);
+  pango_font_description_free (font);
+
+  pango_layout_set_ellipsize (layout, PANGO_ELLIPSIZE_END);
+  pango_layout_set_width (layout, (int) (MAX (max_width_px, 1) * PANGO_SCALE));
+
+  return layout;
+}
+
+
+/* Draw `text` with its left edge at x, vertically centred in a row. */
+static void
+show_bar_text (GsmHistoryChart *self,
+               cairo_t         *cr,
+               const char      *text,
+               double           x,
+               double           y,
+               double           row_height,
+               double           max_width_px)
+{
+  g_autoptr (PangoLayout) layout = bar_text_layout (self, text, max_width_px);
+  int text_height;
+
+  pango_layout_get_pixel_size (layout, NULL, &text_height);
+  cairo_move_to (cr, x, y + (row_height - text_height) / 2);
+  pango_cairo_show_layout (cr, layout);
+}
+
+
+static double
+bar_row_height (const GsmChartBar *bar)
+{
+  return bar->caption ? CAPTION_HEIGHT : BAR_HEIGHT;
+}
+
+
+static double
+bar_row_gap (const GsmChartBar *bar)
+{
+  return bar->caption ? CAPTION_GAP : BAR_GAP;
+}
+
+
+/* The label column fits the longest label (indent included), within limits:
+ * "user.slice (own and exited units)" is longer than a fixed 140 px. */
+static double
+bar_label_column_width (GsmHistoryChart *self,
+                        int              width)
+{
+  double widest = BAR_LABEL_MIN_W;
+  double limit = MAX (BAR_LABEL_MIN_W, width * BAR_LABEL_MAX_SHARE);
+
+  for (guint i = 0; i < self->bars->len; i++) {
+    GsmChartBar *bar = g_ptr_array_index (self->bars, i);
+    g_autoptr (PangoLayout) layout = NULL;
+    int text_width;
+
+    if (bar->caption)
+      continue;
+
+    layout = gtk_widget_create_pango_layout (GTK_WIDGET (self), bar->label);
+    {
+      PangoFontDescription *font = pango_font_description_new ();
+
+      pango_font_description_set_absolute_size (font, FONT_SIZE * PANGO_SCALE);
+      pango_layout_set_font_description (layout, font);
+      pango_font_description_free (font);
+    }
+    pango_layout_get_pixel_size (layout, &text_width, NULL);
+    widest = MAX (widest, bar->indent * BAR_INDENT_W + text_width + 12);
+  }
+
+  return MIN (widest, limit);
+}
+
+
 static void
 draw_bar_chart (GsmHistoryChart *self,
                 cairo_t         *cr,
@@ -291,31 +442,46 @@ draw_bar_chart (GsmHistoryChart *self,
 {
   GdkRGBA accent = accent_color (ink);
   double max_value = 0;
-  double track_x = BAR_LABEL_W;
-  double track_w = width - BAR_LABEL_W - BAR_VALUE_W;
+  double track_x;
+  double track_w;
   double y = 0;
 
   (void) height;
 
-  if (self->bars == NULL || self->bars->len == 0 || track_w <= 0)
+  if (self->bars == NULL || self->bars->len == 0)
+    return;
+
+  track_x = bar_label_column_width (self, width);
+  track_w = width - track_x - BAR_VALUE_W;
+  if (track_w <= 0)
     return;
 
   for (guint i = 0; i < self->bars->len; i++) {
     GsmChartBar *bar = g_ptr_array_index (self->bars, i);
 
-    max_value = MAX (max_value, bar->value);
+    if (!bar->caption)
+      max_value = MAX (max_value, bar->value);
   }
 
-  if (max_value <= 0)
-    return;
-
-  cairo_set_font_size (cr, FONT_SIZE);
-
   for (guint i = 0; i < self->bars->len; i++) {
     GsmChartBar *bar = g_ptr_array_index (self->bars, i);
-    double w = (bar->value / max_value) * track_w;
-    g_autofree char *value_label = format_value (GSM_CHART_UNIT_BYTES, bar->value);
+    double indent_x = bar->indent * BAR_INDENT_W;
+    double row_height = bar_row_height (bar);
+    double w = max_value > 0 ? (bar->value / max_value) * track_w : 0;
+    g_autofree char *value_label = NULL;
     cairo_text_extents_t extents;
+
+    if (bar->caption) {
+      /* An explanation, not a measurement: dimmer than the names, across
+       * the whole row. */
+      set_source (cr, ink, AXIS_LABEL_ALPHA + 0.1);
+      show_bar_text (self, cr, bar->label, indent_x, y, row_height,
+                     width - indent_x);
+      y += row_height + bar_row_gap (bar);
+      continue;
+    }
+
+    value_label = format_value (GSM_CHART_UNIT_BYTES, bar->value);
 
     /*
      * Write volumes span orders of magnitude — a browser can out-write a log
@@ -331,35 +497,35 @@ draw_bar_chart (GsmHistoryChart *self,
     /* Writer name, in text ink — never in the series colour. The bar beside
      * it carries the identity. */
     set_source (cr, ink, 0.85);
-    cairo_text_extents (cr, bar->label, &extents);
-    cairo_move_to (cr, 0, y + (BAR_HEIGHT / 2) + (extents.height / 2));
-    cairo_show_text (cr, bar->label);
+    show_bar_text (self, cr, bar->label, indent_x, y, row_height,
+                   track_x - indent_x - 8);
 
     /* Track */
     set_source (cr, ink, GRID_ALPHA);
-    rounded_bar (cr, track_x, y, track_w, BAR_HEIGHT, BAR_RADIUS);
+    rounded_bar (cr, track_x, y, track_w, row_height, BAR_RADIUS);
     cairo_fill (cr);
 
     /* Fill */
     set_source (cr, &accent, bar->estimated ? 0.35 : 1.0);
-    rounded_bar (cr, track_x, y, w, BAR_HEIGHT, BAR_RADIUS);
+    rounded_bar (cr, track_x, y, w, row_height, BAR_RADIUS);
     cairo_fill (cr);
 
     if (bar->estimated) {
       set_source (cr, &accent, 0.9);
-      rounded_bar (cr, track_x, y, w, BAR_HEIGHT, BAR_RADIUS);
-      hatch_bar (cr, track_x, y, w, BAR_HEIGHT);
+      rounded_bar (cr, track_x, y, w, row_height, BAR_RADIUS);
+      hatch_bar (cr, track_x, y, w, row_height);
     }
 
     /* Value, direct-labelled at the data end — every bar gets one because
      * there are few of them and the exact figure is the point. */
     set_source (cr, ink, 0.85);
+    cairo_set_font_size (cr, FONT_SIZE);
     cairo_text_extents (cr, value_label, &extents);
     cairo_move_to (cr, width - extents.width,
-                   y + (BAR_HEIGHT / 2) + (extents.height / 2));
+                   y + (row_height / 2) + (extents.height / 2));
     cairo_show_text (cr, value_label);
 
-    y += BAR_HEIGHT + BAR_GAP;
+    y += row_height + bar_row_gap (bar);
   }
 }
 
@@ -419,8 +585,15 @@ gsm_history_chart_measure (GtkWidget      *widget,
   if (self->mode == GSM_CHART_BAR) {
     /* Grow to fit however many writers there are, rather than scrolling or
      * clipping them. */
-    guint rows = self->bars != NULL ? self->bars->len : 0;
-    int needed = (int) (rows * (BAR_HEIGHT + BAR_GAP));
+    double needed_px = 0;
+    int needed;
+
+    for (guint i = 0; self->bars != NULL && i < self->bars->len; i++) {
+      const GsmChartBar *bar = g_ptr_array_index (self->bars, i);
+
+      needed_px += bar_row_height (bar) + bar_row_gap (bar);
+    }
+    needed = (int) needed_px;
 
     *minimum = MAX (needed, 24);
     *natural = *minimum;
@@ -439,6 +612,7 @@ gsm_history_chart_dispose (GObject *object)
 
   g_clear_pointer (&self->points, g_array_unref);
   g_clear_pointer (&self->bars, g_ptr_array_unref);
+  g_clear_pointer (&self->projection_label, g_free);
 
   G_OBJECT_CLASS (gsm_history_chart_parent_class)->dispose (object);
 }
@@ -543,6 +717,30 @@ gsm_history_chart_set_projection (GsmHistoryChart *self,
 
 
 void
+gsm_history_chart_set_projection_label (GsmHistoryChart *self,
+                                        const char      *label)
+{
+  g_return_if_fail (GSM_IS_HISTORY_CHART (self));
+
+  g_free (self->projection_label);
+  self->projection_label = g_strdup (label);
+
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+
+void
+gsm_history_chart_set_max_gap (GsmHistoryChart *self,
+                               int64_t          seconds)
+{
+  g_return_if_fail (GSM_IS_HISTORY_CHART (self));
+
+  self->max_gap_seconds = seconds;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+
+void
 gsm_history_chart_set_bars (GsmHistoryChart *self,
                             GPtrArray       *bars)
 {
@@ -550,6 +748,31 @@ gsm_history_chart_set_bars (GsmHistoryChart *self,
 
   g_clear_pointer (&self->bars, g_ptr_array_unref);
   self->bars = bars != NULL ? g_ptr_array_ref (bars) : NULL;
+
+  /* The bars are drawn, so say them in words too: assistive technology
+   * reads this. */
+  {
+    GString *words = g_string_new (NULL);
+
+    for (guint i = 0; self->bars != NULL && i < self->bars->len; i++) {
+      const GsmChartBar *bar = g_ptr_array_index (self->bars, i);
+
+      if (bar->caption) {
+        g_string_append_printf (words, "%*s%s\n", bar->indent * 2, "", bar->label);
+      } else {
+        g_autofree char *value = format_value (GSM_CHART_UNIT_BYTES, bar->value);
+
+        g_string_append_printf (words, "%*s%s: %s%s\n", bar->indent * 2, "",
+                                bar->label, value,
+                                bar->estimated ? _(" (estimated)") : "");
+      }
+    }
+
+    gtk_accessible_update_property (GTK_ACCESSIBLE (self),
+                                    GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, words->str,
+                                    -1);
+    g_string_free (words, TRUE);
+  }
 
   gtk_widget_queue_resize (GTK_WIDGET (self));
 }
