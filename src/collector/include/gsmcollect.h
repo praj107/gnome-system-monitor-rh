@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * gsmcollect.h: the C interface of the collector, layout 2.
+ * gsmcollect.h: the C interface of the collector, layout 3.
  *
  * The collector reads the kernel's own counters (proc_pid_stat(5),
  * proc_pid_status(5), /proc/meminfo, the pressure files of
@@ -51,8 +51,10 @@ extern "C" {
 
 /* The newest record layout. Layout 1: the first release. Layout 2: gsm_process
  * gains priority, nice and the /proc/<pid>/io counters, gsm_sample_stats gains
- * process_io_unreadable. */
-#define GSM_COLLECT_API_VERSION 2
+ * process_io_unreadable. Layout 3: gsm_process and gsm_cgroup gain a workload
+ * class and, for processes, the systemd unit, user unit, login session and
+ * owner uid their cgroup path names. */
+#define GSM_COLLECT_API_VERSION 3
 
 /* The version the library was built with; compare with the macro above. */
 uint32_t gsm_collect_api_version (void);
@@ -124,6 +126,51 @@ const char *    gsm_collect_strerror (int err);
  * file is absent (no task I/O accounting) or refused, which is the normal case
  * for other users' processes. */
 #define GSM_PROCESS_HAS_IO            (1ULL << 10)
+/* Layout 3. HAS_CLASS is set whenever the classifier ran (the processes
+ * reader ran): workload_class, class_rule and class_confidence are valid; the
+ * class key may still be empty. The unit, user unit and login session are
+ * what the cgroup path names, so they need HAS_CGROUP as well; the owner uid
+ * is that of the innermost user-UID.slice. HAS_AGENT: the outermost coding
+ * agent among the process's ancestors (and itself), found by ancestry. */
+#define GSM_PROCESS_HAS_CLASS         (1ULL << 11)
+#define GSM_PROCESS_HAS_UNIT          (1ULL << 12)
+#define GSM_PROCESS_HAS_USER_UNIT     (1ULL << 13)
+#define GSM_PROCESS_HAS_SESSION       (1ULL << 14)
+#define GSM_PROCESS_HAS_OWNER_UID     (1ULL << 15)
+#define GSM_PROCESS_HAS_AGENT         (1ULL << 16)
+
+/* The memory fields are 0 with their bits set, not unknown, for a process
+ * that has no user address space: a kernel thread (GSM_PF_KTHREAD) or a
+ * zombie or dead task (state 'Z' or 'X'), whose status file has no Vm* or Rss*
+ * lines because there is no mm to print (proc_pid_status(5)). That holds only
+ * when the status file was read and parsed; a refused, short or malformed
+ * status stays unknown. Applies to rss_anon_bytes, rss_file_bytes,
+ * rss_shmem_bytes, vm_swap_bytes and vm_size_bytes in every layout. */
+
+/* Workload classes, gsm_process.workload_class and gsm_cgroup.workload_class
+ * (indexes into the names of gsm_class_name). */
+#define GSM_CLASS_KERNEL            0
+#define GSM_CLASS_INIT              1
+#define GSM_CLASS_SYSTEM_SERVICES   2
+#define GSM_CLASS_SESSION_SERVICES  3
+#define GSM_CLASS_APPLICATIONS      4
+#define GSM_CLASS_LOGIN_SESSION     5
+#define GSM_CLASS_AGENT_SESSIONS    6
+#define GSM_CLASS_CONTAINERS_AND_VMS 7
+#define GSM_CLASS_UNCLASSIFIED      8
+#define GSM_CLASS_COUNT             9
+/* A cgroup (never a process) that holds several classes: not a class. */
+#define GSM_CLASS_MIXED             255
+
+/* How sure the rule is, gsm_process.class_confidence. */
+#define GSM_CONFIDENCE_NONE   0
+#define GSM_CONFIDENCE_LOW    1
+#define GSM_CONFIDENCE_MEDIUM 2
+#define GSM_CONFIDENCE_HIGH   3
+#define GSM_CONFIDENCE_COUNT  4
+
+/* The number of classification rules; class_rule is an index below it. */
+#define GSM_CLASS_RULE_COUNT  20
 
 /* gsm_process.flags: the kernel's task flags (proc_pid_stat(5), field 9). */
 #define GSM_PF_KTHREAD 0x00200000u
@@ -171,6 +218,32 @@ typedef struct gsm_process
   uint64_t io_read_bytes;      /* read_bytes: bytes the storage layer was asked to fetch */
   uint64_t io_write_bytes;     /* write_bytes: bytes sent to the storage layer */
   uint64_t io_cancelled_write_bytes;  /* cancelled_write_bytes: writes undone by truncation */
+  /* ---- layout 3 starts here, at offset 280; the record is 336 bytes ----
+   * Every (offset, length) pair below is a slice of the string table, mostly of
+   * this process's cgroup path, raw as the cgroup directory holds it (a
+   * `\xNN` escape is possible: gsm_unescape_name decodes it). A slice is not
+   * followed by a NUL of its own; use the length. */
+  uint8_t workload_class;      /* GSM_CLASS_*; valid with HAS_CLASS, never GSM_CLASS_MIXED */
+  uint8_t class_rule;          /* index of the rule that decided, below GSM_CLASS_RULE_COUNT
+                                  (gsm_class_rule_name) */
+  uint8_t class_confidence;    /* GSM_CONFIDENCE_* */
+  uint8_t reserved3a;
+  uint32_t owner_uid;          /* valid with HAS_OWNER_UID */
+  uint32_t class_key_offset;   /* what the class is keyed by: the unit, the application id,
+                                  the login session, the scope or the project. Empty (length 0)
+                                  when the rule has no key, or when the key is not part of the
+                                  path (an agent's key is a process: see agent_pid) */
+  uint32_t class_key_length;
+  uint32_t unit_offset;        /* the systemd unit that owns the path; valid with HAS_UNIT */
+  uint32_t unit_length;
+  uint32_t user_unit_offset;   /* the unit inside the user manager or login session; HAS_USER_UNIT */
+  uint32_t user_unit_length;
+  uint32_t login_session_offset;  /* the logind session id of session-ID.scope; HAS_SESSION */
+  uint32_t login_session_length;
+  uint32_t agent_pid;          /* with agent_start_ticks, the identity of the outermost agent
+                                  program above this process; valid with HAS_AGENT */
+  uint32_t reserved3b;
+  uint64_t agent_start_ticks;
 } gsm_process;
 
 /* ---- system memory ---------------------------------------------------- */
@@ -308,6 +381,9 @@ typedef struct gsm_pressure
 #define GSM_CGROUP_HAS_CPU_PRESSURE_FULL       (1ULL << 32)
 #define GSM_CGROUP_HAS_IO_PRESSURE_SOME        (1ULL << 33)
 #define GSM_CGROUP_HAS_IO_PRESSURE_FULL        (1ULL << 34)
+/* Layout 3: workload_class, class_rule, class_confidence and the key. Set
+ * whenever the classifier ran (always, for a layout-3 consumer). */
+#define GSM_CGROUP_HAS_CLASS                   (1ULL << 35)
 
 /* Records come parents before children, siblings by name. */
 typedef struct gsm_cgroup
@@ -349,6 +425,17 @@ typedef struct gsm_cgroup
   gsm_pressure_line cpu_pressure_full;
   gsm_pressure_line io_pressure_some;
   gsm_pressure_line io_pressure_full;
+  /* ---- layout 3 starts here: a layout 1 or 2 consumer's records end before it ---- */
+  uint8_t workload_class;      /* GSM_CLASS_*, or GSM_CLASS_MIXED for a node that holds several
+                                  classes (the root, user.slice, a user's slices and manager,
+                                  app.slice); valid with HAS_CLASS */
+  uint8_t class_rule;
+  uint8_t class_confidence;
+  uint8_t reserved3a;
+  uint32_t class_key_offset;   /* a slice of this cgroup's path in the string table; empty
+                                  (length 0) when the rule has no key */
+  uint32_t class_key_length;
+  uint32_t reserved3b;         /* explicit padding to 8 bytes */
 } gsm_cgroup;
 
 /* ---- the snapshot ----------------------------------------------------- */
@@ -391,6 +478,70 @@ const gsm_pressure *     gsm_snapshot_pressure (const gsm_snapshot *snapshot,
 const char *             gsm_snapshot_strings (const gsm_snapshot *snapshot,
                                                size_t             *length);
 const gsm_sample_stats * gsm_snapshot_stats (const gsm_snapshot *snapshot);
+
+/* ---- names ------------------------------------------------------------ */
+
+/* Static English strings, never NULL, valid for the life of the program. An
+ * out-of-range value gives "unknown". gsm_class_name also names
+ * GSM_CLASS_MIXED ("Mixed"). The rule names are those of the classification
+ * policy, in rule order. */
+const char * gsm_class_name (uint32_t workload_class);
+const char * gsm_confidence_name (uint32_t confidence);
+uint32_t     gsm_class_rule_count (void);
+const char * gsm_class_rule_name (uint32_t rule);
+
+/* Decodes the `\xNN` escapes systemd writes into cgroup directory names
+ * (`gnome\x2dtweaks` is `gnome-tweaks`) from the `length` bytes at `name`
+ * into `buffer`, and NUL-terminates it. Returns the decoded length, or -1
+ * when `buffer_size` cannot hold the result and its NUL. Anything that is
+ * not a well-formed escape is copied as it is. */
+static inline long
+gsm_unescape_name (const char *name,
+                   size_t      length,
+                   char       *buffer,
+                   size_t      buffer_size)
+{
+  size_t out = 0;
+  size_t i = 0;
+
+  if (buffer_size == 0)
+    return -1;
+  while (i < length)
+    {
+      char byte = name[i];
+      int advance = 1;
+
+      if (out + 1 >= buffer_size)
+        return -1;
+      if (name[i] == '\\' && i + 3 < length && name[i + 1] == 'x')
+        {
+          int high = -1, low = -1;
+          char h = name[i + 2], l = name[i + 3];
+
+          if (h >= '0' && h <= '9')
+            high = h - '0';
+          else if (h >= 'a' && h <= 'f')
+            high = h - 'a' + 10;
+          else if (h >= 'A' && h <= 'F')
+            high = h - 'A' + 10;
+          if (l >= '0' && l <= '9')
+            low = l - '0';
+          else if (l >= 'a' && l <= 'f')
+            low = l - 'a' + 10;
+          else if (l >= 'A' && l <= 'F')
+            low = l - 'A' + 10;
+          if (high >= 0 && low >= 0)
+            {
+              byte = (char) (high * 16 + low);
+              advance = 4;
+            }
+        }
+      buffer[out++] = byte;
+      i += (size_t) advance;
+    }
+  buffer[out] = '\0';
+  return (long) out;
+}
 
 /* ---- rates and shares ------------------------------------------------- */
 

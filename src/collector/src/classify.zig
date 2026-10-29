@@ -74,6 +74,13 @@ pub fn classLabel(class: Class) []const u8 {
 /// rule's: nothing matched.
 pub const Confidence = enum(u8) { none, low, medium, high };
 
+/// Names, indexed by `Confidence`.
+pub const confidence_names = [_][]const u8{ "none", "low", "medium", "high" };
+
+comptime {
+    std.debug.assert(confidence_names.len == @typeInfo(Confidence).@"enum".fields.len);
+}
+
 /// What `Classification.key` holds.
 pub const KeyKind = enum(u8) {
     none,

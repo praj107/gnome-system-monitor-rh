@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! The C interface of the collector (include/gsmcollect.h, layout 2): a
+//! The C interface of the collector (include/gsmcollect.h, layout 3): a
 //! collector handle that reuses its buffers, and immutable snapshots made of
 //! plain structs. The types and the `known` bits come from the header itself
 //! (translated at build time), so the Zig side and the C side cannot drift.
@@ -25,6 +25,8 @@ const cgroup_tree = @import("cgroup_tree.zig");
 const meminfo = @import("meminfo.zig");
 const pressure_file = @import("pressure.zig");
 const readfile = @import("readfile.zig");
+const classify = @import("classify.zig");
+const unit_path = @import("unit_path.zig");
 
 const gpa = std.heap.smp_allocator;
 
@@ -95,33 +97,63 @@ const max_root_bytes = 4095;
 // A meminfo is about 1.5 KiB; a read that fills the buffer is refused.
 const scratch_bytes = 8192;
 
+/// The `known` bits layout 3 added to a process record.
+const process_layout3_bits: u64 = c.GSM_PROCESS_HAS_CLASS | c.GSM_PROCESS_HAS_UNIT | c.GSM_PROCESS_HAS_USER_UNIT |
+    c.GSM_PROCESS_HAS_SESSION | c.GSM_PROCESS_HAS_OWNER_UID | c.GSM_PROCESS_HAS_AGENT;
+
 /// The sizes of the records that differ between layouts, and the `known`
 /// bits a layout has. A layout only appends, so the size of layout N is the
 /// offset of the first field layout N+1 appended (read from the header, so it
-/// cannot drift); memory, pressure and cgroup records are the same in every
-/// layout and use `@sizeOf`.
+/// cannot drift); memory and pressure records are the same in every layout and
+/// use `@sizeOf`.
 const Layout = struct {
     /// Where the last field of the layout ends, and the record size: that end
     /// rounded up to the record's alignment (layout 1 ends at 212 and is 216
     /// bytes, the last 4 being padding).
     process_fields_bytes: u32,
     process_bytes: u32,
+    /// A cgroup record's layout-1 and layout-2 size is where layout 3's first
+    /// field starts: the previous record ended on an 8-byte boundary.
+    cgroup_bytes: u32,
     stats_bytes: u32,
     process_known_mask: u64,
+    cgroup_known_mask: u64,
 };
 
-fn makeLayout(comptime process_fields_bytes: u32, comptime stats_bytes: u32, comptime known_mask: u64) Layout {
+fn makeLayout(
+    comptime process_fields_bytes: u32,
+    comptime cgroup_bytes: u32,
+    comptime stats_bytes: u32,
+    comptime process_mask: u64,
+    comptime cgroup_mask: u64,
+) Layout {
+    std.debug.assert(cgroup_bytes % @alignOf(c.gsm_cgroup) == 0);
     return .{
         .process_fields_bytes = process_fields_bytes,
         .process_bytes = std.mem.alignForward(u32, process_fields_bytes, @alignOf(c.gsm_process)),
+        .cgroup_bytes = cgroup_bytes,
         .stats_bytes = stats_bytes,
-        .process_known_mask = known_mask,
+        .process_known_mask = process_mask,
+        .cgroup_known_mask = cgroup_mask,
     };
 }
 
 const layouts = [api_version]Layout{
-    makeLayout(@offsetOf(c.gsm_process, "priority"), @offsetOf(c.gsm_sample_stats, "process_io_unreadable"), ~@as(u64, c.GSM_PROCESS_HAS_IO)),
-    makeLayout(@sizeOf(c.gsm_process), @sizeOf(c.gsm_sample_stats), ~@as(u64, 0)),
+    makeLayout(
+        @offsetOf(c.gsm_process, "priority"),
+        @offsetOf(c.gsm_cgroup, "workload_class"),
+        @offsetOf(c.gsm_sample_stats, "process_io_unreadable"),
+        ~(@as(u64, c.GSM_PROCESS_HAS_IO) | process_layout3_bits),
+        ~@as(u64, c.GSM_CGROUP_HAS_CLASS),
+    ),
+    makeLayout(
+        @offsetOf(c.gsm_process, "workload_class"),
+        @offsetOf(c.gsm_cgroup, "workload_class"),
+        @sizeOf(c.gsm_sample_stats),
+        ~process_layout3_bits,
+        ~@as(u64, c.GSM_CGROUP_HAS_CLASS),
+    ),
+    makeLayout(@sizeOf(c.gsm_process), @sizeOf(c.gsm_cgroup), @sizeOf(c.gsm_sample_stats), ~@as(u64, 0), ~@as(u64, 0)),
 };
 
 fn layoutOf(requested_version: u32) Layout {
@@ -269,7 +301,9 @@ const Snapshot = struct {
     /// of `process_stride` bytes each.
     processes: []align(@alignOf(c.gsm_process)) u8 = &.{},
     processes_count: usize = 0,
-    cgroups: []c.gsm_cgroup = &.{},
+    /// Cgroup records at the consumer's layout, like `processes`.
+    cgroups: []align(@alignOf(c.gsm_cgroup)) u8 = &.{},
+    cgroups_count: usize = 0,
     memory: [1]c.gsm_memory = undefined,
     memory_count: usize = 0,
     pressure: [c.GSM_PRESSURE_RESOURCE_COUNT]c.gsm_pressure = undefined,
@@ -306,6 +340,8 @@ const Collector = struct {
     tree: cgroup_tree.Tree,
     /// Reused string interning: path -> offset in the sample's string table.
     interned: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Reused by every sample: the class of each process of the walk, in order.
+    classes: std.ArrayList(classify.Classification) = .empty,
 
     fn io(self: *Collector) Io {
         return self.threaded.io();
@@ -315,6 +351,7 @@ const Collector = struct {
         self.processes.deinit();
         self.tree.deinit();
         self.interned.deinit(gpa);
+        self.classes.deinit(gpa);
         gpa.free(self.procfs_root);
         gpa.free(self.cgroupfs_root);
         gpa.free(self.scratch);
@@ -585,11 +622,17 @@ fn readCgroups(collector: *Collector, io: Io, snapshot: *Snapshot, table: *std.A
     for (counts.malformed) |n| snapshot.stats.cgroup_files_malformed +|= n;
 
     const groups = collector.tree.groups.items;
-    const records = try gpa.alloc(c.gsm_cgroup, groups.len);
-    snapshot.cgroups = records;
-    for (groups, records) |group, *record| {
-        record.* = zeroed(c.gsm_cgroup);
-        record.struct_size = @sizeOf(c.gsm_cgroup);
+    const layout = layoutOf(collector.layout);
+    const stride: usize = layout.cgroup_bytes;
+    const bytes = try gpa.alignedAlloc(u8, .of(c.gsm_cgroup), groups.len * stride);
+    snapshot.cgroups = bytes;
+    snapshot.cgroups_count = groups.len;
+    for (groups, 0..) |group, index| {
+        // As for processes: the full record is built, its first `stride` bytes kept.
+        var full = zeroed(c.gsm_cgroup);
+        const record = &full;
+        defer @memcpy(bytes[index * stride ..][0..stride], std.mem.asBytes(&full)[0..stride]);
+        record.struct_size = layout.cgroup_bytes;
         const path = try intern(collector, table, group.path);
         record.path_offset = path.offset;
         record.path_len = path.len;
@@ -598,8 +641,39 @@ fn readCgroups(collector: *Collector, io: Io, snapshot: *Snapshot, table: *std.A
             record.known |= c.GSM_CGROUP_HAS_PARENT;
         }
         fillCgroup(record, group);
+        if (collector.layout >= 3) fillCgroupClass(record, group.path, classify.classifyPath(group.path));
+        record.known &= layout.cgroup_known_mask;
+        @memset(std.mem.asBytes(&full)[layout.cgroup_bytes..stride], 0);
     }
     return 0;
+}
+
+/// Where `part` sits in the string table, given that `whole` was interned at
+/// `whole_offset`: an (offset, length) pair, or null when `part` is not a
+/// slice of `whole` (a key that is a process's comm, say). An empty `part` is
+/// the empty string (0, 0).
+const Located = struct { offset: u32, length: u32 };
+
+fn locate(whole: []const u8, whole_offset: u32, part: []const u8) ?Located {
+    if (part.len == 0) return .{ .offset = 0, .length = 0 };
+    const start = @intFromPtr(part.ptr);
+    const base = @intFromPtr(whole.ptr);
+    if (start < base or start - base + part.len > whole.len) return null;
+    return .{
+        .offset = whole_offset + @as(u32, @intCast(start - base)),
+        .length = @intCast(part.len),
+    };
+}
+
+fn fillCgroupClass(record: *c.gsm_cgroup, path: []const u8, class: classify.Classification) void {
+    record.workload_class = if (class.mixed) c.GSM_CLASS_MIXED else @intFromEnum(class.class);
+    record.class_rule = class.rule;
+    record.class_confidence = @intFromEnum(class.confidence);
+    record.known |= c.GSM_CGROUP_HAS_CLASS;
+    if (locate(path, record.path_offset, class.key)) |key| {
+        record.class_key_offset = key.offset;
+        record.class_key_length = key.length;
+    }
 }
 
 fn fillLimit(record: *c.gsm_cgroup, limit: ?@import("cgroup_files.zig").Limit, comptime field: []const u8, finite_bit: u64, unlimited_bit: u64) void {
@@ -666,6 +740,15 @@ fn readProcesses(collector: *Collector, io: Io, snapshot: *Snapshot, table: *std
     for (counts.malformed) |n| snapshot.stats.process_files_malformed +|= n;
 
     const listed = collector.processes.processes.items;
+    // Classification is pure over what the walk read: no syscall. Only a
+    // layout-3 consumer has the fields, so older consumers do not pay for it.
+    if (collector.layout >= 3) {
+        try collector.classes.resize(gpa, listed.len);
+        classify.classifyProcesses(gpa, listed, collector.classes.items) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LengthMismatch => return errnoValue(.IO),
+        };
+    }
     const stride: usize = layout.process_bytes;
     const bytes = try gpa.alignedAlloc(u8, .of(c.gsm_process), listed.len * stride);
     snapshot.processes = bytes;
@@ -693,7 +776,10 @@ fn readProcesses(collector: *Collector, io: Io, snapshot: *Snapshot, table: *std
         record.comm_len = process.comm_len;
         // comm_bytes is zero-filled past comm_len, so the buffer is a C string.
         @memcpy(std.mem.asBytes(&record.comm)[0..process.comm_len], process.comm());
-        if (process.status) |status| fill(record, status, &status_rows);
+        if (process.status) |status| {
+            fill(record, status, &status_rows);
+            if (lacksAddressSpace(&process)) record.known |= address_space_bits;
+        }
         if (process.schedstat) |schedstat| copyKnown(record, schedstat, &schedstat_rows);
         if (process.io) |counters| copyKnown(record, counters, &io_rows);
         if (process.cgroup_path) |path| {
@@ -702,11 +788,135 @@ fn readProcesses(collector: *Collector, io: Io, snapshot: *Snapshot, table: *std
             record.cgroup_len = interned.len;
             record.known |= c.GSM_PROCESS_HAS_CGROUP;
         }
+        if (collector.layout >= 3) fillProcessClass(record, &process, collector.classes.items[index]);
         record.known &= layout.process_known_mask;
         // Bytes past the layout's last field are padding: hand them over zero.
         @memset(std.mem.asBytes(&full)[layout.process_fields_bytes..stride], 0);
     }
     return 0;
+}
+
+/// The five memory figures of a status file; absent for a task with no mm.
+const address_space_bits: u64 = c.GSM_PROCESS_HAS_RSS_ANON | c.GSM_PROCESS_HAS_RSS_FILE | c.GSM_PROCESS_HAS_RSS_SHMEM |
+    c.GSM_PROCESS_HAS_VM_SWAP | c.GSM_PROCESS_HAS_VM_SIZE;
+
+/// A kernel thread, or a task that has exited and is waiting to be reaped
+/// (state Z) or is dead (X), has no user address space: the kernel prints no
+/// Vm* or Rss* line for it (proc_pid_status(5)), so its resident memory is
+/// really zero. Whether the file simply lacked the lines for another reason
+/// is decided by the caller, which asks only after a successful parse.
+fn lacksAddressSpace(process: *const walk.Process) bool {
+    return process.isKernelThread() or process.state == 'Z' or process.state == 'X';
+}
+
+fn fillProcessClass(record: *c.gsm_process, process: *const walk.Process, class: classify.Classification) void {
+    record.workload_class = @intFromEnum(class.class);
+    record.class_rule = class.rule;
+    record.class_confidence = @intFromEnum(class.confidence);
+    record.known |= c.GSM_PROCESS_HAS_CLASS;
+    if (class.key_kind == .agent_process) {
+        record.agent_pid = class.agent_pid;
+        record.agent_start_ticks = class.agent_start_ticks;
+        record.known |= c.GSM_PROCESS_HAS_AGENT;
+    }
+    // Everything else is a slice of the cgroup path already in the table.
+    const path = process.cgroup_path orelse return;
+    const path_offset = record.cgroup_offset;
+    if (locate(path, path_offset, class.key)) |key| {
+        record.class_key_offset = key.offset;
+        record.class_key_length = key.length;
+    }
+    if (unit_path.unit(path)) |name| if (locate(path, path_offset, name)) |at| {
+        record.unit_offset = at.offset;
+        record.unit_length = at.length;
+        record.known |= c.GSM_PROCESS_HAS_UNIT;
+    };
+    if (unit_path.userUnit(path)) |name| if (locate(path, path_offset, name)) |at| {
+        record.user_unit_offset = at.offset;
+        record.user_unit_length = at.length;
+        record.known |= c.GSM_PROCESS_HAS_USER_UNIT;
+    };
+    if (unit_path.session(path)) |name| if (locate(path, path_offset, name)) |at| {
+        record.login_session_offset = at.offset;
+        record.login_session_length = at.length;
+        record.known |= c.GSM_PROCESS_HAS_SESSION;
+    };
+    if (unit_path.ownerUid(path)) |uid| {
+        record.owner_uid = uid;
+        record.known |= c.GSM_PROCESS_HAS_OWNER_UID;
+    }
+}
+
+// ---- names, built from the classifier's tables ----
+
+/// NUL-terminated copies of `texts`, made at compile time, for the C side.
+fn terminated(comptime texts: []const []const u8) [texts.len][*:0]const u8 {
+    comptime {
+        var out: [texts.len][*:0]const u8 = undefined;
+        for (texts, 0..) |text, index| out[index] = (text ++ "\x00")[0..text.len :0];
+        return out;
+    }
+}
+
+fn ruleTexts() [classify.rules.len][]const u8 {
+    comptime {
+        var out: [classify.rules.len][]const u8 = undefined;
+        for (classify.rules, 0..) |rule, index| out[index] = rule.name;
+        return out;
+    }
+}
+
+const class_name_table = terminated(&classify.class_labels);
+const confidence_name_table = terminated(&classify.confidence_names);
+const rule_name_table = terminated(&ruleTexts());
+
+// The header's constants and the classifier's tables must agree, or the
+// build stops: a class added on one side only cannot ship.
+comptime {
+    const Class = classify.Class;
+    const class_pairs = .{
+        .{ c.GSM_CLASS_KERNEL, Class.kernel },
+        .{ c.GSM_CLASS_INIT, Class.init },
+        .{ c.GSM_CLASS_SYSTEM_SERVICES, Class.system_services },
+        .{ c.GSM_CLASS_SESSION_SERVICES, Class.session_services },
+        .{ c.GSM_CLASS_APPLICATIONS, Class.applications },
+        .{ c.GSM_CLASS_LOGIN_SESSION, Class.login_session },
+        .{ c.GSM_CLASS_AGENT_SESSIONS, Class.agent_sessions },
+        .{ c.GSM_CLASS_CONTAINERS_AND_VMS, Class.containers_and_vms },
+        .{ c.GSM_CLASS_UNCLASSIFIED, Class.unclassified },
+    };
+    for (class_pairs) |pair| {
+        if (pair[0] != @intFromEnum(pair[1])) @compileError("a GSM_CLASS_* value differs from classify.Class");
+    }
+    if (c.GSM_CLASS_COUNT != class_pairs.len or c.GSM_CLASS_COUNT != @typeInfo(Class).@"enum".fields.len)
+        @compileError("GSM_CLASS_COUNT differs from classify.Class");
+    if (c.GSM_CLASS_MIXED != std.math.maxInt(u8)) @compileError("GSM_CLASS_MIXED must be 255");
+    const Confidence = classify.Confidence;
+    if (c.GSM_CONFIDENCE_NONE != @intFromEnum(Confidence.none) or c.GSM_CONFIDENCE_LOW != @intFromEnum(Confidence.low) or
+        c.GSM_CONFIDENCE_MEDIUM != @intFromEnum(Confidence.medium) or c.GSM_CONFIDENCE_HIGH != @intFromEnum(Confidence.high) or
+        c.GSM_CONFIDENCE_COUNT != @typeInfo(Confidence).@"enum".fields.len)
+        @compileError("a GSM_CONFIDENCE_* value differs from classify.Confidence");
+    if (c.GSM_CLASS_RULE_COUNT != classify.rules.len) @compileError("GSM_CLASS_RULE_COUNT differs from classify.rules");
+}
+
+export fn gsm_class_name(workload_class: u32) [*:0]const u8 {
+    if (workload_class == c.GSM_CLASS_MIXED) return "Mixed";
+    if (workload_class >= class_name_table.len) return "unknown";
+    return class_name_table[workload_class];
+}
+
+export fn gsm_confidence_name(confidence: u32) [*:0]const u8 {
+    if (confidence >= confidence_name_table.len) return "unknown";
+    return confidence_name_table[confidence];
+}
+
+export fn gsm_class_rule_count() u32 {
+    return rule_name_table.len;
+}
+
+export fn gsm_class_rule_name(rule: u32) [*:0]const u8 {
+    if (rule >= rule_name_table.len) return "unknown";
+    return rule_name_table[rule];
 }
 
 // ---- accessors ----
@@ -719,8 +929,8 @@ export fn gsm_snapshot_processes(handle: *const c.gsm_snapshot, count: *usize) ?
 
 export fn gsm_snapshot_cgroups(handle: *const c.gsm_snapshot, count: *usize) ?[*]const c.gsm_cgroup {
     const snapshot = snapshotOf(handle);
-    count.* = snapshot.cgroups.len;
-    return if (snapshot.cgroups.len == 0) null else snapshot.cgroups.ptr;
+    count.* = snapshot.cgroups_count;
+    return if (snapshot.cgroups_count == 0) null else @ptrCast(snapshot.cgroups.ptr);
 }
 
 export fn gsm_snapshot_memory(handle: *const c.gsm_snapshot, count: *usize) ?[*]const c.gsm_memory {
@@ -800,18 +1010,27 @@ test "a snapshot over the fixtures lists every process, with a known process fie
     );
 }
 
-test "a kernel thread's resident memory is unknown, not zero" {
+test "a kernel thread has no address space: its resident memory is a known zero" {
     const collector = fixtureCollector(c.GSM_READ_PROCESSES).?;
     defer gsm_collect_free(collector);
     var snapshot: ?*c.gsm_snapshot = null;
     try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
     defer gsm_snapshot_free(snapshot);
 
-    const kthreadd = try processFor(snapshot.?, 2);
-    try testing.expect(kthreadd.flags & c.GSM_PF_KTHREAD != 0);
-    try testing.expectEqual(@as(u64, 0), kthreadd.known & c.GSM_PROCESS_HAS_RSS_ANON);
-    try testing.expectEqual(@as(u64, 0), kthreadd.rss_anon_bytes);
-    try testing.expect(kthreadd.known & c.GSM_PROCESS_HAS_CGROUP != 0);
+    // Its status file has no Vm* or Rss* lines because there is no mm to
+    // print, so the figures are really zero (proc_pid_status(5)).
+    const memory_bits = c.GSM_PROCESS_HAS_RSS_ANON | c.GSM_PROCESS_HAS_RSS_FILE | c.GSM_PROCESS_HAS_RSS_SHMEM |
+        c.GSM_PROCESS_HAS_VM_SWAP | c.GSM_PROCESS_HAS_VM_SIZE;
+    for ([_]u32{ 2, 103116 }) |pid| {
+        const record = try processFor(snapshot.?, pid);
+        try testing.expect(record.flags & c.GSM_PF_KTHREAD != 0);
+        try testing.expectEqual(@as(u64, memory_bits), record.known & memory_bits);
+        try testing.expectEqual(@as(u64, 0), record.rss_anon_bytes + record.rss_file_bytes + record.rss_shmem_bytes + record.vm_swap_bytes + record.vm_size_bytes);
+        try testing.expect(record.known & c.GSM_PROCESS_HAS_CGROUP != 0);
+    }
+    // An ordinary process keeps what its status says.
+    const sleeper = try processFor(snapshot.?, 344260);
+    try testing.expectEqual(@as(u64, 112 * 1024), sleeper.rss_anon_bytes);
 }
 
 test "memory, pressure and the cgroup tree come through with their unknowns clear" {
@@ -976,14 +1195,34 @@ fn recordAt(snapshot: *c.gsm_snapshot, stride: usize, index: usize) c.gsm_proces
     return record;
 }
 
-test "the layouts' sizes are the header's: 216 and 64 bytes for layout 1, no hidden padding in layout 2" {
+/// The record of process `pid` in a snapshot read at `stride` bytes a record.
+fn recordWithPid(snapshot: *c.gsm_snapshot, stride: usize, pid: u32) c.gsm_process {
+    var count: usize = 0;
+    _ = gsm_snapshot_processes(snapshot, &count);
+    for (0..count) |index| {
+        const record = recordAt(snapshot, stride, index);
+        if (record.pid == pid) return record;
+    }
+    std.debug.panic("no process {d} in the snapshot", .{pid});
+}
+
+test "the layouts' sizes are the header's: 216 and 64 bytes for layout 1, 280 for layout 2, no hidden padding in layout 3" {
     try testing.expectEqual(@as(u32, 216), layoutOf(1).process_bytes);
     try testing.expectEqual(@as(u32, 64), layoutOf(1).stats_bytes);
     try testing.expectEqual(@as(u32, 280), layoutOf(2).process_bytes);
     try testing.expectEqual(@as(u32, 72), layoutOf(2).stats_bytes);
-    try testing.expectEqual(@sizeOf(c.gsm_process), @offsetOf(c.gsm_process, "io_cancelled_write_bytes") + 8);
+    try testing.expectEqual(@as(u32, 336), layoutOf(3).process_bytes);
+    try testing.expectEqual(@as(u32, 72), layoutOf(3).stats_bytes);
+    try testing.expectEqual(@as(usize, 336), @sizeOf(c.gsm_process));
+    try testing.expectEqual(@sizeOf(c.gsm_process), @offsetOf(c.gsm_process, "agent_start_ticks") + 8);
+    try testing.expectEqual(@as(usize, 280), @offsetOf(c.gsm_process, "workload_class"));
     try testing.expectEqual(@sizeOf(c.gsm_sample_stats), @offsetOf(c.gsm_sample_stats, "reserved3") + 4);
-    try testing.expectEqual(@as(u32, 2), gsm_collect_api_version());
+    // cgroups: layouts 1 and 2 end where layout 3 starts, layout 3 adds 16 bytes
+    try testing.expectEqual(@as(u32, @offsetOf(c.gsm_cgroup, "workload_class")), layoutOf(1).cgroup_bytes);
+    try testing.expectEqual(layoutOf(1).cgroup_bytes, layoutOf(2).cgroup_bytes);
+    try testing.expectEqual(layoutOf(1).cgroup_bytes + 16, layoutOf(3).cgroup_bytes);
+    try testing.expectEqual(@sizeOf(c.gsm_cgroup), @offsetOf(c.gsm_cgroup, "reserved3b") + 4);
+    try testing.expectEqual(@as(u32, 3), gsm_collect_api_version());
 }
 
 test "a layout-1 consumer sees the same processes at layout 1's size and stride" {
@@ -1034,7 +1273,11 @@ test "layout 2 carries nice, priority and io: known for the processes that have 
     try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
     defer gsm_snapshot_free(snapshot);
 
-    const shell = try processFor(snapshot.?, 344261);
+    var count: usize = 0;
+    _ = gsm_snapshot_processes(snapshot.?, &count);
+    try testing.expectEqual(@as(usize, 5), count);
+    const shell_record = recordWithPid(snapshot.?, 280, 344261);
+    const shell = &shell_record;
     try testing.expectEqual(@as(i32, 20), shell.priority);
     try testing.expectEqual(@as(i32, 0), shell.nice);
     try testing.expect(shell.known & c.GSM_PROCESS_HAS_IO != 0);
@@ -1048,7 +1291,7 @@ test "layout 2 carries nice, priority and io: known for the processes that have 
 
     // pid 1, pid 2 and the kworker have no io file in the capture
     for ([_]u32{ 1, 2, 103116 }) |pid| {
-        const record = try processFor(snapshot.?, pid);
+        const record = recordWithPid(snapshot.?, 280, pid);
         try testing.expectEqual(@as(u64, 0), record.known & c.GSM_PROCESS_HAS_IO);
         try testing.expectEqual(@as(u64, 0), record.io_write_bytes);
         try testing.expectEqual(@as(i32, 20), record.priority); // stat is always there
@@ -1065,7 +1308,273 @@ test "an api_version of 0 asks for the newest layout" {
     var snapshot: ?*c.gsm_snapshot = null;
     try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
     defer gsm_snapshot_free(snapshot);
-    try testing.expectEqual(@as(u32, 280), (try processFor(snapshot.?, 1)).struct_size);
+    try testing.expectEqual(@as(u32, 336), (try processFor(snapshot.?, 1)).struct_size);
+}
+
+const fixture_agent_proc = "tests/c/fixture-agent/proc";
+
+fn classCollector(proc_root: []const u8, layout: u32, readers: u32) ?*c.gsm_collector {
+    var config = zeroed(c.gsm_collect_config);
+    config.struct_size = @sizeOf(c.gsm_collect_config);
+    config.api_version = layout;
+    config.readers = readers;
+    config.procfs_root = proc_root.ptr;
+    config.cgroupfs_root = fixture_cgroup;
+    return gsm_collect_new(&config);
+}
+
+fn cgroupAt(snapshot: *c.gsm_snapshot, stride: usize, index: usize) c.gsm_cgroup {
+    var count: usize = 0;
+    const base: [*]const u8 = @ptrCast(gsm_snapshot_cgroups(snapshot, &count).?);
+    std.debug.assert(index < count);
+    var record = zeroed(c.gsm_cgroup);
+    @memcpy(std.mem.asBytes(&record)[0..stride], base[index * stride ..][0..stride]);
+    return record;
+}
+
+fn cgroupNamed(snapshot: *c.gsm_snapshot, path: []const u8) !c.gsm_cgroup {
+    var count: usize = 0;
+    _ = gsm_snapshot_cgroups(snapshot, &count);
+    for (0..count) |index| {
+        const record = cgroupAt(snapshot, @sizeOf(c.gsm_cgroup), index);
+        if (std.mem.eql(u8, pathOf(snapshot, record.path_offset, record.path_len), path)) return record;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn expectClass(snapshot: *c.gsm_snapshot, record: *const c.gsm_process, class: u8, rule: u8, confidence: u8, key: []const u8) !void {
+    try testing.expect(record.known & c.GSM_PROCESS_HAS_CLASS != 0);
+    try testing.expectEqual(class, record.workload_class);
+    try testing.expectEqualStrings(classify.rules[rule].name, classify.rules[record.class_rule].name);
+    try testing.expectEqual(confidence, record.class_confidence);
+    try testing.expectEqualStrings(key, pathOf(snapshot, record.class_key_offset, record.class_key_length));
+}
+
+test "layout 3 gives every fixture process a class, with the unit its cgroup path names" {
+    const collector = fixtureCollector(0).?;
+    defer gsm_collect_free(collector);
+    var snapshot: ?*c.gsm_snapshot = null;
+    try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
+    defer gsm_snapshot_free(snapshot);
+
+    var count: usize = 0;
+    const records = gsm_snapshot_processes(snapshot.?, &count).?[0..count];
+    for (records) |*record| {
+        try testing.expect(record.known & c.GSM_PROCESS_HAS_CLASS != 0);
+        try testing.expect(record.workload_class < c.GSM_CLASS_COUNT);
+        try testing.expect(record.class_rule < c.GSM_CLASS_RULE_COUNT);
+        try testing.expect(record.workload_class != c.GSM_CLASS_MIXED);
+    }
+
+    const sleeper = try processFor(snapshot.?, 344260);
+    try expectClass(snapshot.?, sleeper, c.GSM_CLASS_APPLICATIONS, classify.rule_application, c.GSM_CONFIDENCE_HIGH, "com.visualstudio.CodeOSS");
+    const scope = "app-com.visualstudio.CodeOSS-4247.scope";
+    try testing.expect(sleeper.known & (c.GSM_PROCESS_HAS_UNIT | c.GSM_PROCESS_HAS_USER_UNIT | c.GSM_PROCESS_HAS_OWNER_UID) == (c.GSM_PROCESS_HAS_UNIT | c.GSM_PROCESS_HAS_USER_UNIT | c.GSM_PROCESS_HAS_OWNER_UID));
+    // the unit is the user manager's, the user unit the scope inside it
+    try testing.expectEqualStrings("user@1000.service", pathOf(snapshot.?, sleeper.unit_offset, sleeper.unit_length));
+    try testing.expectEqualStrings(scope, pathOf(snapshot.?, sleeper.user_unit_offset, sleeper.user_unit_length));
+    try testing.expectEqual(@as(u32, 1000), sleeper.owner_uid);
+    try testing.expectEqual(@as(u64, 0), sleeper.known & (c.GSM_PROCESS_HAS_SESSION | c.GSM_PROCESS_HAS_AGENT));
+    try testing.expectEqual(@as(u32, 0), sleeper.login_session_length);
+
+    const init_process = try processFor(snapshot.?, 1);
+    try expectClass(snapshot.?, init_process, c.GSM_CLASS_INIT, classify.rule_init, c.GSM_CONFIDENCE_HIGH, "");
+    // a kernel thread sitting in the root group, and one the capture put in init.scope
+    for ([_]u32{ 2, 103116 }) |pid| {
+        const record = try processFor(snapshot.?, pid);
+        try expectClass(snapshot.?, record, c.GSM_CLASS_KERNEL, classify.rule_kernel_thread, c.GSM_CONFIDENCE_HIGH, "");
+    }
+    // no cgroup path names no unit
+    try testing.expectEqual(@as(u64, 0), (try processFor(snapshot.?, 2)).known & c.GSM_PROCESS_HAS_UNIT);
+}
+
+test "layout 3 gives every cgroup a class, and a node that holds several classes is mixed" {
+    const collector = fixtureCollector(c.GSM_READ_CGROUPS).?;
+    defer gsm_collect_free(collector);
+    var snapshot: ?*c.gsm_snapshot = null;
+    try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
+    defer gsm_snapshot_free(snapshot);
+
+    var count: usize = 0;
+    const groups = gsm_snapshot_cgroups(snapshot.?, &count).?[0..count];
+    try testing.expectEqual(@as(usize, 11), count);
+    for (groups) |group| try testing.expect(group.known & c.GSM_CGROUP_HAS_CLASS != 0);
+
+    const user_manager_path = "/user.slice/user-1000.slice/user@1000.service";
+    for ([_][]const u8{ "/", "/user.slice", "/user.slice/user-1000.slice", user_manager_path }) |path| {
+        const group = try cgroupNamed(snapshot.?, path);
+        try testing.expectEqual(@as(u8, c.GSM_CLASS_MIXED), group.workload_class);
+        try testing.expectEqual(@as(u8, classify.rule_mixed), group.class_rule);
+        try testing.expectEqual(@as(u8, c.GSM_CONFIDENCE_NONE), group.class_confidence);
+        try testing.expectEqual(@as(u32, 0), group.class_key_length);
+    }
+
+    const udev = try cgroupNamed(snapshot.?, "/system.slice/systemd-udevd.service/udev");
+    try testing.expectEqual(@as(u8, c.GSM_CLASS_SYSTEM_SERVICES), udev.workload_class);
+    try testing.expectEqual(@as(u8, classify.rule_system_service), udev.class_rule);
+    try testing.expectEqualStrings("systemd-udevd.service", pathOf(snapshot.?, udev.class_key_offset, udev.class_key_length));
+
+    const job = try cgroupNamed(snapshot.?, user_manager_path ++ "/agents.slice/agents-alpha.slice/job-alpha-386902.scope");
+    try testing.expectEqual(@as(u8, c.GSM_CLASS_AGENT_SESSIONS), job.workload_class);
+    try testing.expectEqual(@as(u8, classify.rule_agent_job_scope), job.class_rule);
+    try testing.expectEqualStrings("job-alpha-386902.scope", pathOf(snapshot.?, job.class_key_offset, job.class_key_length));
+
+    const beta = try cgroupNamed(snapshot.?, user_manager_path ++ "/agents.slice/agents-beta.slice");
+    try testing.expectEqual(@as(u8, c.GSM_CLASS_AGENT_SESSIONS), beta.workload_class);
+    try testing.expectEqualStrings("beta", pathOf(snapshot.?, beta.class_key_offset, beta.class_key_length));
+}
+
+test "layout 1 and 2 consumers get cgroup records at their own size, without class fields" {
+    var records: [3]?*c.gsm_snapshot = undefined;
+    const sizes = [3]usize{ layoutOf(1).cgroup_bytes, layoutOf(2).cgroup_bytes, layoutOf(3).cgroup_bytes };
+    for (&records, 1..) |*slot, layout| {
+        const collector = layoutCollector(@intCast(layout), c.GSM_READ_CGROUPS).?;
+        defer gsm_collect_free(collector);
+        slot.* = null;
+        try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, slot));
+    }
+    defer for (records) |snapshot| gsm_snapshot_free(snapshot);
+
+    var count: usize = 0;
+    _ = gsm_snapshot_cgroups(records[2].?, &count);
+    try testing.expectEqual(@as(usize, 11), count);
+    for (0..count) |index| {
+        const newest = cgroupAt(records[2].?, sizes[2], index);
+        try testing.expectEqual(@as(u32, @intCast(sizes[2])), newest.struct_size);
+        try testing.expect(newest.known & c.GSM_CGROUP_HAS_CLASS != 0);
+        for (records[0..2], sizes[0..2]) |snapshot, size| {
+            const older = cgroupAt(snapshot.?, size, index);
+            try testing.expectEqual(@as(u32, @intCast(size)), older.struct_size);
+            try testing.expectEqual(newest.known & ~@as(u64, c.GSM_CGROUP_HAS_CLASS), older.known);
+            try testing.expectEqual(newest.memory_current_bytes, older.memory_current_bytes);
+            try testing.expectEqual(newest.parent, older.parent);
+            try testing.expectEqualStrings(
+                pathOf(records[2].?, newest.path_offset, newest.path_len),
+                pathOf(snapshot.?, older.path_offset, older.path_len),
+            );
+            // nothing of layout 3 leaks into the bytes past the older record
+            try testing.expectEqual(@as(u8, 0), older.workload_class);
+        }
+    }
+    _ = gsm_snapshot_cgroups(records[0].?, &count);
+    try testing.expectEqual(@as(usize, 11), count);
+}
+
+test "layout 1 and 2 process records carry no class bits, and layout 3 only adds them" {
+    var snapshots: [3]?*c.gsm_snapshot = undefined;
+    const strides = [3]usize{ layoutOf(1).process_bytes, layoutOf(2).process_bytes, layoutOf(3).process_bytes };
+    for (&snapshots, 1..) |*slot, layout| {
+        const collector = layoutCollector(@intCast(layout), c.GSM_READ_PROCESSES).?;
+        defer gsm_collect_free(collector);
+        slot.* = null;
+        try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, slot));
+    }
+    defer for (snapshots) |snapshot| gsm_snapshot_free(snapshot);
+
+    for (0..5) |index| {
+        const newest = recordAt(snapshots[2].?, strides[2], index);
+        try testing.expect(newest.known & c.GSM_PROCESS_HAS_CLASS != 0);
+        const second = recordAt(snapshots[1].?, strides[1], index);
+        try testing.expectEqual(newest.known & ~process_layout3_bits, second.known);
+        try testing.expectEqual(@as(u32, 0), second.owner_uid);
+        const first_layout = recordAt(snapshots[0].?, strides[0], index);
+        try testing.expectEqual(second.known & ~@as(u64, c.GSM_PROCESS_HAS_IO), first_layout.known);
+        // the memory rule applies in every layout
+        try testing.expectEqual(newest.rss_anon_bytes, first_layout.rss_anon_bytes);
+        try testing.expectEqual(newest.vm_size_bytes, second.vm_size_bytes);
+    }
+}
+
+test "an agent's descendants in a shared scope are agent sessions, with the agent's identity" {
+    const collector = classCollector(fixture_agent_proc, c.GSM_COLLECT_API_VERSION, c.GSM_READ_PROCESSES).?;
+    defer gsm_collect_free(collector);
+    var snapshot: ?*c.gsm_snapshot = null;
+    try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
+    defer gsm_snapshot_free(snapshot);
+
+    // 100 is the agent (comm "claude"), 101 its shell, 102 the shell's child: one scope
+    for ([_]u32{ 100, 101, 102 }) |pid| {
+        const record = try processFor(snapshot.?, pid);
+        try expectClass(snapshot.?, record, c.GSM_CLASS_AGENT_SESSIONS, classify.rule_agent_ancestry, c.GSM_CONFIDENCE_MEDIUM, "");
+        try testing.expect(record.known & c.GSM_PROCESS_HAS_AGENT != 0);
+        try testing.expectEqual(@as(u32, 100), record.agent_pid);
+        try testing.expectEqual(@as(u64, 1000), record.agent_start_ticks);
+        // the path still names the application's unit
+        try testing.expectEqualStrings("app-com.visualstudio.CodeOSS-4247.scope", pathOf(snapshot.?, record.user_unit_offset, record.user_unit_length));
+    }
+    // 103 shares the scope but is not below the agent: it stays an application
+    const editor = try processFor(snapshot.?, 103);
+    try expectClass(snapshot.?, editor, c.GSM_CLASS_APPLICATIONS, classify.rule_application, c.GSM_CONFIDENCE_HIGH, "com.visualstudio.CodeOSS");
+    try testing.expectEqual(@as(u64, 0), editor.known & c.GSM_PROCESS_HAS_AGENT);
+    try testing.expectEqual(@as(u32, 0), editor.agent_pid);
+}
+
+test "a zombie has no address space: known zero when its status parsed, unknown when there was none" {
+    const collector = classCollector(fixture_agent_proc, 1, c.GSM_READ_PROCESSES).?;
+    defer gsm_collect_free(collector);
+    var snapshot: ?*c.gsm_snapshot = null;
+    try testing.expectEqual(@as(c_int, 0), gsm_collect_sample(collector, &snapshot));
+    defer gsm_snapshot_free(snapshot);
+
+    const memory_bits = c.GSM_PROCESS_HAS_RSS_ANON | c.GSM_PROCESS_HAS_RSS_FILE | c.GSM_PROCESS_HAS_RSS_SHMEM |
+        c.GSM_PROCESS_HAS_VM_SWAP | c.GSM_PROCESS_HAS_VM_SIZE;
+    // layout 1, the oldest consumer, gets the corrected meaning too
+    const zombie = recordWithPid(snapshot.?, layoutOf(1).process_bytes, 104);
+    try testing.expectEqual(@as(u8, 'Z'), zombie.state);
+    try testing.expectEqual(@as(u64, memory_bits), zombie.known & memory_bits);
+    try testing.expectEqual(@as(u64, 0), zombie.rss_anon_bytes + zombie.vm_size_bytes);
+    // the same task whose status file could not be read: nothing is known about it
+    const unseen = recordWithPid(snapshot.?, layoutOf(1).process_bytes, 105);
+    try testing.expectEqual(@as(u64, 0), unseen.known & (memory_bits | c.GSM_PROCESS_HAS_UID));
+    // a live process whose status has the lines keeps its figures
+    const shell = recordWithPid(snapshot.?, layoutOf(1).process_bytes, 101);
+    try testing.expectEqual(@as(u64, 112 * 1024), shell.rss_anon_bytes);
+}
+
+test "the class, confidence and rule names come from the classifier's tables" {
+    try testing.expectEqualStrings("Kernel", std.mem.span(gsm_class_name(c.GSM_CLASS_KERNEL)));
+    try testing.expectEqualStrings("Agent sessions", std.mem.span(gsm_class_name(c.GSM_CLASS_AGENT_SESSIONS)));
+    try testing.expectEqualStrings("Unclassified", std.mem.span(gsm_class_name(c.GSM_CLASS_UNCLASSIFIED)));
+    try testing.expectEqualStrings("Mixed", std.mem.span(gsm_class_name(c.GSM_CLASS_MIXED)));
+    try testing.expectEqualStrings("unknown", std.mem.span(gsm_class_name(c.GSM_CLASS_COUNT)));
+    for (0..c.GSM_CLASS_COUNT) |index| {
+        try testing.expectEqualStrings(classify.class_labels[index], std.mem.span(gsm_class_name(@intCast(index))));
+    }
+    try testing.expectEqualStrings("none", std.mem.span(gsm_confidence_name(c.GSM_CONFIDENCE_NONE)));
+    try testing.expectEqualStrings("high", std.mem.span(gsm_confidence_name(c.GSM_CONFIDENCE_HIGH)));
+    try testing.expectEqualStrings("unknown", std.mem.span(gsm_confidence_name(c.GSM_CONFIDENCE_COUNT)));
+    try testing.expectEqual(@as(u32, c.GSM_CLASS_RULE_COUNT), gsm_class_rule_count());
+    for (classify.rules, 0..) |rule, index| {
+        try testing.expectEqualStrings(rule.name, std.mem.span(gsm_class_rule_name(@intCast(index))));
+    }
+    try testing.expectEqualStrings("agent ancestry", std.mem.span(gsm_class_rule_name(classify.rule_agent_ancestry)));
+    try testing.expectEqualStrings("unknown", std.mem.span(gsm_class_rule_name(gsm_class_rule_count())));
+    try testing.expectEqualStrings("unknown", std.mem.span(gsm_class_rule_name(0xFFFF_FFFF)));
+}
+
+test "the header's escape decoder agrees with the classifier's" {
+    const cases = [_][]const u8{
+        "plain.service",
+        "gnome\\x2dtweaks",
+        "a\\x2fb\\x2Fc",
+        "bad\\xZZescape\\x4",
+        "trailing\\x",
+        "\\x41\\x42",
+        "",
+    };
+    for (cases) |name| {
+        var from_c: [64]u8 = undefined;
+        var from_zig: [64]u8 = undefined;
+        const length = c.gsm_unescape_name(name.ptr, name.len, &from_c, from_c.len);
+        const decoded = unit_path.unescape(&from_zig, name).?;
+        try testing.expectEqualStrings(decoded, from_c[0..@intCast(length)]);
+        try testing.expectEqual(@as(u8, 0), from_c[@intCast(length)]);
+    }
+    // too small a buffer for the result and its NUL is refused, not truncated
+    var small: [4]u8 = undefined;
+    try testing.expectEqual(@as(c_long, -1), c.gsm_unescape_name("abcd", 4, &small, small.len));
+    try testing.expectEqual(@as(c_long, 3), c.gsm_unescape_name("abc", 3, &small, small.len));
+    try testing.expectEqual(@as(c_long, -1), c.gsm_unescape_name("a", 1, &small, 0));
 }
 
 test "no function here keeps a large array on the stack" {

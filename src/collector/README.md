@@ -188,8 +188,10 @@ classes (Kernel, Init, System services, Session services, Applications,
 Login session, Agent sessions, Containers and VMs, Unclassified) by an
 ordered rule table: an array of `Rule` records, first match wins, each with a
 name, a class, a confidence (high, medium, low) and the kind of key it
-extracts. The names are `classify.rules[i].name`. It is not yet part of the C
-interface: nothing in `gsmcollect.h` or the walk changes.
+extracts. The names are `classify.rules[i].name`. Layout 3 of the C
+interface carries the result (see "C interface"): a class, rule and
+confidence for every process and cgroup, and the systemd unit, user unit,
+login session and owner uid a process's cgroup path names.
 
 Two passes, both pure functions of what the walk already read (**zero
 syscalls**):
@@ -257,7 +259,7 @@ and VMs.
 ## C interface
 
 `include/gsmcollect.h` (C11, `<stdint.h>` and `<stddef.h>` only,
-`GSM_COLLECT_API_VERSION 2`) is the contract; the Zig side takes its types
+`GSM_COLLECT_API_VERSION 3`) is the contract; the Zig side takes its types
 and `known` bits from the header at build time, so they cannot drift.
 
 ```c
@@ -281,14 +283,36 @@ gsm_snapshot_free(snap); gsm_collect_free(c);
   records of 216 bytes and a `gsm_sample_stats` with `struct_size` 64,
   holding exactly layout 1's fields; layout 2 adds `priority` and `nice`
   (`stat` fields 18 and 19) and the seven `/proc/<pid>/io` counters under
-  `GSM_PROCESS_HAS_IO` (280 bytes), and `process_io_unreadable` in the stats.
-  The library writes the full record and hands over its first `struct_size`
+  `GSM_PROCESS_HAS_IO` (280 bytes), and `process_io_unreadable` in the stats;
+  layout 3 adds the workload class (below) to `gsm_process` (336 bytes) and
+  to `gsm_cgroup` (16 bytes more). A layout-1 or layout-2 caller gets
+  `gsm_cgroup` records at the old size too, and the classifier does not run
+  for them. The library writes the full record and hands over its first `struct_size`
   bytes at that stride.
 - **Unknown is a bit, not a sentinel.** Each record has `uint64_t known`;
   a field whose bit is clear is 0 and must not be shown as 0. A kernel
-  thread has no `GSM_PROCESS_HAS_RSS_ANON`; a cgroup without a memory
+  thread has no address space, so its memory is a known zero (its status
+  file prints no `Vm*` or `Rss*` line, proc_pid_status(5)), as is a zombie's;
+  a process whose status could not be read has no `GSM_PROCESS_HAS_RSS_ANON`; a cgroup without a memory
   controller has no `GSM_CGROUP_HAS_MEMORY_CURRENT`; `memory.max` of `max` is
   `GSM_CGROUP_MEMORY_MAX_UNLIMITED`, a different bit from a finite limit.
+- **Workload classes (layout 3).** `gsm_process` and `gsm_cgroup` carry
+  `workload_class` (`GSM_CLASS_*`, nine classes in the order of
+  `classify.Class`, plus `GSM_CLASS_MIXED` 255 for a cgroup that holds
+  several classes), `class_rule` (an index below `gsm_class_rule_count()`),
+  `class_confidence` (`GSM_CONFIDENCE_*`) and a `class_key` (the unit, the
+  application id, the session, the scope or the project) as a slice of the
+  cgroup path in the string table. A process also has `unit`, `user_unit`,
+  `login_session` and `owner_uid` (each with its `known` bit) as systemd's
+  `cg_path_get_*` would answer for its path, and, when ancestry made it an
+  agent session, `agent_pid` and `agent_start_ticks` (the key is then a
+  process, not a path slice, and stays empty). `gsm_class_name`,
+  `gsm_confidence_name` and `gsm_class_rule_name` return static English
+  strings built from the classifier's own tables, and a compile-time check
+  stops the build if the header's constants and those tables disagree.
+  The names are slices of the path, raw as the cgroup directory holds them;
+  `gsm_unescape_name` in the header decodes `\xNN`. `GSM_PROCESS_HAS_CLASS`
+  is set for every process of a layout-3 sample.
 - **Raw counters plus `sampled_at_ns`** (CLOCK_MONOTONIC, taken before the
   reads). Rates and stall shares are computed from two snapshots with the
   header's `gsm_rate_per_s` and `gsm_pressure_share`, which return 0 (unknown)
@@ -310,8 +334,10 @@ gsm_snapshot_free(snap); gsm_collect_free(c);
   position-independent, and registers three test suites, `collector-zig`, `collector-budget` (the
   overhead budgets on the live machine) and
   `collector-c` (a plain C program that links the library and checks a
-  snapshot over the fixture trees, `tests/c/fixture/proc` and
-  `testdata/cgroup`, then once over the live `/proc`). Nothing is installed.
+  snapshot over the fixture trees, `tests/c/fixture/proc`,
+  `testdata/cgroup` and `tests/c/fixture-agent/proc` (a synthetic tree: an
+  agent, its shell and a child in an editor's scope, the editor beside it, a
+  zombie), then once over the live `/proc`). Nothing is installed.
 - **Link notes:** the archive holds one object and exports only `gsm_*`
   symbols. It has no libc inside: the final link supplies `memcpy`, `memmove`,
   `memset`, `getauxval` and `__tls_get_addr` from the C library and `__divti3`
@@ -331,6 +357,15 @@ gsm_snapshot_free(snap); gsm_collect_free(c);
   216 bytes per process (280 in layout 2, so about 29% more for the process
   array: 143 KB for 510 processes), 376 per cgroup and a 6.4 KB string table, about
   190 KB in all; there is no subprocess and **0 bytes are written**.
+  Layout 3 adds 56 bytes per process (336, about 20% more: 168 KB for 500
+  processes) and 16 per cgroup. Classification (class of each process, plus
+  the unit, user unit, session and owner of its path) is pure work over the
+  walk's data, no syscall: `zig build budget` asserts it costs **at most 0.1
+  of the walk's own CPU time**, same thread, median of 9 pairs, and prints
+  the absolute figure. Measured 2026-10-29 with 499 to 507 processes,
+  ReleaseSafe, pinned: 475 to 501 microseconds per 500 processes against a
+  walk of 10.8 to 11.2 ms, ratio 0.044 to 0.046. Classification runs only for
+  a layout-3 caller, once per sample.
 
 ## Build and test
 

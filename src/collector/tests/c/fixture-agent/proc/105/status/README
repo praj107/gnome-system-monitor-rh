@@ -1,0 +1,1 @@
+a directory where status should be: reading it fails (EISDIR), so the status is unreadable

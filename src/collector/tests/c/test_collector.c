@@ -4,7 +4,7 @@
  * snapshot over captured /proc and cgroupfs trees, then once over the live
  * machine. No GLib: this is what a plain C consumer sees.
  *
- *   test-collector FIXTURE_PROC FIXTURE_CGROUP
+ *   test-collector FIXTURE_PROC FIXTURE_CGROUP FIXTURE_AGENT_PROC
  */
 #define _DEFAULT_SOURCE
 #include "gsmcollect.h"
@@ -114,6 +114,7 @@ check_fixture_snapshot (const char *proc_root,
   if (sleeper != NULL)
     {
       CHECK (sleeper->struct_size == sizeof (gsm_process));
+      CHECK (sizeof (gsm_process) == 336);
       CHECK (strcmp (sleeper->comm, "sleep") == 0 && sleeper->comm_len == 5);
       CHECK (sleeper->state == 'S');
       CHECK (sleeper->ppid == 344259 && sleeper->pgrp == 344259 && sleeper->session == 344253);
@@ -135,14 +136,16 @@ check_fixture_snapshot (const char *proc_root,
       CHECK (strcmp (strings + sleeper->cgroup_offset, expected) == 0);  /* NUL-terminated */
     }
 
-  /* a kernel thread has no mm: its RSS is unknown, and says so */
+  /* a kernel thread has no address space: its status prints no Vm* or Rss*
+   * lines, so its memory is a known zero, not an unknown */
   const gsm_process *kthreadd = find_process (second, 2);
   CHECK (kthreadd != NULL);
   if (kthreadd != NULL)
     {
       CHECK ((kthreadd->flags & GSM_PF_KTHREAD) != 0);
-      CHECK ((kthreadd->known & GSM_PROCESS_HAS_RSS_ANON) == 0 && kthreadd->rss_anon_bytes == 0);
-      CHECK ((kthreadd->known & GSM_PROCESS_HAS_VM_SIZE) == 0);
+      CHECK ((kthreadd->known & GSM_PROCESS_HAS_RSS_ANON) != 0 && kthreadd->rss_anon_bytes == 0);
+      CHECK ((kthreadd->known & GSM_PROCESS_HAS_VM_SIZE) != 0 && kthreadd->vm_size_bytes == 0);
+      CHECK ((kthreadd->known & GSM_PROCESS_HAS_VM_SWAP) != 0 && kthreadd->vm_swap_bytes == 0);
     }
 
   /* a cgroup path from the string table, with its counters */
@@ -242,6 +245,12 @@ typedef struct
   uint32_t reserved[2];
 } gsm_sample_stats_layout1;
 
+/* A layout 2 process record is the 280 bytes before layout 3's first field. */
+#define PROCESS_LAYOUT2_BYTES offsetof (gsm_process, workload_class)
+
+/* A layout 1 or 2 cgroup record ends where layout 3's first field starts. */
+#define CGROUP_LAYOUT2_BYTES offsetof (gsm_cgroup, workload_class)
+
 static gsm_collector *
 new_collector_layout (const char *procfs_root,
                       const char *cgroupfs_root,
@@ -263,18 +272,27 @@ static void
 check_layouts (const char *proc_root,
                const char *cgroup_root)
 {
-  /* the sizes layout 1 shipped with, and layout 2 appending without padding */
+  /* the sizes layout 1 shipped with, layout 2 appending without padding, and
+   * layout 3 appending without padding after it */
   CHECK (sizeof (gsm_process_layout1) == 216);
   CHECK (sizeof (gsm_sample_stats_layout1) == 64);
   CHECK (offsetof (gsm_process, priority) == 212);
   CHECK (offsetof (gsm_process, comm) == offsetof (gsm_process_layout1, comm));
   CHECK (offsetof (gsm_process, io_rchar_bytes) % 8 == 0);
-  CHECK (sizeof (gsm_process) == 280);
+  CHECK (offsetof (gsm_process, io_cancelled_write_bytes) + 8 == PROCESS_LAYOUT2_BYTES);
+  CHECK (PROCESS_LAYOUT2_BYTES == 280);
+  CHECK (offsetof (gsm_process, workload_class) == 280);
+  CHECK (offsetof (gsm_process, owner_uid) == 284);
+  CHECK (offsetof (gsm_process, agent_start_ticks) % 8 == 0);
+  CHECK (offsetof (gsm_process, agent_start_ticks) + 8 == sizeof (gsm_process));
+  CHECK (sizeof (gsm_process) == 336);
   CHECK (sizeof (gsm_sample_stats) == 72);
   CHECK (offsetof (gsm_sample_stats, process_io_unreadable) == sizeof (gsm_sample_stats_layout1));
-  CHECK (GSM_COLLECT_API_VERSION == 2);
+  CHECK (CGROUP_LAYOUT2_BYTES % 8 == 0);
+  CHECK (sizeof (gsm_cgroup) == CGROUP_LAYOUT2_BYTES + 16);
+  CHECK (GSM_COLLECT_API_VERSION == 3);
 
-  gsm_collector *new_reader = new_collector_layout (proc_root, cgroup_root, 2);
+  gsm_collector *new_reader = new_collector_layout (proc_root, cgroup_root, 3);
   gsm_collector *old_reader = new_collector_layout (proc_root, cgroup_root, 1);
   gsm_snapshot *new_snapshot = NULL, *old_snapshot = NULL;
 
@@ -352,6 +370,205 @@ check_layouts (const char *proc_root,
   gsm_snapshot_free (old_snapshot);
   gsm_collect_free (new_reader);
   gsm_collect_free (old_reader);
+}
+
+/* The text of a (offset, length) pair of the string table, compared with `expected`. */
+static int
+string_is (const gsm_snapshot *snapshot,
+           uint32_t            offset,
+           uint32_t            length,
+           const char         *expected)
+{
+  size_t table_length = 0;
+  const char *strings = gsm_snapshot_strings (snapshot, &table_length);
+
+  if ((size_t) offset + length > table_length)
+    return 0;
+  return length == strlen (expected) && memcmp (strings + offset, expected, length) == 0;
+}
+
+static const gsm_cgroup *
+find_cgroup_record (const gsm_snapshot *snapshot,
+                    const char         *path)
+{
+  return find_cgroup (snapshot, path);
+}
+
+static void
+check_layout2_consumer (const char *proc_root,
+                        const char *cgroup_root)
+{
+  gsm_collector *reader = new_collector_layout (proc_root, cgroup_root, 2);
+  gsm_snapshot *snapshot = NULL;
+  size_t count = 0;
+
+  CHECK (reader != NULL);
+  if (reader == NULL)
+    return;
+  CHECK (gsm_collect_sample (reader, &snapshot) == 0);
+  if (snapshot != NULL)
+    {
+      /* layout 2 records are 280 bytes (processes) and the pre-class size (cgroups) */
+      const char *processes = (const char *) gsm_snapshot_processes (snapshot, &count);
+      CHECK (count == 5);
+      for (size_t i = 0; i < count; i++)
+        {
+          const gsm_process *record = (const gsm_process *) (processes + i * PROCESS_LAYOUT2_BYTES);
+
+          CHECK (record->struct_size == PROCESS_LAYOUT2_BYTES);
+          CHECK ((record->known & (GSM_PROCESS_HAS_CLASS | GSM_PROCESS_HAS_UNIT | GSM_PROCESS_HAS_AGENT)) == 0);
+        }
+      const char *cgroups = (const char *) gsm_snapshot_cgroups (snapshot, &count);
+      CHECK (count == 11);
+      for (size_t i = 0; i < count; i++)
+        {
+          const gsm_cgroup *record = (const gsm_cgroup *) (cgroups + i * CGROUP_LAYOUT2_BYTES);
+
+          CHECK (record->struct_size == CGROUP_LAYOUT2_BYTES);
+          CHECK ((record->known & GSM_CGROUP_HAS_CLASS) == 0);
+        }
+      CHECK (gsm_snapshot_stats (snapshot)->struct_size == sizeof (gsm_sample_stats));
+      gsm_snapshot_free (snapshot);
+    }
+  gsm_collect_free (reader);
+}
+
+static void
+check_class_names (void)
+{
+  CHECK (strcmp (gsm_class_name (GSM_CLASS_KERNEL), "Kernel") == 0);
+  CHECK (strcmp (gsm_class_name (GSM_CLASS_AGENT_SESSIONS), "Agent sessions") == 0);
+  CHECK (strcmp (gsm_class_name (GSM_CLASS_UNCLASSIFIED), "Unclassified") == 0);
+  CHECK (strcmp (gsm_class_name (GSM_CLASS_MIXED), "Mixed") == 0);
+  CHECK (strcmp (gsm_class_name (GSM_CLASS_COUNT), "unknown") == 0);
+  for (uint32_t i = 0; i < GSM_CLASS_COUNT; i++)
+    CHECK (strlen (gsm_class_name (i)) > 0 && strcmp (gsm_class_name (i), "unknown") != 0);
+  CHECK (strcmp (gsm_confidence_name (GSM_CONFIDENCE_NONE), "none") == 0);
+  CHECK (strcmp (gsm_confidence_name (GSM_CONFIDENCE_MEDIUM), "medium") == 0);
+  CHECK (strcmp (gsm_confidence_name (GSM_CONFIDENCE_COUNT), "unknown") == 0);
+  CHECK (gsm_class_rule_count () == GSM_CLASS_RULE_COUNT);
+  CHECK (strcmp (gsm_class_rule_name (0), "kernel thread") == 0);
+  CHECK (strcmp (gsm_class_rule_name (GSM_CLASS_RULE_COUNT - 1), "otherwise") == 0);
+  CHECK (strcmp (gsm_class_rule_name (GSM_CLASS_RULE_COUNT), "unknown") == 0);
+  CHECK (strcmp (gsm_class_rule_name (0xFFFFFFFFu), "unknown") == 0);
+}
+
+static void
+check_unescape (void)
+{
+  char buffer[32];
+  const char *escaped = "gnome\\x2dtweaks";
+
+  CHECK (gsm_unescape_name (escaped, strlen (escaped), buffer, sizeof buffer) == 12);
+  CHECK (strcmp (buffer, "gnome-tweaks") == 0);
+  CHECK (gsm_unescape_name ("a\\x2Fb", 6, buffer, sizeof buffer) == 3 && strcmp (buffer, "a/b") == 0);
+  /* a malformed escape is kept as it is */
+  CHECK (gsm_unescape_name ("a\\xZZb", 6, buffer, sizeof buffer) == 6 && strcmp (buffer, "a\\xZZb") == 0);
+  /* only the length given is read: the text goes on past it */
+  CHECK (gsm_unescape_name ("abcdef", 3, buffer, sizeof buffer) == 3 && strcmp (buffer, "abc") == 0);
+  CHECK (gsm_unescape_name ("", 0, buffer, sizeof buffer) == 0 && buffer[0] == '\0');
+  /* the result and its NUL must fit */
+  CHECK (gsm_unescape_name ("abcd", 4, buffer, 4) == -1);
+  CHECK (gsm_unescape_name ("abc", 3, buffer, 4) == 3);
+  CHECK (gsm_unescape_name ("a", 1, buffer, 0) == -1);
+}
+
+static void
+check_layout3 (const char *proc_root,
+               const char *cgroup_root,
+               const char *agent_root)
+{
+  gsm_collector *collector = new_collector (proc_root, cgroup_root, 0);
+  gsm_snapshot *snapshot = NULL;
+  size_t count = 0;
+
+  CHECK (collector != NULL);
+  if (collector == NULL)
+    return;
+  CHECK (gsm_collect_sample (collector, &snapshot) == 0);
+  if (snapshot == NULL)
+    {
+      gsm_collect_free (collector);
+      return;
+    }
+
+  /* every process has a class, a rule below the count, and never "mixed" */
+  const gsm_process *records = gsm_snapshot_processes (snapshot, &count);
+  for (size_t i = 0; i < count; i++)
+    {
+      CHECK ((records[i].known & GSM_PROCESS_HAS_CLASS) != 0);
+      CHECK (records[i].workload_class < GSM_CLASS_COUNT);
+      CHECK (records[i].class_rule < gsm_class_rule_count ());
+      CHECK (records[i].class_confidence <= GSM_CONFIDENCE_HIGH);
+    }
+
+  const gsm_process *sleeper = find_process (snapshot, 344260);
+  CHECK (sleeper != NULL);
+  if (sleeper != NULL)
+    {
+      CHECK (sleeper->workload_class == GSM_CLASS_APPLICATIONS);
+      CHECK (strcmp (gsm_class_name (sleeper->workload_class), "Applications") == 0);
+      CHECK (strcmp (gsm_class_rule_name (sleeper->class_rule), "application") == 0);
+      CHECK (sleeper->class_confidence == GSM_CONFIDENCE_HIGH);
+      CHECK (string_is (snapshot, sleeper->class_key_offset, sleeper->class_key_length, "com.visualstudio.CodeOSS"));
+      CHECK ((sleeper->known & GSM_PROCESS_HAS_UNIT) != 0);
+      CHECK (string_is (snapshot, sleeper->unit_offset, sleeper->unit_length, "user@1000.service"));
+      CHECK ((sleeper->known & GSM_PROCESS_HAS_USER_UNIT) != 0);
+      CHECK (string_is (snapshot, sleeper->user_unit_offset, sleeper->user_unit_length,
+                        "app-com.visualstudio.CodeOSS-4247.scope"));
+      CHECK ((sleeper->known & GSM_PROCESS_HAS_OWNER_UID) != 0 && sleeper->owner_uid == 1000);
+      CHECK ((sleeper->known & (GSM_PROCESS_HAS_SESSION | GSM_PROCESS_HAS_AGENT)) == 0);
+    }
+  const gsm_process *init_process = find_process (snapshot, 1);
+  CHECK (init_process != NULL && init_process->workload_class == GSM_CLASS_INIT);
+  const gsm_process *kthreadd = find_process (snapshot, 2);
+  CHECK (kthreadd != NULL && kthreadd->workload_class == GSM_CLASS_KERNEL);
+
+  /* a cgroup that holds several classes is "mixed", one inside a service has its key */
+  const gsm_cgroup *user_slice = find_cgroup_record (snapshot, "/user.slice");
+  CHECK (user_slice != NULL && (user_slice->known & GSM_CGROUP_HAS_CLASS) != 0);
+  CHECK (user_slice != NULL && user_slice->workload_class == GSM_CLASS_MIXED);
+  CHECK (strcmp (gsm_class_name (GSM_CLASS_MIXED), "Mixed") == 0);
+  const gsm_cgroup *udev = find_cgroup_record (snapshot, "/system.slice/systemd-udevd.service/udev");
+  CHECK (udev != NULL && udev->workload_class == GSM_CLASS_SYSTEM_SERVICES);
+  CHECK (udev != NULL && string_is (snapshot, udev->class_key_offset, udev->class_key_length, "systemd-udevd.service"));
+  CHECK (udev != NULL && strcmp (gsm_confidence_name (udev->class_confidence), "high") == 0);
+  gsm_snapshot_free (snapshot);
+  gsm_collect_free (collector);
+
+  /* a synthetic agent tree: claude, its shell and the shell's child share the
+   * editor's scope with the editor; a zombie has no address space */
+  gsm_collector *agent_reader = new_collector (agent_root, cgroup_root, GSM_READ_PROCESSES);
+  CHECK (agent_reader != NULL);
+  if (agent_reader == NULL)
+    return;
+  CHECK (gsm_collect_sample (agent_reader, &snapshot) == 0);
+  if (snapshot != NULL)
+    {
+      for (uint32_t pid = 100; pid <= 102; pid++)
+        {
+          const gsm_process *record = find_process (snapshot, pid);
+
+          CHECK (record != NULL && record->workload_class == GSM_CLASS_AGENT_SESSIONS);
+          CHECK (record != NULL && strcmp (gsm_class_rule_name (record->class_rule), "agent ancestry") == 0);
+          CHECK (record != NULL && record->class_confidence == GSM_CONFIDENCE_MEDIUM);
+          CHECK (record != NULL && (record->known & GSM_PROCESS_HAS_AGENT) != 0);
+          CHECK (record != NULL && record->agent_pid == 100 && record->agent_start_ticks == 1000);
+          CHECK (record != NULL && record->class_key_length == 0);
+        }
+      const gsm_process *editor = find_process (snapshot, 103);
+      CHECK (editor != NULL && editor->workload_class == GSM_CLASS_APPLICATIONS);
+      CHECK (editor != NULL && (editor->known & GSM_PROCESS_HAS_AGENT) == 0 && editor->agent_pid == 0);
+      const gsm_process *zombie = find_process (snapshot, 104);
+      CHECK (zombie != NULL && zombie->state == 'Z');
+      CHECK (zombie != NULL && (zombie->known & GSM_PROCESS_HAS_RSS_ANON) != 0 && zombie->rss_anon_bytes == 0);
+      CHECK (zombie != NULL && (zombie->known & GSM_PROCESS_HAS_VM_SIZE) != 0 && zombie->vm_size_bytes == 0);
+      /* a task whose status could not be read stays unknown */
+      const gsm_process *unseen = find_process (snapshot, 105);
+      CHECK (unseen != NULL && (unseen->known & GSM_PROCESS_HAS_RSS_ANON) == 0);
+      gsm_snapshot_free (snapshot);
+    }
+  gsm_collect_free (agent_reader);
 }
 
 static void
@@ -466,13 +683,17 @@ int
 main (int    argc,
       char **argv)
 {
-  if (argc != 3)
+  if (argc != 4)
     {
-      fprintf (stderr, "usage: %s FIXTURE_PROC FIXTURE_CGROUP\n", argv[0]);
+      fprintf (stderr, "usage: %s FIXTURE_PROC FIXTURE_CGROUP FIXTURE_AGENT_PROC\n", argv[0]);
       return 2;
     }
   check_fixture_snapshot (argv[1], argv[2]);
   check_layouts (argv[1], argv[2]);
+  check_layout2_consumer (argv[1], argv[2]);
+  check_layout3 (argv[1], argv[2], argv[3]);
+  check_class_names ();
+  check_unescape ();
   check_helpers_and_errors ();
   check_live_machine ();
   if (failures != 0)

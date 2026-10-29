@@ -123,6 +123,7 @@ test(
   args: [
     collector_dir / 'tests/c/fixture/proc',
     collector_dir / 'testdata/cgroup',
+    collector_dir / 'tests/c/fixture-agent/proc',
   ],
   suite: 'collector-c',
 )
