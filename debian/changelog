@@ -43,5 +43,26 @@ gnome-system-monitor-rh (50.0+rh.1) noble; urgency=medium
   * Release builds contain no developer control socket. The polkit policy and
     privileged helpers install under /usr, and the storage wear sampler's
     user unit under /usr/lib/systemd/user.
+  * Processes: the list and its figures come from the monitor's own
+    collector library by default instead of libgtop: about 39 system calls
+    per shown process per refresh instead of about 90. CPU share is the
+    scheduler's run time over wall time; disk write excludes writes later
+    cancelled by truncation; "My processes" selects by real user, so the
+    user's own non-dumpable processes (ssh-agent and the like) are no longer
+    hidden. The gsettings key process-source switches back to libgtop.
+  * Processes: a Class column puts every process in a workload class
+    (kernel, init, system services, session services, applications, login
+    session, agent sessions, containers and VMs, unclassified) by an ordered
+    rule table over its cgroup, with the rule in the tooltip. The Unit column
+    shows the innermost systemd unit (an application's own scope rather than
+    user@1000.service). A Swap column is available. Unit, session and owner
+    come from the cgroup path instead of a libsystemd call per process.
+  * Processes: CPU share shows "—" when there is no rate yet (a process's
+    first refresh, a failed read, a reused process id) instead of a wrapped
+    value that read as 1600 %. Kernel threads' memory is 0, not unknown.
+  * Resources: per-CPU graphs read /proc/stat by CPU number, so an offline
+    CPU no longer shifts the others, and interrupt time counts as busy.
+    Graph scales hold rates above 4 GiB/s, and the disk graph no longer
+    rescales on every refresh.
 
- -- Pranav <pranavrajput321@gmail.com>  Wed, 28 Oct 2026 22:07:02 +0800
+ -- Pranav <pranavrajput321@gmail.com>  Thu, 29 Oct 2026 09:30:12 +0800
