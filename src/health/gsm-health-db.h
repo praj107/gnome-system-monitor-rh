@@ -48,15 +48,32 @@ void         gsm_blame_row_free (GsmBlameRow *row);
 GsmHealthDb *gsm_health_db_new              (const char  *path,
                                              GError     **error);
 
+/*
+ * Where "now" comes from, in unix seconds. NULL (the default) is the wall
+ * clock; tests inject their own so a simulated hour runs in milliseconds.
+ */
+typedef int64_t (*GsmHealthClock) (gpointer user_data);
+
+void         gsm_health_db_set_clock        (GsmHealthDb    *self,
+                                             GsmHealthClock  clock,
+                                             gpointer        user_data);
+
 /* --- writing (sampler side) --- */
 
+/*
+ * Remember a drive and, when health was read, one sample of it. Both rows
+ * are skipped when nothing changed since they were last written and the last
+ * write is under an hour old. Opens a transaction that stays open until
+ * gsm_health_db_commit() or gsm_health_db_flush().
+ */
 void         gsm_health_db_record_drive     (GsmHealthDb *self,
                                              GsmDrive    *drive);
 
 /*
  * Record a *delta* of bytes written by `name` to one drive since the last
  * sample. Deltas, not totals: the underlying counters die with the cgroup or
- * process, so only the increments are durable.
+ * process, so only the increments are durable. The delta is held in memory,
+ * in today's bucket, until gsm_health_db_flush().
  */
 void         gsm_health_db_record_blame     (GsmHealthDb *self,
                                              const char  *drive_id,
@@ -75,6 +92,17 @@ void         gsm_health_db_roll_up          (GsmHealthDb *self);
 
 gboolean     gsm_health_db_commit           (GsmHealthDb  *self,
                                              GError      **error);
+
+/*
+ * Write the accumulated blame deltas and any open drive or battery rows in
+ * one short transaction, and record the time in the meta table. Returns FALSE
+ * (keeping the deltas for the next flush) when the commit fails.
+ */
+gboolean     gsm_health_db_flush            (GsmHealthDb  *self,
+                                             GError      **error);
+
+/* When the record was last flushed (unix seconds), or 0 when it never was. */
+int64_t      gsm_health_db_get_last_flush   (GsmHealthDb *self);
 
 /* --- reading (UI side) --- */
 

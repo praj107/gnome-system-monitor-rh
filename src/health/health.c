@@ -326,6 +326,36 @@ update_banner (DriveCard *card)
 }
 
 
+/*
+ * The sampler holds writes in memory and flushes every few minutes, so the
+ * figures below can lag. Say when the record was last written; say nothing
+ * when it never was, rather than invent a time.
+ */
+static char *
+recorded_up_to_text (GsmHealthView *self)
+{
+  int64_t flushed = gsm_health_db_get_last_flush (self->db);
+  g_autoptr (GDateTime) when = NULL;
+  g_autoptr (GDateTime) now = NULL;
+  g_autofree char *stamp = NULL;
+
+  if (flushed <= 0)
+    return NULL;
+
+  when = g_date_time_new_from_unix_local (flushed);
+  now = g_date_time_new_now_local ();
+  if (when == NULL || now == NULL)
+    return NULL;
+
+  stamp = g_date_time_get_day_of_year (when) == g_date_time_get_day_of_year (now) &&
+          g_date_time_get_year (when) == g_date_time_get_year (now)
+          ? g_date_time_format (when, "%R")
+          : g_date_time_format (when, "%x %R");
+
+  return g_strdup_printf (_("Recorded up to %s."), stamp);
+}
+
+
 /* ------------------------------------------------------------------ */
 /* Charts                                                              */
 /* ------------------------------------------------------------------ */
@@ -423,18 +453,28 @@ update_charts (DriveCard *card)
   gtk_widget_set_visible (card->blame_heading, bars->len > 0);
   gtk_widget_set_visible (card->blame_chart, bars->len > 0);
 
-  if (blame->len == 0) {
-    gtk_label_set_text (card->blame_note,
-                        self->tracking_enabled
-                        ? _("No writes recorded yet.")
-                        : _("Turn on wear tracking to find out what writes to "
-                            "this drive."));
-  } else if (any_estimated) {
-    gtk_label_set_text (card->blame_note,
-                        _("Hatched bars are estimated: the system reports how "
-                          "much an app wrote, but not to which drive."));
-  } else {
-    gtk_label_set_text (card->blame_note, _("Measured per drive."));
+  {
+    g_autofree char *base = NULL;
+    g_autofree char *fresh = recorded_up_to_text (self);
+
+    if (blame->len == 0)
+      base = g_strdup (self->tracking_enabled
+                       ? _("No writes recorded yet.")
+                       : _("Turn on wear tracking to find out what writes to "
+                           "this drive."));
+    else if (any_estimated)
+      base = g_strdup (_("Hatched bars are estimated: the system reports how "
+                         "much an app wrote, but not to which drive."));
+    else
+      base = g_strdup (_("Measured per drive."));
+
+    if (fresh != NULL) {
+      g_autofree char *note = g_strdup_printf ("%s %s", base, fresh);
+
+      gtk_label_set_text (card->blame_note, note);
+    } else {
+      gtk_label_set_text (card->blame_note, base);
+    }
   }
 }
 

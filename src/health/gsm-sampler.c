@@ -12,6 +12,17 @@
  * what a machine writes, so the honest options were "sample in the background"
  * or "do not make the claim at all".
  *
+ * It reads often and writes rarely. The blame counters are read every tick
+ * (they die with their process), but the deltas are held in memory and the
+ * database is written once per flush interval and on SIGTERM, so the sampler
+ * stays within a few hundred kilobytes of writes an hour instead of a commit
+ * of several pages every few seconds. Drive health is fetched at the flush
+ * cadence too: udisksd refreshes ATA and NVMe SMART data from its own
+ * housekeeping timer, which udiskslinuxprovider.c schedules every 10 minutes
+ * (g_timeout_add_seconds (10*60, on_housekeeping_timeout, ...) calling
+ * udisks_linux_drive_object_housekeeping), so asking more often only returns
+ * the same values.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -32,6 +43,13 @@
 
 #define DEFAULT_INTERVAL_SECS 15
 
+/* Matches udisksd's housekeeping period; see the file header. */
+#define DEFAULT_FLUSH_INTERVAL_SECS 600
+
+/* A device the map does not know triggers a refresh, but at most this often:
+ * partitions and device-mapper nodes never appear in it. */
+#define MAP_MISS_REFRESH_SECS 60
+
 typedef struct {
   GsmHealthDb     *db;
   GDBusConnection *bus;
@@ -45,7 +63,15 @@ typedef struct {
   /* Maps "<major>:<minor>" of a whole disk to its stable drive id. */
   GHashTable      *device_to_drive;
 
+  /* "<major>:<minor>" keys already looked up since the last map refresh and
+   * not found, so one unmappable device does not cost a refresh per tick. */
+  GHashTable      *unknown_devices;
+  int64_t          map_refreshed_us;
+  guint            misses;
+
   guint            interval;
+  guint            flush_interval;
+  int64_t          last_flush_us;
 } Sampler;
 
 
@@ -99,18 +125,33 @@ drive_for_device (Sampler *self,
                   guint    minor)
 {
   g_autofree char *key = g_strdup_printf ("%u:%u", major, minor);
+  const char *drive_id = g_hash_table_lookup (self->device_to_drive, key);
 
-  return g_hash_table_lookup (self->device_to_drive, key);
+  if (drive_id != NULL)
+    return drive_id;
+
+  if (g_hash_table_add (self->unknown_devices, g_steal_pointer (&key)))
+    self->misses++;
+
+  return NULL;
 }
 
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Ask udisks which drives exist and rebuild the major:minor map. With
+ * `record`, also hand each drive's identity and health to the database
+ * (which skips what has not changed).
+ */
 static void
-sample_drives (Sampler *self)
+refresh_drives (Sampler  *self,
+                gboolean  record)
 {
   g_autoptr (GPtrArray) infos = NULL;
   g_autoptr (GError) error = NULL;
+
+  self->map_refreshed_us = g_get_monotonic_time ();
 
   infos = gsm_udisks_collect (self->bus, &error);
   if (infos == NULL) {
@@ -119,6 +160,7 @@ sample_drives (Sampler *self)
   }
 
   g_hash_table_remove_all (self->device_to_drive);
+  g_hash_table_remove_all (self->unknown_devices);
 
   for (guint i = 0; i < infos->len; i++) {
     GsmDriveInfo *info = g_ptr_array_index (infos, i);
@@ -132,6 +174,9 @@ sample_drives (Sampler *self)
                             g_strdup_printf ("%u:%u", info->major, info->minor),
                             g_strdup (info->serial));
     }
+
+    if (!record)
+      continue;
 
     drive = gsm_drive_new (info->serial);
     gsm_drive_apply_info (drive, info);
@@ -221,20 +266,49 @@ sample_batteries (Sampler *self)
 }
 
 
+/*
+ * One flush: drives and batteries are read now (they move slowly), the
+ * rollups run if they are due, and everything reaches storage in a single
+ * short transaction.
+ */
+static void
+flush (Sampler  *self,
+       gboolean  read_hardware)
+{
+  g_autoptr (GError) error = NULL;
+
+  if (read_hardware) {
+    refresh_drives (self, TRUE);
+    sample_batteries (self);
+    gsm_health_db_roll_up (self->db);
+  }
+
+  if (!gsm_health_db_flush (self->db, &error))
+    g_warning ("sampler: could not write the record: %s", error->message);
+
+  self->last_flush_us = g_get_monotonic_time ();
+}
+
+
 static gboolean
 tick (gpointer data)
 {
   Sampler *self = data;
-  g_autoptr (GError) error = NULL;
+  int64_t now_us = g_get_monotonic_time ();
 
-  sample_drives (self);
+  self->misses = 0;
   sample_blame (self);
-  sample_batteries (self);
 
-  gsm_health_db_roll_up (self->db);
+  /* A device the map has never heard of: the drive may have just appeared.
+   * Refresh the map once and read again, so nothing it wrote is skipped. */
+  if (self->misses > 0 &&
+      now_us - self->map_refreshed_us >= MAP_MISS_REFRESH_SECS * G_USEC_PER_SEC) {
+    refresh_drives (self, FALSE);
+    sample_blame (self);
+  }
 
-  if (!gsm_health_db_commit (self->db, &error))
-    g_warning ("sampler: could not commit: %s", error->message);
+  if (now_us - self->last_flush_us >= (int64_t) self->flush_interval * G_USEC_PER_SEC)
+    flush (self, TRUE);
 
   return G_SOURCE_CONTINUE;
 }
@@ -330,6 +404,15 @@ main (int   argc,
       self.interval = (guint) parsed;
   }
 
+  self.flush_interval = DEFAULT_FLUSH_INTERVAL_SECS;
+  interval_env = g_getenv ("GSM_HEALTH_FLUSH_INTERVAL");
+  if (interval_env != NULL) {
+    int parsed = atoi (interval_env);
+
+    if (parsed >= 5 && parsed <= 86400)
+      self.flush_interval = (guint) parsed;
+  }
+
   self.db = gsm_health_db_new (NULL, &error);
   if (self.db == NULL) {
     g_printerr ("gsm-health-sampler: %s\n", error->message);
@@ -346,6 +429,8 @@ main (int   argc,
   self.prev_proc = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
   self.device_to_drive = g_hash_table_new_full (g_str_hash, g_str_equal,
                                                 g_free, g_free);
+  self.unknown_devices = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                g_free, NULL);
 
   self.loop = g_main_loop_new (NULL, FALSE);
 
@@ -355,7 +440,7 @@ main (int   argc,
   /* Prime the deltas: the first tick would otherwise attribute every byte
    * each process has written since it started as if it happened just now,
    * putting a huge false spike at the moment tracking was switched on. */
-  sample_drives (&self);
+  refresh_drives (&self, TRUE);
   {
     g_autoptr (GPtrArray) cgroups = gsm_blame_collect ();
     g_autoptr (GPtrArray) procs = gsm_proc_io_collect ();
@@ -375,7 +460,7 @@ main (int   argc,
       store_value (self.prev_proc, key, entry->wbytes);
     }
   }
-  gsm_health_db_commit (self.db, NULL);
+  flush (&self, FALSE);
 
   g_timeout_add_seconds (self.interval, tick, &self);
   g_timeout_add_seconds (600, prune, &self);
@@ -383,12 +468,17 @@ main (int   argc,
   g_debug ("sampler: running, every %us", self.interval);
   g_main_loop_run (self.loop);
 
-  gsm_health_db_commit (self.db, NULL);
+  /* SIGTERM (logout, shutdown): read the counters one last time and write
+   * what has accumulated, so a clean stop loses nothing. */
+  self.misses = 0;
+  sample_blame (&self);
+  flush (&self, FALSE);
 
   g_clear_pointer (&self.loop, g_main_loop_unref);
   g_clear_pointer (&self.prev_cgroup, g_hash_table_unref);
   g_clear_pointer (&self.prev_proc, g_hash_table_unref);
   g_clear_pointer (&self.device_to_drive, g_hash_table_unref);
+  g_clear_pointer (&self.unknown_devices, g_hash_table_unref);
   g_clear_object (&self.bus);
   g_clear_object (&self.db);
 

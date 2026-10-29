@@ -277,6 +277,20 @@ test(
   protocol: 'tap',
 )
 
+# The health sampler's write budget: a simulated hour through a counting
+# SQLite VFS. Lives in src/ because it links the health library.
+test(
+  'health-budget',
+  executable(
+    'test-health-budget',
+    ['tests/test-health-budget.c'],
+    include_directories: rootInclude,
+    dependencies: [libgsm_health_dep, glib, sqlite],
+  ),
+  protocol: 'tap',
+  timeout: 120,
+)
+
 gsm_app = executable('gnome-system-monitor-rh',
   ['main.cpp'],
   dependencies: libgsm_dep,

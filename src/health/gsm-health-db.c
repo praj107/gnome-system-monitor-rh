@@ -18,12 +18,50 @@
 #include "gsm-drive-spec.h"
 #include "gsm-health-db.h"
 
+/* What the sampler has been told about one drive and when it last reached
+ * storage, so an unchanged reading is not written again. */
+typedef struct {
+  char     *model;
+  uint64_t  size;
+  gboolean  removable;
+  int64_t   identity_ts;
+
+  gboolean  has_sample;
+  int64_t   sample_ts;
+  uint64_t  bytes_written;
+  int       percent_used;
+  int       temperature;
+} DriveState;
+
+typedef struct {
+  int64_t day;
+  int     health_percent;
+  int     cycle_count;
+} BatteryState;
+
+/* One writer's bytes on one drive on one day, not yet in the database. */
+typedef struct {
+  char     *drive_id;
+  int64_t   day;
+  char     *name;
+  uint64_t  wbytes;
+  gboolean  exact;
+} PendingBlame;
+
 struct _GsmHealthDb {
   GObject parent_instance;
 
   sqlite3 *db;
   char *path;
   gboolean in_transaction;
+
+  GsmHealthClock clock;
+  gpointer clock_data;
+
+  GHashTable *pending_blame;   /* "drive\nday\nname" -> PendingBlame */
+  GHashTable *drive_state;     /* drive id -> DriveState */
+  GHashTable *battery_state;   /* battery id -> BatteryState */
+  int64_t last_roll_up;
 };
 
 G_DEFINE_FINAL_TYPE (GsmHealthDb, gsm_health_db, G_TYPE_OBJECT)
@@ -35,6 +73,24 @@ G_DEFINE_FINAL_TYPE (GsmHealthDb, gsm_health_db, G_TYPE_OBJECT)
  * hundred KB per decade, and a multi-year wear curve is the whole point. */
 
 #define SCHEMA_VERSION 1
+
+/* Drive identity and an unchanged health reading are rewritten at most this
+ * often: a "last seen" accurate to the hour is as honest as one accurate to
+ * the second, and costs 24 page writes a day instead of thousands. */
+#define DRIVE_REWRITE_SECS 3600
+
+/* Folding old samples into rollups only has work to do when something has
+ * aged out, which happens at the pace of the raw retention, not per flush. */
+#define ROLL_UP_SECS 3600
+
+/*
+ * Write-ahead log bounds (https://www.sqlite.org/pragma.html): the log is
+ * truncated to this size when a checkpoint resets it, and checkpoints run
+ * after this many pages, so the file does not sit at several megabytes next
+ * to a database of a few dozen kilobytes.
+ */
+#define WAL_SIZE_LIMIT_BYTES 524288
+#define WAL_AUTOCHECKPOINT_PAGES 100
 
 static const char *SCHEMA_SQL =
   /* Identity of every drive we have ever seen, keyed by serial so history
@@ -108,6 +164,45 @@ static const char *SCHEMA_SQL =
 
 
 static void
+drive_state_free (DriveState *state)
+{
+  g_free (state->model);
+  g_free (state);
+}
+
+
+static void
+pending_blame_free (PendingBlame *pending)
+{
+  g_free (pending->drive_id);
+  g_free (pending->name);
+  g_free (pending);
+}
+
+
+static int64_t
+db_now (GsmHealthDb *self)
+{
+  if (self->clock != NULL)
+    return self->clock (self->clock_data);
+
+  return g_get_real_time () / G_USEC_PER_SEC;
+}
+
+
+void
+gsm_health_db_set_clock (GsmHealthDb    *self,
+                         GsmHealthClock  clock,
+                         gpointer        user_data)
+{
+  g_return_if_fail (GSM_IS_HEALTH_DB (self));
+
+  self->clock = clock;
+  self->clock_data = user_data;
+}
+
+
+static void
 gsm_health_db_finalize (GObject *object)
 {
   GsmHealthDb *self = GSM_HEALTH_DB (object);
@@ -121,6 +216,9 @@ gsm_health_db_finalize (GObject *object)
   }
 
   g_clear_pointer (&self->path, g_free);
+  g_clear_pointer (&self->pending_blame, g_hash_table_unref);
+  g_clear_pointer (&self->drive_state, g_hash_table_unref);
+  g_clear_pointer (&self->battery_state, g_hash_table_unref);
 
   G_OBJECT_CLASS (gsm_health_db_parent_class)->finalize (object);
 }
@@ -136,7 +234,14 @@ gsm_health_db_class_init (GsmHealthDbClass *klass)
 static void
 gsm_health_db_init (GsmHealthDb *self)
 {
-  (void) self;
+  self->pending_blame =
+    g_hash_table_new_full (g_str_hash, g_str_equal, g_free,
+                           (GDestroyNotify) pending_blame_free);
+  self->drive_state =
+    g_hash_table_new_full (g_str_hash, g_str_equal, g_free,
+                           (GDestroyNotify) drive_state_free);
+  self->battery_state =
+    g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 }
 
 
@@ -194,6 +299,8 @@ gsm_health_db_new (const char  *path,
 
   if (!exec_sql (self, "PRAGMA journal_mode=WAL;", error) ||
       !exec_sql (self, "PRAGMA synchronous=NORMAL;", error) ||
+      !exec_sql (self, "PRAGMA journal_size_limit=" G_STRINGIFY (WAL_SIZE_LIMIT_BYTES) ";", error) ||
+      !exec_sql (self, "PRAGMA wal_autocheckpoint=" G_STRINGIFY (WAL_AUTOCHECKPOINT_PAGES) ";", error) ||
       !exec_sql (self, SCHEMA_SQL, error))
     return NULL;
 
@@ -241,12 +348,42 @@ gsm_health_db_commit (GsmHealthDb  *self,
 /* Writing                                                             */
 /* ------------------------------------------------------------------ */
 
+static gboolean
+drive_identity_changed (const DriveState *state,
+                        GsmDrive         *drive,
+                        int64_t           now)
+{
+  return state == NULL ||
+         now - state->identity_ts >= DRIVE_REWRITE_SECS ||
+         state->size != gsm_drive_get_size (drive) ||
+         (state->removable != 0) != (gsm_drive_get_removable (drive) != 0) ||
+         g_strcmp0 (state->model, gsm_drive_get_model (drive)) != 0;
+}
+
+
+static gboolean
+drive_sample_due (const DriveState *state,
+                  GsmDrive         *drive,
+                  int64_t           now)
+{
+  return state == NULL ||
+         !state->has_sample ||
+         now - state->sample_ts >= DRIVE_REWRITE_SECS ||
+         state->bytes_written != gsm_drive_get_bytes_written (drive) ||
+         state->percent_used != gsm_drive_get_percent_used (drive) ||
+         state->temperature != gsm_drive_get_temperature (drive);
+}
+
+
 void
 gsm_health_db_record_drive (GsmHealthDb *self,
                             GsmDrive    *drive)
 {
   sqlite3_stmt *stmt = NULL;
   const char *drive_id;
+  DriveState *state;
+  gboolean write_identity;
+  gboolean write_sample;
   int64_t now;
 
   g_return_if_fail (GSM_IS_HEALTH_DB (self));
@@ -256,11 +393,38 @@ gsm_health_db_record_drive (GsmHealthDb *self,
   if (drive_id == NULL)
     return;
 
-  now = g_get_real_time () / G_USEC_PER_SEC;
+  now = db_now (self);
+  state = g_hash_table_lookup (self->drive_state, drive_id);
+
+  /*
+   * A health *sample* only makes sense when we actually read health.
+   * Recording zeroes would draw a cliff to the floor in the wear chart every
+   * time a drive was locked or absent.
+   */
+  write_identity = drive_identity_changed (state, drive, now);
+  write_sample = !(gsm_drive_get_bytes_written (drive) == 0 &&
+                   gsm_drive_get_percent_used (drive) < 0) &&
+                 drive_sample_due (state, drive, now);
+
+  if (!write_identity && !write_sample)
+    return;
+
+  if (state == NULL) {
+    state = g_new0 (DriveState, 1);
+    g_hash_table_replace (self->drive_state, g_strdup (drive_id), state);
+  }
 
   begin (self);
 
-  if (sqlite3_prepare_v2 (self->db,
+  /*
+   * The identity row is written whenever it changed or is an hour old — a
+   * drive we cannot read health from still needs to be remembered, so a
+   * removable that is currently unplugged (or a drive still awaiting an
+   * unlock) can be shown with an honest "last seen" rather than vanishing
+   * from the list entirely.
+   */
+  if (write_identity &&
+      sqlite3_prepare_v2 (self->db,
                           "INSERT INTO drive (drive_id, model, size, removable, last_seen) "
                           "VALUES (?1, ?2, ?3, ?4, ?5) "
                           "ON CONFLICT (drive_id) DO UPDATE SET "
@@ -275,20 +439,15 @@ gsm_health_db_record_drive (GsmHealthDb *self,
     sqlite3_bind_int64 (stmt, 5, now);
     sqlite3_step (stmt);
     sqlite3_finalize (stmt);
+
+    g_free (state->model);
+    state->model = g_strdup (gsm_drive_get_model (drive));
+    state->size = gsm_drive_get_size (drive);
+    state->removable = gsm_drive_get_removable (drive) != 0;
+    state->identity_ts = now;
   }
 
-  /*
-   * The identity row above is always written — a drive we cannot read health
-   * from still needs to be remembered, so a removable that is currently
-   * unplugged (or a drive still awaiting an unlock) can be shown with an
-   * honest "last seen" rather than vanishing from the list entirely.
-   *
-   * A health *sample*, though, only makes sense when we actually read health.
-   * Recording zeroes here would draw a cliff to the floor in the wear chart
-   * every time a drive was locked or absent.
-   */
-  if (gsm_drive_get_bytes_written (drive) == 0 &&
-      gsm_drive_get_percent_used (drive) < 0)
+  if (!write_sample)
     return;
 
   stmt = NULL;
@@ -304,6 +463,12 @@ gsm_health_db_record_drive (GsmHealthDb *self,
     sqlite3_bind_int (stmt, 5, gsm_drive_get_temperature (drive));
     sqlite3_step (stmt);
     sqlite3_finalize (stmt);
+
+    state->has_sample = TRUE;
+    state->sample_ts = now;
+    state->bytes_written = gsm_drive_get_bytes_written (drive);
+    state->percent_used = gsm_drive_get_percent_used (drive);
+    state->temperature = gsm_drive_get_temperature (drive);
   }
 }
 
@@ -315,7 +480,8 @@ gsm_health_db_record_blame (GsmHealthDb *self,
                             uint64_t     delta_wbytes,
                             gboolean     exact)
 {
-  sqlite3_stmt *stmt = NULL;
+  g_autofree char *key = NULL;
+  PendingBlame *pending;
   int64_t day;
 
   g_return_if_fail (GSM_IS_HEALTH_DB (self));
@@ -323,16 +489,41 @@ gsm_health_db_record_blame (GsmHealthDb *self,
   if (drive_id == NULL || name == NULL || delta_wbytes == 0)
     return;
 
-  day = (g_get_real_time () / G_USEC_PER_SEC) / 86400;
+  /* The day is taken now, when the delta is read, so a flush after midnight
+   * still fills the bucket of the day the bytes were written in. */
+  day = db_now (self) / 86400;
+  key = g_strdup_printf ("%s\n%" G_GINT64_FORMAT "\n%s", drive_id, day, name);
 
-  begin (self);
+  pending = g_hash_table_lookup (self->pending_blame, key);
+  if (pending == NULL) {
+    pending = g_new0 (PendingBlame, 1);
+    pending->drive_id = g_strdup (drive_id);
+    pending->day = day;
+    pending->name = g_strdup (name);
+    pending->exact = exact;
+    g_hash_table_insert (self->pending_blame, g_steal_pointer (&key), pending);
+  } else {
+    /* `exact` is sticky-pessimistic: one heuristic contribution makes the
+     * whole row an estimate, so the UI never overstates its confidence. */
+    pending->exact = pending->exact && exact;
+  }
 
-  /*
-   * Accumulate into today's bucket rather than appending a row per tick.
-   * `exact` is sticky-pessimistic: if any contribution to a writer's daily
-   * total was a heuristic guess, the whole row is marked estimated, so the UI
-   * never overstates its confidence.
-   */
+  pending->wbytes += delta_wbytes;
+}
+
+
+static void
+write_pending_blame (GsmHealthDb *self)
+{
+  GHashTableIter iter;
+  PendingBlame *pending;
+  sqlite3_stmt *stmt = NULL;
+
+  if (g_hash_table_size (self->pending_blame) == 0)
+    return;
+
+  /* Added to the stored day's total; `exact` combined with MIN against what
+   * earlier flushes stored, for the same reason as above. */
   if (sqlite3_prepare_v2 (self->db,
                           "INSERT INTO blame_daily (drive_id, day, name, wbytes, exact) "
                           "VALUES (?1, ?2, ?3, ?4, ?5) "
@@ -342,12 +533,17 @@ gsm_health_db_record_blame (GsmHealthDb *self,
                           -1, &stmt, NULL) != SQLITE_OK)
     return;
 
-  sqlite3_bind_text (stmt, 1, drive_id, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int64 (stmt, 2, day);
-  sqlite3_bind_text (stmt, 3, name, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int64 (stmt, 4, (sqlite3_int64) delta_wbytes);
-  sqlite3_bind_int (stmt, 5, exact ? 1 : 0);
-  sqlite3_step (stmt);
+  g_hash_table_iter_init (&iter, self->pending_blame);
+  while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &pending)) {
+    sqlite3_bind_text (stmt, 1, pending->drive_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64 (stmt, 2, pending->day);
+    sqlite3_bind_text (stmt, 3, pending->name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64 (stmt, 4, (sqlite3_int64) pending->wbytes);
+    sqlite3_bind_int (stmt, 5, pending->exact ? 1 : 0);
+    sqlite3_step (stmt);
+    sqlite3_reset (stmt);
+  }
+
   sqlite3_finalize (stmt);
 }
 
@@ -359,6 +555,7 @@ gsm_health_db_record_battery (GsmHealthDb *self,
                               int          cycle_count)
 {
   sqlite3_stmt *stmt = NULL;
+  BatteryState *state;
   int64_t day;
 
   g_return_if_fail (GSM_IS_HEALTH_DB (self));
@@ -366,11 +563,18 @@ gsm_health_db_record_battery (GsmHealthDb *self,
   if (battery_id == NULL || health_percent < 0)
     return;
 
-  day = (g_get_real_time () / G_USEC_PER_SEC) / 86400;
+  day = db_now (self) / 86400;
+
+  /* Battery wear moves on the scale of weeks; one row per day is plenty, and
+   * the same reading is not written twice. */
+  state = g_hash_table_lookup (self->battery_state, battery_id);
+  if (state != NULL && state->day == day &&
+      state->health_percent == health_percent &&
+      state->cycle_count == cycle_count)
+    return;
 
   begin (self);
 
-  /* Battery wear moves on the scale of weeks; one row per day is plenty. */
   if (sqlite3_prepare_v2 (self->db,
                           "INSERT OR REPLACE INTO battery_daily "
                           "(battery_id, day, health_percent, cycle_count) "
@@ -384,6 +588,82 @@ gsm_health_db_record_battery (GsmHealthDb *self,
   sqlite3_bind_int (stmt, 4, cycle_count);
   sqlite3_step (stmt);
   sqlite3_finalize (stmt);
+
+  if (state == NULL) {
+    state = g_new0 (BatteryState, 1);
+    g_hash_table_replace (self->battery_state, g_strdup (battery_id), state);
+  }
+  state->day = day;
+  state->health_percent = health_percent;
+  state->cycle_count = cycle_count;
+}
+
+
+/*
+ * Write everything held in memory in one short transaction and note when.
+ * The write transaction is open only inside this call, so the UI's own
+ * writes (a rated TBW typed into a drive card) never wait on the sampler.
+ */
+gboolean
+gsm_health_db_flush (GsmHealthDb  *self,
+                     GError      **error)
+{
+  sqlite3_stmt *stmt = NULL;
+
+  g_return_val_if_fail (GSM_IS_HEALTH_DB (self), FALSE);
+
+  begin (self);
+
+  write_pending_blame (self);
+
+  if (sqlite3_prepare_v2 (self->db,
+                          "INSERT OR REPLACE INTO meta (key, value) "
+                          "VALUES ('last_flush', ?1)",
+                          -1, &stmt, NULL) == SQLITE_OK) {
+    g_autofree char *value =
+      g_strdup_printf ("%" G_GINT64_FORMAT, db_now (self));
+
+    sqlite3_bind_text (stmt, 1, value, -1, SQLITE_TRANSIENT);
+    sqlite3_step (stmt);
+    sqlite3_finalize (stmt);
+  }
+
+  if (!gsm_health_db_commit (self, error)) {
+    sqlite3_exec (self->db, "ROLLBACK", NULL, NULL, NULL);
+
+    /* Keep the pending deltas for the next flush, but forget what we
+     * believe reached storage so identity and samples are written again. */
+    g_hash_table_remove_all (self->drive_state);
+    g_hash_table_remove_all (self->battery_state);
+    return FALSE;
+  }
+
+  g_hash_table_remove_all (self->pending_blame);
+
+  return TRUE;
+}
+
+
+int64_t
+gsm_health_db_get_last_flush (GsmHealthDb *self)
+{
+  sqlite3_stmt *stmt = NULL;
+  int64_t out = 0;
+
+  g_return_val_if_fail (GSM_IS_HEALTH_DB (self), 0);
+
+  if (sqlite3_prepare_v2 (self->db,
+                          "SELECT CAST (value AS INTEGER) FROM meta "
+                          " WHERE key = 'last_flush'",
+                          -1, &stmt, NULL) != SQLITE_OK)
+    return 0;
+
+  if (sqlite3_step (stmt) == SQLITE_ROW)
+    out = sqlite3_column_int64 (stmt, 0);
+
+  sqlite3_finalize (stmt);
+
+  return out > 0 ? out : 0;
 }
 
 
@@ -399,7 +679,11 @@ gsm_health_db_roll_up (GsmHealthDb *self)
 
   g_return_if_fail (GSM_IS_HEALTH_DB (self));
 
-  now = g_get_real_time () / G_USEC_PER_SEC;
+  now = db_now (self);
+
+  if (self->last_roll_up != 0 && now - self->last_roll_up < ROLL_UP_SECS)
+    return;
+  self->last_roll_up = now;
 
   begin (self);
 
@@ -455,9 +739,9 @@ gsm_blame_row_free (GsmBlameRow *row)
  * its age, not on which range is being asked for, so the query spans all
  * three and this just picks the cutoff. */
 static int64_t
-range_since (GsmHistoryRange range)
+range_since (GsmHealthDb *self, GsmHistoryRange range)
 {
-  int64_t now = g_get_real_time () / G_USEC_PER_SEC;
+  int64_t now = db_now (self);
 
   switch (range) {
     case GSM_HISTORY_RANGE_DAY:
@@ -478,7 +762,7 @@ gsm_health_db_get_history (GsmHealthDb     *self,
 {
   GArray *points = g_array_new (FALSE, FALSE, sizeof (GsmHistoryPoint));
   sqlite3_stmt *stmt = NULL;
-  int64_t since = range_since (range);
+  int64_t since = range_since (self, range);
   g_autofree char *sql = NULL;
 
   g_return_val_if_fail (GSM_IS_HEALTH_DB (self), points);
@@ -539,7 +823,7 @@ gsm_health_db_get_blame (GsmHealthDb     *self,
   GPtrArray *rows =
     g_ptr_array_new_with_free_func ((GDestroyNotify) gsm_blame_row_free);
   sqlite3_stmt *stmt = NULL;
-  int64_t today = (g_get_real_time () / G_USEC_PER_SEC) / 86400;
+  int64_t today = db_now (self) / 86400;
   int days;
 
   g_return_val_if_fail (GSM_IS_HEALTH_DB (self), rows);
@@ -592,7 +876,7 @@ gsm_health_db_get_write_rate (GsmHealthDb *self,
                               int          days)
 {
   sqlite3_stmt *stmt = NULL;
-  int64_t now = g_get_real_time () / G_USEC_PER_SEC;
+  int64_t now = db_now (self);
   int64_t since = now - ((int64_t) days * 24 * 3600);
   double rate = -1;
 
