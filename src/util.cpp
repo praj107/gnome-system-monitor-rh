@@ -414,8 +414,46 @@ percentage_cell_data_func (GtkTreeViewColumn *,
 }
 
 
+static const char *const UNKNOWN_FIGURE = "—";
+
+static ProcInfo *
+proc_info_of_row (GtkTreeModel *model,
+                  GtkTreeIter  *iter)
+{
+  gpointer info = NULL;
+
+  gtk_tree_model_get (model, iter, COL_POINTER, &info, -1);
+  return static_cast<ProcInfo *>(info);
+}
+
+/* Whether the figure of a memory column is known for the process: the
+ * collector leaves a memory figure unknown when the kernel's status file did
+ * not provide the counters it is made of. */
+static bool
+memory_figure_known (const ProcInfo *info,
+                     guint           column)
+{
+  switch (column)
+    {
+      case COL_VMSIZE:
+        return info->vmsize_known;
+
+      case COL_MEMRES:
+        return info->memres_known;
+
+      case COL_MEMSHARED:
+        return info->memshared_known;
+
+      case COL_MEM:
+        return info->mem_known;
+
+      default:
+        return true;
+    }
+}
+
 /*
-      Same as above but handles size == 0 as not available
+      Memory columns: "—" when the figure is unknown for the process
     */
 void
 size_na_cell_data_func (GtkTreeViewColumn *,
@@ -425,6 +463,13 @@ size_na_cell_data_func (GtkTreeViewColumn *,
                         gpointer         user_data)
 {
   const guint index = GPOINTER_TO_UINT (user_data);
+
+  const ProcInfo *info = proc_info_of_row (model, iter);
+  if (info != NULL && !memory_figure_known (info, index))
+    {
+      g_object_set (renderer, "text", UNKNOWN_FIGURE, NULL);
+      return;
+    }
 
   guint64 size;
   GValue value = G_VALUE_INIT;
@@ -450,18 +495,6 @@ size_na_cell_data_func (GtkTreeViewColumn *,
   char *str = format_byte_size (size, GsmApplication::get ().config.process_memory_in_iec);
   g_object_set (renderer, "text", str, NULL);
   g_free (str);
-}
-
-static const char *const UNKNOWN_FIGURE = "—";
-
-static ProcInfo *
-proc_info_of_row (GtkTreeModel *model,
-                  GtkTreeIter  *iter)
-{
-  gpointer info = NULL;
-
-  gtk_tree_model_get (model, iter, COL_POINTER, &info, -1);
-  return static_cast<ProcInfo *>(info);
 }
 
 /* Disk totals: "—" when /proc/PID/io was unreadable for the process. */
@@ -626,6 +659,13 @@ time_cell_data_func (GtkTreeViewColumn *,
                      gpointer         user_data)
 {
   const guint index = GPOINTER_TO_UINT (user_data);
+
+  const ProcInfo *info = proc_info_of_row (model, iter);
+  if (info != NULL && !info->start_time_known)
+    {
+      g_object_set (renderer, "text", UNKNOWN_FIGURE, NULL);
+      return;
+    }
 
   time_t time;
   GValue value = G_VALUE_INIT;

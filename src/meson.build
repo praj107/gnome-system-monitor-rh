@@ -34,6 +34,7 @@ system_monitor_sources = [
   'procinfo.cpp',
   'proclist.cpp',
   'procproperties.cpp',
+  'procsource.cpp',
   'proctable.cpp',
   'setaffinity.cpp',
   'smooth_refresh.cpp',
@@ -132,15 +133,17 @@ system_monitor_dependencies = [
   libgsm_health_dep,
   dl_dep,
 ]
+# The collector is a prebuilt archive: the static libgsm only needs its
+# header; whatever links libgsm_dep gets the archive itself.
 libgsm = static_library(
   'libgsm',
   system_monitor_sources + [gsm_resource],
   include_directories: rootInclude,
-  dependencies: system_monitor_dependencies,
+  dependencies: system_monitor_dependencies + [libgsmcollect_dep.partial_dependency(includes: true)],
   link_with: libgsm_legacy,
 )
 libgsm_dep = declare_dependency(
-  dependencies: system_monitor_dependencies,
+  dependencies: system_monitor_dependencies + [libgsmcollect_dep],
   include_directories: rootInclude,
   link_with: libgsm,
 )
@@ -201,6 +204,18 @@ test(
     include_directories: rootInclude,
     dependencies: [glib],
   ),
+  protocol: 'tap',
+)
+
+test(
+  'procsource',
+  executable(
+    'test-procsource',
+    ['procsource.cpp', 'tests/test-procsource.cpp'],
+    include_directories: rootInclude,
+    dependencies: [glib, libgtop, libgsmcollect_dep],
+  ),
+  args: [meson.project_source_root() / 'src' / 'collector' / 'testdata' / 'proc'],
   protocol: 'tap',
 )
 

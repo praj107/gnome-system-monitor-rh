@@ -106,6 +106,16 @@
       <summary>Determines which processes to show.</summary>
     </key>
 
+    <key name="process-source" type="s">
+      <default>'libgtop'</default>
+      <choices>
+        <choice value="libgtop"/>
+        <choice value="collector"/>
+      </choices>
+      <summary>Where the Processes tab reads its figures from.</summary>
+      <description>With “libgtop” the process list and each process’s state, memory, CPU time and disk I/O are read through libgtop, several files per process per refresh. With “collector” they come from the monitor’s own collector library, which reads each process’s files once per refresh and works out CPU and disk rates from two consecutive readings. The collector reports a memory figure as unknown (“—”) when the kernel did not provide it, and measures CPU share from the scheduler’s run time rather than from clock ticks. Takes effect at the next refresh.</description>
+    </key>
+
     <key name="current-tab" type="s">
       <choices>
         <choice value="resources"/>

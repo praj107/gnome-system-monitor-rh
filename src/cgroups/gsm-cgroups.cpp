@@ -186,3 +186,18 @@ gsm_cgroups_get_name (pid_t pid)
 
   return g_strdup (get_process_cgroup_string (pid));
 }
+
+
+char *
+gsm_cgroups_name_from_path (const char *path,
+                            gsize       path_len)
+{
+  g_return_val_if_fail (path != NULL || path_len == 0, NULL);
+
+  // make_parsed_cgroup_line: the root group has no name, and a cgroup v2
+  // line carries no controller list, so the name is the path itself.
+  if (path_len == 0 || (path_len == 1 && path[0] == '/'))
+    return g_strdup ("");
+
+  return g_strndup (path, path_len);
+}

@@ -15,6 +15,7 @@ struct LoadGraph;
 #include "prettytable.h"
 #include "procinfo.h"
 #include "proclist.h"
+#include "procsource.h"
 #include "smooth_refresh.h"
 #include "util.h"
 
@@ -107,6 +108,8 @@ public:
   GMenuModel *process_window_menu_model;
 
   ProcList processes;
+  // the collector behind the Processes tab; opened on first use, NULL until then
+  GsmProcSource *proc_source;
   ProcConfig config;
   PrettyTable *pretty_table;
   GsmTreeView *tree;

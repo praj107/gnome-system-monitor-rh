@@ -23,6 +23,11 @@ struct MutableProcInfo
     memwritable (0UL),
     mem (0UL),
     start_time (0UL),
+    vmsize_known (true),
+    memres_known (true),
+    memshared_known (true),
+    mem_known (true),
+    start_time_known (true),
     cpu_time (0ULL),
     disk_read_bytes_total (0ULL),
     disk_write_bytes_total (0ULL),
@@ -59,6 +64,14 @@ struct MutableProcInfo
   gulong mem;
 
   gulong start_time;
+  // The libgtop path always has these figures; the collector path leaves one
+  // unknown (shown as "—", left out of the totals) when the kernel did not
+  // provide the counters it is made of.
+  bool vmsize_known;
+  bool memres_known;
+  bool memshared_known;
+  bool mem_known;
+  bool start_time_known;
   guint64 cpu_time;
   guint64 disk_read_bytes_total;
   guint64 disk_write_bytes_total;

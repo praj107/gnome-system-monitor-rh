@@ -387,6 +387,7 @@ GsmApplication::GsmApplication()
   stack (NULL),
   app_menu_button (NULL),
 
+  proc_source (NULL),
   config (),
   pretty_table (NULL),
   tree (NULL),
@@ -534,6 +535,8 @@ GsmApplication::shutdown ()
     g_source_remove (timeout);
 
   proctable_free_table (this);
+  gsm_proc_source_free (proc_source);
+  proc_source = NULL;
   delete smooth_refresh;
   delete pretty_table;
 

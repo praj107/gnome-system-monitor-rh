@@ -22,6 +22,7 @@
 #define GSM_SETTING_RESOURCES_GPU_EXPANDED  "resources-gpu-expanded"
 #define GSM_SETTING_PROCESS_UPDATE_INTERVAL "update-interval"
 #define GSM_SETTING_SHOW_WHOSE_PROCESSES    "show-whose-processes"
+#define GSM_SETTING_PROCESS_SOURCE          "process-source"
 #define GSM_SETTING_SHOW_DEPENDENCIES       "show-dependencies"
 #define GSM_SETTING_SHOW_KILL_DIALOG        "kill-dialog"
 #define GSM_SETTING_SOLARIS_MODE            "solaris-mode"

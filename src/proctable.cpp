@@ -38,10 +38,12 @@
 #include <sys/stat.h>
 #include <pwd.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <set>
 #include <list>
 #include <map>
+#include <vector>
 
 #include "application.h"
 #include "proctable.h"
@@ -50,6 +52,7 @@
 #include "interface.h"
 #include "nvml.h"
 #include "procinfo.h"
+#include "procsource.h"
 #include "cpurate.h"
 #include "gsm-selinux.h"
 #include "settings-keys.h"
@@ -1068,6 +1071,25 @@ update_disk_io (ProcInfo             *info,
   info->disk_write_bytes_total = procio.disk_wbytes;
 }
 
+// Each figure is known only when NVML reported it for this process; a
+// process absent from NVML's lists is "not reported", not 0.
+static void
+update_gpu_figures (ProcInfo *info)
+{
+  info->gpu_percent = 0.0;
+  info->gpu_percent_known = false;
+  info->gpu_mem = 0;
+  info->gpu_mem_known = false;
+  auto gpu_it = gpu_process_usage.find (info->pid);
+  if (gpu_it != gpu_process_usage.end ())
+    {
+      info->gpu_percent_known = gpu_it->second.util_known;
+      info->gpu_percent = gpu_it->second.util_known ? gpu_it->second.util_percent : 0.0;
+      info->gpu_mem_known = gpu_it->second.mem_known;
+      info->gpu_mem = gpu_it->second.mem_known ? gpu_it->second.mem_bytes : 0;
+    }
+}
+
 static void
 update_info (GsmApplication *app,
              ProcInfo       *info)
@@ -1089,6 +1111,8 @@ update_info (GsmApplication *app,
   glibtop_get_proc_io (&procio, info->pid);
 
   get_process_memory_info (info);
+  info->vmsize_known = info->memres_known = info->memshared_known = info->mem_known = true;
+  info->start_time_known = true;
 
   info->set_user (procstate.uid);
 
@@ -1147,20 +1171,87 @@ update_info (GsmApplication *app,
   info->num_threads = get_process_thread_count (info->pid);
   info->process_type = get_process_type (info);
 
-  // Each figure is known only when NVML reported it for this process; a
-  // process absent from NVML's lists is "not reported", not 0.
-  info->gpu_percent = 0.0;
-  info->gpu_percent_known = false;
-  info->gpu_mem = 0;
-  info->gpu_mem_known = false;
-  auto gpu_it = gpu_process_usage.find (info->pid);
-  if (gpu_it != gpu_process_usage.end ())
+  update_gpu_figures (info);
+}
+
+
+/* The same row from one record of the collector: no per-process libgtop
+ * call. The once-per-process reads of the ProcInfo constructor (name,
+ * arguments, SELinux context) and the systemd lookups stay as they are.
+ * wchan is read, through libgtop, only while its column is visible. */
+static void
+update_info_from_collector (ProcInfo             *info,
+                            const GsmProcFigures &figures,
+                            bool                  wchan_visible)
+{
+  if (wchan_visible)
     {
-      info->gpu_percent_known = gpu_it->second.util_known;
-      info->gpu_percent = gpu_it->second.util_known ? gpu_it->second.util_percent : 0.0;
-      info->gpu_mem_known = gpu_it->second.mem_known;
-      info->gpu_mem = gpu_it->second.mem_known ? gpu_it->second.mem_bytes : 0;
+      glibtop_proc_kernel prockernel;
+
+      glibtop_get_proc_kernel (&prockernel, info->pid);
+      info->wchan = get_proc_kernel_wchan (prockernel);
     }
+  else
+    {
+      info->wchan.clear ();
+    }
+
+  info->status = figures.status;
+  if (figures.uid_known)
+    info->set_user (figures.uid);
+
+  info->vmsize_known = figures.vmsize_known;
+  info->vmsize = figures.vmsize_known ? figures.vmsize_bytes : 0;
+  info->memres_known = figures.memres_known;
+  info->memres = figures.memres_known ? figures.memres_bytes : 0;
+  info->memshared_known = figures.memshared_known;
+  info->memshared = figures.memshared_known ? figures.memshared_bytes : 0;
+  info->mem_known = figures.mem_known;
+  info->mem = figures.mem_known ? figures.mem_bytes : 0;
+
+  info->cpu_known = figures.cpu_known;
+  info->pcpu = figures.cpu_known ? figures.cpu_percent : 0.0;
+
+  // if the cpu time has increased reset the status to running
+  // regardless of kernel state (#606579)
+  if (figures.cpu_known && figures.cpu_percent > 0.0)
+    info->status = GLIBTOP_PROCESS_RUNNING;
+
+  // The rate baseline of this path is the collector's previous snapshot, not
+  // the ProcInfo; the libgtop path starts a new baseline if it takes over.
+  info->cpu_baseline_valid = false;
+  info->cpu_time = figures.cpu_time_ticks;
+  info->start_time_known = figures.start_time_known;
+  info->start_time = figures.start_time_known ? figures.start_time_s : 0;
+  info->nice = figures.nice;
+  info->num_threads = figures.num_threads;
+
+  info->io_readable = figures.io_readable;
+  info->io_rate_valid = figures.io_readable && figures.io_rate_valid;
+  info->disk_read_bytes_total = figures.io_readable ? figures.disk_read_bytes : 0;
+  info->disk_write_bytes_total = figures.io_readable ? figures.disk_write_bytes : 0;
+  info->disk_read_bytes_current = info->io_rate_valid ? figures.disk_read_bytes_per_s : 0;
+  info->disk_write_bytes_current = info->io_rate_valid ? figures.disk_write_bytes_per_s : 0;
+
+  // set the ppid only if one can exist
+  // i.e. pid=0 can never have a parent
+  if (info->pid > 0)
+    info->ppid = figures.ppid;
+
+  g_assert (info->pid != info->ppid);
+  g_assert (info->ppid != -1 || info->pid == 0);
+
+  if (figures.cgroup_path != NULL)
+    info->cgroup_name = make_string (gsm_cgroups_name_from_path (figures.cgroup_path,
+                                                                 figures.cgroup_path_len));
+  else
+    info->cgroup_name.clear ();
+
+  gsm_proc_info_load_systemd (info);
+
+  info->process_type = get_process_type (info);
+
+  update_gpu_figures (info);
 }
 
 
@@ -1261,12 +1352,17 @@ proctable_refresh_summary_headers(GsmApplication * app)
     if (!proc)
       return;
 
-    total_mem += proc->mem;
+    // an unknown memory figure (collector path) is left out of the sum, not added as 0
+    if (proc->mem_known)
+      total_mem += proc->mem;
     if (proc->cpu_known)
       total_cpu += round(proc->pcpu * 10.0f) / 10.0f;
-    total_memres += proc->memres;
-    total_vmsize += proc->vmsize;
-    total_memshared += proc->memshared;
+    if (proc->memres_known)
+      total_memres += proc->memres;
+    if (proc->vmsize_known)
+      total_vmsize += proc->vmsize;
+    if (proc->memshared_known)
+      total_memshared += proc->memshared;
     total_memwritable += proc->memwritable;
     process_count++;
     if (proc->io_readable)
@@ -1367,10 +1463,14 @@ proctable_refresh_summary_headers(GsmApplication * app)
   g_list_free(columns);
 }
 
+// `figures` is NULL when the rows are filled through libgtop, else one entry
+// per pid of pid_list (same order) from the collector.
 static void
-refresh_list (GsmApplication *app,
-              const pid_t    *pid_list,
-              const guint     n)
+refresh_list (GsmApplication       *app,
+              const pid_t          *pid_list,
+              const guint           n,
+              const GsmProcFigures *figures,
+              bool                  wchan_visible)
 {
   typedef std::list<ProcInfo*> ProcList;
   ProcList addition;
@@ -1391,7 +1491,10 @@ refresh_list (GsmApplication *app,
           addition.push_back (info);
         }
 
-      update_info (app, info);
+      if (figures != NULL)
+        update_info_from_collector (info, figures[i], wchan_visible);
+      else
+        update_info (app, info);
     }
 
 
@@ -1500,45 +1603,130 @@ refresh_list (GsmApplication *app,
     update_info_mutable_cols (&v.second);
 }
 
+// Whether the column sorted by `column_id` is shown: only then is its
+// figure worth reading when reading it costs a file per process.
+static bool
+column_is_visible (GsmApplication *app,
+                   gint            column_id)
+{
+  bool visible = false;
+  GList *columns = gtk_tree_view_get_columns (GTK_TREE_VIEW (app->tree));
+
+  for (GList *it = columns; it; it = it->next)
+    {
+      GtkTreeViewColumn *column = static_cast<GtkTreeViewColumn *>(it->data);
+
+      if (gtk_tree_view_column_get_sort_column_id (column) == column_id)
+        visible = gtk_tree_view_column_get_visible (column);
+    }
+  g_list_free (columns);
+  return visible;
+}
+
+// Figures for the selected processes from the collector, sorted by pid, or
+// 0 with *figures NULL when the collector could not be used this refresh
+// (the caller then reads through libgtop).
+static guint
+read_figures_from_collector (GsmApplication  *app,
+                             GsmProcWhose     whose,
+                             GsmProcFigures **figures)
+{
+  static bool warned = false;
+
+  *figures = NULL;
+
+  if (app->proc_source == NULL)
+    app->proc_source = gsm_proc_source_new (NULL);
+
+  if (app->proc_source == NULL || !gsm_proc_source_sample (app->proc_source))
+    {
+      if (!warned)
+        g_warning ("The process collector could not read /proc; the Processes tab reads through libgtop instead.");
+      warned = true;
+      return 0;
+    }
+
+  return gsm_proc_source_figures (app->proc_source, whose, getuid (),
+                                  MAX (app->config.num_cpus, 1),
+                                  app->config.solaris_mode, figures);
+}
+
 void
 proctable_update (GsmApplication *app)
 {
-  pid_t*pid_list;
+  pid_t*pid_list = NULL;
   glibtop_proclist proclist;
   glibtop_cpu cpu;
   int which = 0;
   int arg = 0;
   auto whose_processes = app->settings->get_string (GSM_SETTING_SHOW_WHOSE_PROCESSES);
+  const bool collector_wanted = app->settings->get_string (GSM_SETTING_PROCESS_SOURCE) == "collector";
+
+  GsmProcWhose whose = GSM_PROC_WHOSE_ALL;
 
   if (whose_processes == "all")
     {
       which = GLIBTOP_KERN_PROC_ALL;
       arg = 0;
+      whose = GSM_PROC_WHOSE_ALL;
     }
   else if (whose_processes == "active")
     {
       which = GLIBTOP_KERN_PROC_ALL | GLIBTOP_EXCLUDE_IDLE;
       arg = 0;
+      whose = GSM_PROC_WHOSE_ACTIVE;
     }
   else if (whose_processes == "user")
     {
       which = GLIBTOP_KERN_PROC_UID;
       arg = getuid ();
+      whose = GSM_PROC_WHOSE_USER;
     }
 
-  pid_list = glibtop_get_proclist (&proclist, which, arg);
+  GsmProcFigures *figures = NULL;
+  std::vector<pid_t> collector_pids;
+  guint n = 0;
+  bool wchan_visible = false;
 
-  /* FIXME: total cpu time elapsed should be calculated on an individual basis here
-  ** should probably have a total_time_last gint in the ProcInfo structure */
-  glibtop_get_cpu (&cpu);
-  app->cpu_total_time = MAX (cpu.total - app->cpu_total_time_last, 1);
-  app->cpu_total_time_last = cpu.total;
+  if (collector_wanted)
+    {
+      n = read_figures_from_collector (app, whose, &figures);
+      collector_pids.reserve (n);
+      for (guint i = 0; i < n; i++)
+        collector_pids.push_back (figures[i].pid);
+      wchan_visible = column_is_visible (app, COL_WCHAN);
+    }
+  else if (app->proc_source != NULL)
+    {
+      // The baseline would be stale if the collector took over again later.
+      gsm_proc_source_reset (app->proc_source);
+    }
 
-  // FIXME: not sure if glibtop always returns a sorted list of pid
-  // but it is important otherwise refresh_list won't find the parent
-  std::sort (pid_list, pid_list + proclist.number);
-  update_gpu_process_usage (gpu_process_usage);
-  refresh_list (app, pid_list, proclist.number);
+  if (figures != NULL)
+    {
+      // the collector's snapshot is the baseline: nothing to read from libgtop
+      pid_list = collector_pids.data ();
+      update_gpu_process_usage (gpu_process_usage);
+      refresh_list (app, pid_list, n, figures, wchan_visible);
+      pid_list = NULL;
+    }
+  else
+    {
+      pid_list = glibtop_get_proclist (&proclist, which, arg);
+
+      /* FIXME: total cpu time elapsed should be calculated on an individual basis here
+      ** should probably have a total_time_last gint in the ProcInfo structure */
+      glibtop_get_cpu (&cpu);
+      app->cpu_total_time = MAX (cpu.total - app->cpu_total_time_last, 1);
+      app->cpu_total_time_last = cpu.total;
+
+      // FIXME: not sure if glibtop always returns a sorted list of pid
+      // but it is important otherwise refresh_list won't find the parent
+      std::sort (pid_list, pid_list + proclist.number);
+      update_gpu_process_usage (gpu_process_usage);
+      refresh_list (app, pid_list, proclist.number, NULL, false);
+    }
+  g_free (figures);
 
   // juggling with tree scroll position to fix https://bugzilla.gnome.org/show_bug.cgi?id=92724
   GtkTreePath*current_top;
