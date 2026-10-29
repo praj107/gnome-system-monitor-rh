@@ -38,6 +38,7 @@ struct ProcConfig
     bg_color (),
     frame_color (),
     num_cpus (0),
+    num_cpu_slots (0),
     solaris_mode (false),
     process_memory_in_iec (true),
     logarithmic_scale (false),
@@ -65,7 +66,10 @@ struct ProcConfig
   GdkRGBA gpu_mem_color;
   GdkRGBA bg_color;
   GdkRGBA frame_color;
-  gint num_cpus;
+  gint num_cpus;       /* online CPUs: the CPU % scale of a process */
+  gint num_cpu_slots;  /* highest present CPU number + 1: slots of the CPU
+                        * graph, its labels and colours (offline CPUs keep
+                        * theirs and show no sample) */
   bool solaris_mode;
   bool process_memory_in_iec;
   bool logarithmic_scale;

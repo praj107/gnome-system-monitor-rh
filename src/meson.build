@@ -22,8 +22,10 @@ system_monitor_sources = [
   'cputopology.c',
   'cpurate.c',
   'diskstats.c',
+  'graphscale.c',
   'netif.c',
   'nvml.c',
+  'procstat.c',
   'psi.c',
   'memmaps.cpp',
   'open-file.cpp',
@@ -118,6 +120,7 @@ gsm_gsettings = gnome.mkenums('org.gnome.gnome-system-monitor.enums.xml',
 
 # dlopen of the NVIDIA management library (a separate library before glibc 2.34)
 dl_dep = meson.get_compiler('c').find_library('dl', required: false)
+m_dep = meson.get_compiler('c').find_library('m', required: false)
 
 system_monitor_dependencies = [
   glibmm,
@@ -183,6 +186,29 @@ test(
     dependencies: [glib],
   ),
   args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
+)
+
+test(
+  'procstat',
+  executable(
+    'test-procstat',
+    ['procstat.c', 'tests/test-procstat.c'],
+    include_directories: rootInclude,
+    dependencies: [glib],
+  ),
+  args: [meson.current_source_dir() / 'tests' / 'fixtures'],
+  protocol: 'tap',
+)
+
+test(
+  'graphscale',
+  executable(
+    'test-graphscale',
+    ['graphscale.c', 'tests/test-graphscale.c'],
+    include_directories: rootInclude,
+    dependencies: [glib, m_dep],
+  ),
   protocol: 'tap',
 )
 

@@ -13,6 +13,7 @@
 
 #include "application.h"
 #include "procdialogs.h"
+#include "procstat.h"
 #include "prefsdialog.h"
 #include "interface.h"
 #include "proctable.h"
@@ -175,9 +176,9 @@ apply_cpu_color_settings (Gio::Settings& settings,
 
   g_variant_builder_init (&builder, G_VARIANT_TYPE_ARRAY);
 
-  std::vector<std::string> random_colors = procman::generate_colors (app->config.num_cpus);
+  std::vector<std::string> random_colors = procman::generate_colors (app->config.num_cpu_slots);
 
-  for (guint i = 0; i < static_cast<guint>(app->config.num_cpus); i++)
+  for (guint i = 0; i < static_cast<guint>(app->config.num_cpu_slots); i++)
     {
       if (i < n)
         {
@@ -196,7 +197,7 @@ apply_cpu_color_settings (Gio::Settings& settings,
     }
   full = g_variant_builder_end (&builder);
   // if the user has more cores than colors stored in the gsettings, store the newly built gvariant in gsettings
-  if (n < static_cast<guint>(app->config.num_cpus))
+  if (n < static_cast<guint>(app->config.num_cpu_slots))
     g_settings_set_value (settings.gobj (), GSM_SETTING_CPU_COLORS, full);
   else
     g_variant_unref (full);
@@ -212,7 +213,7 @@ cb_color_changed (Gio::Settings& settings,
   if (key == GSM_SETTING_CPU_COLORS)
     {
       apply_cpu_color_settings (settings, app);
-      for (int i = 0; i < app->config.num_cpus; i++)
+      for (int i = 0; i < app->config.num_cpu_slots; i++)
         if (!gdk_rgba_equal (&app->cpu_graph->colors[i], &app->config.cpu_color[i]))
           {
             app->cpu_graph->colors[i] = app->config.cpu_color[i];
@@ -336,6 +337,10 @@ GsmApplication::load_settings ()
   // Not glibtop_get_sysinfo (): it runs `lscpu` to fill in model names this
   // program never shows. The online CPUs are the ones /proc/stat lists.
   config.num_cpus = MAX (sysconf (_SC_NPROCESSORS_ONLN), 1);
+  // The graph needs a slot for every present CPU number, offline ones
+  // included, or the highest-numbered CPUs have none.
+  config.num_cpu_slots = CLAMP ((gint) gsm_cpu_slot_count ("/sys", config.num_cpus),
+                                config.num_cpus, GLIBTOP_NCPU);
 
   apply_cpu_color_settings (*this->settings.operator-> (), this);
 

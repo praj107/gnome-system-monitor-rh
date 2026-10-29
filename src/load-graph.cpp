@@ -13,10 +13,12 @@
 
 #include "application.h"
 #include "diskstats.h"
+#include "graphscale.h"
 #include "load-graph.h"
 #include "meminfo.h"
 #include "netif.h"
 #include "nvml.h"
+#include "procstat.h"
 #include "psi.h"
 #include "util.h"
 #include "legacy/gsm_color_button.h"
@@ -57,11 +59,11 @@ LoadGraph::get_caption (guint index)
     max_value = 100;
 
   // operation orders matters so it's 0 if index == num_bars
-  float caption_percentage = (float)max_value - index * (float)max_value / this->num_bars;
+  double caption_percentage = (double) max_value - index * (double) max_value / this->num_bars;
 
   if (this->is_logarithmic_scale ())
     {
-      float caption_value = caption_percentage == 0 ? 0 : pow (100, caption_percentage / max_value);
+      double caption_value = caption_percentage == 0 ? 0 : pow (100, caption_percentage / max_value);
       // Translators: loadgraphs y axis percentage labels: 0 %, 50%, 100%
       caption = g_strdup_printf (_("%.0f %%"), caption_value);
     }
@@ -554,72 +556,64 @@ update_pressure_label (LoadGraph  *graph,
   g_free (tooltip);
 }
 
+/* Busy % of each CPU from /proc/stat (see procstat.h for the definition).
+ * Graph slot i is kernel CPU number i: an offline CPU has no line in the
+ * file and so no sample, rather than showing a different CPU's figure. The
+ * first refresh, a counter that went backwards and a failed read are also
+ * "no sample": the label shows "—" and no point is drawn. */
 static void
 get_load (LoadGraph *graph)
 {
-  guint i;
-  glibtop_cpu cpu;
+  GsmCpuTicks machine;
+  std::vector<GsmCpuTicks> now (graph->n);
 
-  glibtop_get_cpu (&cpu);
+  // a stopped and restarted graph has a stale previous reading
+  if (graph->iteration == 1)
+    std::fill (graph->cpu.last.begin (), graph->cpu.last.end (), GsmCpuTicks {});
 
-  auto NOW = [&]() -> guint64 (&)[GLIBTOP_NCPU][N_CPU_STATES] {
-               return graph->cpu.times[graph->cpu.now];
-             };
-  auto LAST = [&]() -> guint64 (&)[GLIBTOP_NCPU][N_CPU_STATES] {
-                return graph->cpu.times[graph->cpu.now ^ 1];
-              };
-
+  gsm_procstat_read ("/proc/stat", &machine, now.data (), graph->n);
+  // a single graph is the whole machine, whichever CPUs are online
   if (graph->n == 1)
-    {
-      NOW ()[0][CPU_TOTAL] = cpu.total;
-      NOW ()[0][CPU_USED] = cpu.user + cpu.nice + cpu.sys;
-    }
-  else
-    {
-      for (i = 0; i < graph->n; i++)
-        {
-          NOW ()[i][CPU_TOTAL] = cpu.xcpu_total[i];
-          NOW ()[i][CPU_USED] = cpu.xcpu_user[i] + cpu.xcpu_nice[i]
-                                + cpu.xcpu_sys[i];
-        }
-    }
+    now[0] = machine;
 
-  // on the first call, LAST is 0
-  // which means data is set to the average load since boot
-  // that value has no meaning, we just want all the
-  // graphs to be aligned, so the CPU graph needs to start
-  // immediately
   bool drawStacked = graph->type == LOAD_GRAPH_CPU && GsmApplication::get ().config.draw_stacked;
+  guint n_known = 0;
 
-  if(graph->iteration != 1) {
-    for (i = 0; i < graph->n; i++)
-      {
-        float load;
-        float total, used;
-        gchar *text;
+  for (guint i = 0; i < graph->n; i++)
+    {
+      double percent = 0.0;
+      bool known = gsm_cpu_ticks_busy_percent (&graph->cpu.last[i], &now[i], &percent);
+      gchar *text;
 
-        total = NOW ()[i][CPU_TOTAL] - LAST ()[i][CPU_TOTAL];
-        used = NOW ()[i][CPU_USED] - LAST ()[i][CPU_USED];
+      if (known)
+        n_known++;
+      graph->cpu.last[i] = now[i];
 
-        load = used / MAX (total, 1.0f);
+      if (drawStacked)
+        {
+          // an unknown CPU adds nothing to the stack
+          graph->data[0][i] = known ? percent / 100.0 / graph->n : 0.0;
+          if (i > 0)
+            graph->data[0][i] += graph->data[0][i - 1];
+        }
+      else
+        {
+          graph->data[0][i] = known ? percent / 100.0 : -1.0;
+        }
 
-        graph->data[0][i] = load;
-        if (drawStacked)
-          {
-            graph->data[0][i] /= graph->n;
-            if (i > 0)
-              graph->data[0][i] += graph->data[0][i - 1];
-          }
-
-        /* Update label */
+      if (known)
         // Translators: CPU usage percentage label: 95.7%
-        text = g_strdup_printf (_("%.1f%%"), load * 100.0f);
-        gtk_label_set_text (GTK_LABEL (graph->labels.cpu[i]), text);
-        g_free (text);
-      }
-  }
+        text = g_strdup_printf (_("%.1f%%"), percent);
+      else
+        text = g_strdup (_("—"));
+      gtk_label_set_text (GTK_LABEL (graph->labels.cpu[i]), text);
+      g_free (text);
+    }
 
-  graph->cpu.now ^= 1;
+  // nothing known yet (first refresh): draw no point rather than an empty stack
+  if (drawStacked && n_known == 0)
+    for (guint i = 0; i < graph->n; i++)
+      graph->data[0][i] = -1.0;
 
   update_pressure_label (graph, "/proc/pressure/cpu", _("CPU"), false);
 }
@@ -744,148 +738,53 @@ get_memory (LoadGraph *graph)
   update_pressure_label (graph, "/proc/pressure/memory", _("memory"), true);
 }
 
-/* Nice Numbers for Graph Labels after Paul Heckbert
-   nicenum: find a "nice" number approximately equal to x.
-   Round the number if round=1, take ceiling if round=0    */
-
-static double
-nicenum (double x,
-         int    round)
+/* Record this refresh's peak rate in the history ring (64-bit: a drive can
+ * read faster than 4 GiB/s) and rescale the graph when the round maximum
+ * (graphscale.h) moves. The history slot of this refresh is the one before
+ * `latest`. */
+static void
+store_rate_history (LoadGraph            *graph,
+                    std::vector<guint64> *values,
+                    guint64               peak_per_s)
 {
-  int expv;                  /* exponent of x */
-  double f;                  /* fractional part of x */
-  double nf;                  /* nice, rounded fraction */
-
-  expv = floor (log10 (x));
-  f = x / pow (10.0, expv);       /* between 1 and 10 */
-  if (round)
-    {
-      if (f < 1.5)
-        nf = 1.0;
-      else if (f < 3.0)
-        nf = 2.0;
-      else if (f < 7.0)
-        nf = 5.0;
-      else
-        nf = 10.0;
-    }
-  else
-    {
-      if (f <= 1.0)
-        nf = 1.0;
-      else if (f <= 2.0)
-        nf = 2.0;
-      else if (f <= 5.0)
-        nf = 5.0;
-      else
-        nf = 10.0;
-    }
-  return nf * pow (10.0, expv);
+  values->at (graph->latest == 0 ? graph->num_points - 1 : graph->latest - 1) = peak_per_s;
 }
 
 static void
-dynamic_scale (LoadGraph             *graph,
-               std::vector<unsigned> *values,
-               guint64               *max,
-               guint64                din,
-               guint64                dout,
-               gboolean               in_bits)
+dynamic_scale (LoadGraph            *graph,
+               std::vector<guint64> *values,
+               guint64              *max,
+               guint64               din,
+               guint64               dout,
+               gboolean              in_bits)
 {
-  graph->data[0][0] = 1.0f * din / *max;
-  graph->data[0][1] = 1.0f * dout / *max;
+  graph->data[0][0] = (double) din / (double) *max;
+  graph->data[0][1] = (double) dout / (double) *max;
 
-  guint64 dmax = std::max (din, dout);
+  store_rate_history (graph, values, std::max (din, dout));
 
-  if (graph->latest == 0)
-    values->at (graph->num_points - 1) = dmax;
-  else
-    values->at (graph->latest - 1) = dmax;
+  // the tick size is unknown until the graph has been laid out
+  if (in_bits && graph->num_bars == 0)
+    return;
 
-  guint64 new_max;
-  // both way, new_max is the greatest value
-  if (dmax >= *max)
-    new_max = dmax;
-  else
-    new_max = *std::max_element (&values->at (0),
-                                 &values->at (graph->num_points - 1));
-
-  //
-  // Round maximum
-  //
-
-  const guint64 bak_max (new_max);
-
-  if (in_bits)
-    {
-      // nice number is for the ticks
-      unsigned ticks = graph->num_bars;
-
-      if (graph->num_bars == 0)
-        return;
-
-      // gets messy at low values due to division by 8
-      guint64 bit_max = std::max (new_max * 8, G_GUINT64_CONSTANT (10000));
-
-      // our tick size leads to max
-      double d = nicenum (bit_max / ticks, 0);
-      bit_max = ticks * d;
-      new_max = bit_max / 8;
-
-      procman_debug ("bak*8 %" G_GUINT64_FORMAT ", ticks %d, d %f"
-                     ", bit_max %" G_GUINT64_FORMAT ", new_max %" G_GUINT64_FORMAT,
-                     bak_max * 8, ticks, d, bit_max, new_max);
-    }
-  else
-    {
-      // round up to get some extra space
-      // yes, it can overflow
-      new_max = 1.1 * new_max;
-      // make sure max is not 0 to avoid / 0
-      // default to 1 KiB
-      new_max = std::max (new_max, G_GUINT64_CONSTANT (1024));
-
-      // decompose new_max = coef10 * 2**(base10 * 10)
-      // where coef10 and base10 are integers and coef10 < 2**10
-      //
-      // e.g: ceil(100.5 KiB) = 101 KiB = 101 * 2**(1 * 10)
-      //      where base10 = 1, coef10 = 101, pow2 = 16
-
-      guint64 pow2 = std::floor (log2 (new_max));
-      guint64 base10 = pow2 / 10.0;
-      guint64 coef10 = std::ceil (new_max / double (G_GUINT64_CONSTANT (1) << (base10 * 10)));
-      g_assert (new_max <= (coef10 * (G_GUINT64_CONSTANT (1) << (base10 * 10))));
-
-      // then decompose coef10 = x * 10**factor10
-      // where factor10 is integer and x < 10
-      // so we new_max has only 1 significant digit
-
-      guint64 factor10 = std::pow (10.0, std::floor (std::log10 (coef10)));
-      coef10 = std::ceil (coef10 / double (factor10)) * factor10;
-
-      new_max = coef10 * (G_GUINT64_CONSTANT (1) << guint64 (base10 * 10));
-      procman_debug ("bak %" G_GUINT64_FORMAT " new_max %" G_GUINT64_FORMAT
-                     "pow2 %" G_GUINT64_FORMAT " coef10 %" G_GUINT64_FORMAT,
-                     bak_max, new_max, pow2, coef10);
-    }
+  const guint64 new_max = gsm_graph_scale_next (values->data (), values->size (), *max,
+                                                in_bits, graph->num_bars);
 
   // if max is the same or has decreased but not so much, don't
   // do anything to avoid rescaling
-  if ((0.8 * graph->net.max) < new_max && new_max <= graph->net.max)
+  if (new_max == *max)
     return;
 
-  const double scale = 1.0f * *max / new_max;
+  const double scale = (double) *max / (double) new_max;
 
   for (size_t i = 0; i < graph->num_points; i++)
-    if (graph->data[i][0] >= 0.0f)
-      {
-        graph->data[i][0] *= scale;
-        graph->data[i][1] *= scale;
-      }
+    for (guint j = 0; j < 2; j++)
+      if (graph->data[i][j] >= 0.0)
+        graph->data[i][j] *= scale;
 
-  procman_debug ("rescale dmax = %" G_GUINT64_FORMAT
-                 " max = %" G_GUINT64_FORMAT
+  procman_debug ("rescale max = %" G_GUINT64_FORMAT
                  " new_max = %" G_GUINT64_FORMAT,
-                 dmax, *max, new_max);
+                 *max, new_max);
 
   *max = new_max;
 
@@ -908,41 +807,46 @@ get_hash64 (const gchar*c_str)
   return hash;
 }
 
+/* One refresh of a rate graph. The rate is the change of the cumulative
+ * counters over the measured time since the previous refresh, in doubles.
+ * It is "no sample" (a "—" label, no point drawn) on the first refresh, when
+ * a counter went backwards (interface removed, counters reset), when the set
+ * of devices changed or when the clock did not advance; the totals are
+ * shown whenever the counters were read. */
 static void
-handle_dynamic_max_value (LoadGraph             *graph,
-                          std::vector<unsigned> *values,
-                          guint64               *max,
-                          guint64               *last_in,
-                          guint64               *last_out,
-                          guint64                in,
-                          guint64                out,
-                          guint64               *graph_time,
-                          guint64                hash,
-                          guint64               *graph_hash,
-                          gboolean               in_bits,
-                          gboolean               totals_in_bits,
-                          GtkLabel              *label_in,
-                          GtkLabel              *label_out,
-                          GtkLabel              *label_in_total,
-                          GtkLabel              *label_out_total)
+handle_dynamic_max_value (LoadGraph            *graph,
+                          std::vector<guint64> *values,
+                          guint64              *max,
+                          guint64              *last_in,
+                          guint64              *last_out,
+                          guint64               in,
+                          guint64               out,
+                          guint64              *graph_time,
+                          guint64               hash,
+                          guint64              *graph_hash,
+                          gboolean              in_bits,
+                          gboolean              totals_in_bits,
+                          GtkLabel             *label_in,
+                          GtkLabel             *label_out,
+                          GtkLabel             *label_in_total,
+                          GtkLabel             *label_out_total)
 {
   guint64 time = g_get_monotonic_time ();
-  guint64 din, dout;
+  guint64 din = 0, dout = 0;
 
-  if (in >= *last_in && out >= *last_out &&
-      (graph_hash == NULL || hash == *graph_hash) &&
-      *graph_time != 0)
+  // a stopped and restarted graph has a stale previous reading
+  if (graph->iteration == 1)
+    *graph_time = 0;
+
+  const bool have_rate = in >= *last_in && out >= *last_out
+                         && (graph_hash == NULL || hash == *graph_hash)
+                         && *graph_time != 0 && time > *graph_time;
+
+  if (have_rate)
     {
-      float dtime = ((double) (time - *graph_time)) / G_USEC_PER_SEC;
-      din = static_cast<guint64>((in - *last_in) / dtime);
-      dout = static_cast<guint64>((out - *last_out) / dtime);
-    }
-  else
-    {
-      /* Don't calc anything if new data is less than old (interface
-         removed, counters reset, ...) or if it is the first time */
-      din = 0;
-      dout = 0;
+      const double dtime = (double) (time - *graph_time) / G_USEC_PER_SEC;
+      din = static_cast<guint64>((double) (in - *last_in) / dtime);
+      dout = static_cast<guint64>((double) (out - *last_out) / dtime);
     }
 
   *last_in = in;
@@ -951,12 +855,22 @@ handle_dynamic_max_value (LoadGraph             *graph,
   if (graph_hash != NULL)
     *graph_hash = hash;
 
-  dynamic_scale (graph, values, max, din, dout, in_bits);
+  if (have_rate)
+    {
+      dynamic_scale (graph, values, max, din, dout, in_bits);
+      gtk_label_set_text (GTK_LABEL (label_in), procman::format_rate (din, in_bits).c_str ());
+      gtk_label_set_text (GTK_LABEL (label_out), procman::format_rate (dout, in_bits).c_str ());
+    }
+  else
+    {
+      store_rate_history (graph, values, 0);
+      graph->data[0][0] = -1.0;
+      graph->data[0][1] = -1.0;
+      gtk_label_set_text (GTK_LABEL (label_in), _("—"));
+      gtk_label_set_text (GTK_LABEL (label_out), _("—"));
+    }
 
-  gtk_label_set_text (GTK_LABEL (label_in), procman::format_rate (din, in_bits).c_str ());
   gtk_label_set_text (GTK_LABEL (label_in_total), procman::format_volume (in, totals_in_bits).c_str ());
-
-  gtk_label_set_text (GTK_LABEL (label_out), procman::format_rate (dout, in_bits).c_str ());
   gtk_label_set_text (GTK_LABEL (label_out_total), procman::format_volume (out, totals_in_bits).c_str ());
 }
 
@@ -1008,15 +922,13 @@ get_net (LoadGraph *graph)
 
   g_strfreev (ifnames);
 
-  if(graph->iteration != 1) {
-    handle_dynamic_max_value (graph, &graph->net.values, &graph->net.max, &graph->net.last_in,
+  handle_dynamic_max_value (graph, &graph->net.values, &graph->net.max, &graph->net.last_in,
                             &graph->net.last_out, in, out, &graph->net.time,
                             hash, &graph->net.last_hash,
                             GsmApplication::get ().config.network_in_bits,
                             GsmApplication::get ().config.network_total_in_bits,
                             graph->labels.net_in, graph->labels.net_out,
                             graph->labels.net_in_total, graph->labels.net_out_total);
-  }
 }
 
 static void
@@ -1032,15 +944,25 @@ get_disk (LoadGraph *graph)
          bytes. A disk appearing or vanishing changes the device-set hash, and
          handle_dynamic_max_value then reports no rate for that interval
          instead of a spike. */
-      if (graph->iteration != 1)
-        handle_dynamic_max_value (graph, &graph->disk.values, &graph->disk.max, &graph->disk.last_read,
-                                  &graph->disk.last_write, totals.read_bytes, totals.written_bytes,
-                                  &graph->disk.time, totals.device_set_hash, &graph->disk.last_hash,
-                                  FALSE, FALSE, graph->labels.disk_read, graph->labels.disk_write,
-                                  graph->labels.disk_read_total, graph->labels.disk_write_total);
+      handle_dynamic_max_value (graph, &graph->disk.values, &graph->disk.max, &graph->disk.last_read,
+                                &graph->disk.last_write, totals.read_bytes, totals.written_bytes,
+                                &graph->disk.time, totals.device_set_hash, &graph->disk.last_hash,
+                                FALSE, FALSE, graph->labels.disk_read, graph->labels.disk_write,
+                                graph->labels.disk_read_total, graph->labels.disk_write_total);
     }
   else
-    g_warning_once ("Cannot read /proc/diskstats: the disk figures are unknown");
+    {
+      /* Unknown, not zero: no point is drawn, every figure reads "—", and the
+         next successful read has nothing to take a difference with. */
+      g_warning_once ("Cannot read /proc/diskstats: the disk figures are unknown");
+      store_rate_history (graph, &graph->disk.values, 0);
+      graph->data[0][0] = -1.0;
+      graph->data[0][1] = -1.0;
+      graph->disk.time = 0;
+      for (GtkLabel *label : { graph->labels.disk_read, graph->labels.disk_write,
+                               graph->labels.disk_read_total, graph->labels.disk_write_total })
+        gtk_label_set_text (label, _("—"));
+    }
 
   update_pressure_label (graph, "/proc/pressure/io", _("disk I/O"), true);
 }
@@ -1184,7 +1106,8 @@ LoadGraph::LoadGraph(guint type)
     {
       case LOAD_GRAPH_CPU:
         cpu = CPU {};
-        n = GsmApplication::get ().config.num_cpus;
+        n = GsmApplication::get ().config.num_cpu_slots;
+        cpu.last.assign (n, GsmCpuTicks {});
 
         for (guint i = 0; i < G_N_ELEMENTS (labels.cpu); ++i)
           labels.cpu[i] = make_tnum_label ();
@@ -1253,14 +1176,14 @@ LoadGraph::LoadGraph(guint type)
         break;
 
       case LOAD_GRAPH_NET:
-        net.values = std::vector<unsigned>(num_points);
+        net.values = std::vector<guint64>(num_points);
         colors[0] = GsmApplication::get ().config.net_in_color;
         colors[1] = GsmApplication::get ().config.net_out_color;
         gsm_graph_set_max_value (disp, this->net.max);
         break;
 
       case LOAD_GRAPH_DISK:
-        disk.values = std::vector<unsigned>(num_points);
+        disk.values = std::vector<guint64>(num_points);
         colors[0] = GsmApplication::get ().config.disk_read_color;
         colors[1] = GsmApplication::get ().config.disk_write_color;
         gsm_graph_set_max_value (disp, this->disk.max);

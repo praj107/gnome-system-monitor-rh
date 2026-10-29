@@ -5,6 +5,7 @@
 #include <glibtop/cpu.h>
 
 #include "gsm-graph.h"
+#include "procstat.h"
 #include "psi.h"
 #include "legacy/gsm_color_button.h"
 #include "util.h"
@@ -17,13 +18,6 @@ enum
   LOAD_GRAPH_NET,
   LOAD_GRAPH_DISK,
   LOAD_GRAPH_GPU
-};
-
-enum
-{
-  CPU_TOTAL,
-  CPU_USED,
-  N_CPU_STATES
 };
 
 struct LoadGraphLabels
@@ -85,10 +79,10 @@ struct LoadGraph
   /* union { */
   struct CPU
   {
-    guint now;     /* 0 -> current, 1 -> last
-                      now ^ 1 each time */
-    /* times[now], times[now ^ 1] is last */
-    guint64 times[2][GLIBTOP_NCPU][N_CPU_STATES];
+    /* The previous /proc/stat reading of each graph slot, slot i being kernel
+     * CPU number i (a single slot holds the whole machine). An entry that is
+     * not present yields no sample on the next refresh. */
+    std::vector<GsmCpuTicks> last;
   } cpu;
 
   struct NET
@@ -97,7 +91,7 @@ struct LoadGraph
     guint64 last_hash;
     guint64 time;
     guint64 max;
-    std::vector<unsigned> values;
+    std::vector<guint64> values;   /* bytes per second of each past refresh */
   } net;
 
   struct DISK
@@ -106,7 +100,7 @@ struct LoadGraph
     guint64 last_hash;
     guint64 time;
     guint64 max;
-    std::vector<unsigned> values;
+    std::vector<guint64> values;   /* bytes per second of each past refresh */
   } disk;
 
   /* The previous /proc/pressure reading, for the share of the refresh

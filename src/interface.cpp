@@ -281,19 +281,19 @@ create_sys_view (GsmApplication *app,
                    GTK_WIDGET (load_graph_get_widget (cpu_graph)));
 
   GtkGrid*cpu_table = GTK_GRID (gtk_builder_get_object (builder, "cpu_table"));
-  gint cols = 4 + app->config.num_cpus / 32;
-  gint rows = (app->config.num_cpus + cols - 1) / cols;
+  gint cols = 4 + app->config.num_cpu_slots / 32;
+  gint rows = (app->config.num_cpu_slots + cols - 1) / cols;
 
   int max_cpu_label_width = 0;
-  if (app->config.num_cpus >= 10)
-    for (i = 0; i < app->config.num_cpus; i++)
+  if (app->config.num_cpu_slots >= 10)
+    for (i = 0; i < app->config.num_cpu_slots; i++)
       {
-        int w = static_cast<int> (get_cpu_core_label (i, app->config.num_cpus).length ());
+        int w = static_cast<int> (get_cpu_core_label (i, app->config.num_cpu_slots).length ());
         if (w > max_cpu_label_width)
           max_cpu_label_width = w;
       }
 
-  for (i = 0; i < app->config.num_cpus; i++)
+  for (i = 0; i < app->config.num_cpu_slots; i++)
     {
       GtkBox *temp_hbox;
 
@@ -311,17 +311,17 @@ create_sys_view (GsmApplication *app,
       gtk_box_append (temp_hbox, GTK_WIDGET (color_picker));
       gtk_widget_set_size_request (GTK_WIDGET (color_picker), 32, -1);
 
-      label_text = g_strdup (get_cpu_core_label (i, app->config.num_cpus).c_str ());
+      label_text = g_strdup (get_cpu_core_label (i, app->config.num_cpu_slots).c_str ());
       title_text = g_strdup_printf (title_template, label_text);
       label = GTK_LABEL (gtk_label_new (label_text));
-      if (app->config.num_cpus >= 10)
+      if (app->config.num_cpu_slots >= 10)
         gtk_label_set_width_chars (label, max_cpu_label_width);
       gsm_color_button_set_title (color_picker, title_text);
       g_free (title_text);
       gtk_box_append (temp_hbox, GTK_WIDGET (label));
       g_free (label_text);
 
-      std::string cpu_tooltip = get_cpu_core_tooltip (i, app->config.num_cpus);
+      std::string cpu_tooltip = get_cpu_core_tooltip (i, app->config.num_cpu_slots);
       gtk_widget_set_tooltip_text (GTK_WIDGET (temp_hbox), cpu_tooltip.c_str ());
 
       cpu_label = make_tnum_label ();
