@@ -28,6 +28,7 @@ typedef struct {
   uint64_t bytes_written;
   int      percent_used;   /* -1 unknown       */
   int      temperature;    /* -1 unknown       */
+  int64_t  power_on_hours; /* -1 unknown       */
 } GsmHistoryPoint;
 
 /* One row of the blame chart: how much a named app wrote to one drive. */
@@ -143,6 +144,18 @@ gboolean     gsm_health_db_commit           (GsmHealthDb  *self,
  */
 gboolean     gsm_health_db_flush            (GsmHealthDb  *self,
                                              GError      **error);
+
+/*
+ * A small keyed value in the meta table (the journal cursor the sampler
+ * resumes from, for one). Set inside the open transaction, so it reaches
+ * storage with the next flush at no extra commit. get returns NULL when the
+ * key was never set.
+ */
+void         gsm_health_db_set_meta         (GsmHealthDb *self,
+                                             const char  *key,
+                                             const char  *value);
+char *       gsm_health_db_get_meta         (GsmHealthDb *self,
+                                             const char  *key);
 
 /* When the record was last flushed (unix seconds), or 0 when it never was. */
 int64_t      gsm_health_db_get_last_flush   (GsmHealthDb *self);

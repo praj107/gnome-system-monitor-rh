@@ -38,7 +38,9 @@
 #include "gsm-blame.h"
 #include "gsm-drive-spec.h"
 #include "gsm-health-db.h"
+#include "gsm-onbehalf.h"
 #include "gsm-procio.h"
+#include "gsm-smart-file.h"
 #include "gsm-udisks.h"
 
 #define DEFAULT_INTERVAL_SECS 15
@@ -61,6 +63,13 @@ typedef struct {
 
   /* Rows for devices the drive map does not know yet. */
   GsmBlameHold    *hold;
+
+  /* Bytes charged to the proxy writers (core dumps, journald) in this flush
+   * interval, and where in the journal the interval began. The journal
+   * position starts over with the tracker's baseline: bytes written before
+   * the sampler started are not credited, so neither are log lines. */
+  GsmOnBehalf     *on_behalf;
+  char            *journal_cursor;
 
   /* Last seen cumulative /proc/<pid>/io counters, keyed by "<pid>". */
   GHashTable      *prev_proc;
@@ -156,6 +165,7 @@ refresh_drives (Sampler  *self,
 {
   g_autoptr (GPtrArray) infos = NULL;
   g_autoptr (GError) error = NULL;
+  GsmSmartFile *smart_file = NULL;
 
   self->map_refreshed_us = g_get_monotonic_time ();
 
@@ -185,6 +195,22 @@ refresh_drives (Sampler  *self,
     if (!record)
       continue;
 
+    /* A USB disk udisks cannot read SMART from: take the system reader's
+     * snapshot when it is fresh and names this disk by serial. */
+    if (info->smart_source != GSM_SMART_SOURCE_UDISKS)
+      {
+        const GsmSmartFileDrive *usb;
+
+        if (smart_file == NULL)
+          smart_file = gsm_smart_file_load (GSM_SMART_FILE_DEFAULT_PATH,
+                                            g_get_real_time () / G_USEC_PER_SEC,
+                                            GSM_SMART_FILE_MAX_AGE_SECONDS);
+
+        usb = gsm_smart_file_find (smart_file, info->serial);
+        if (usb != NULL)
+          gsm_smart_file_fill_info (smart_file, usb, info);
+      }
+
     drive = gsm_drive_new (info->serial);
     gsm_drive_apply_info (drive, info);
 
@@ -193,6 +219,8 @@ refresh_drives (Sampler  *self,
 
     gsm_health_db_record_drive (self->db, drive);
   }
+
+  gsm_smart_file_free (smart_file);
 
   return TRUE;
 }
@@ -213,10 +241,64 @@ record_delta (const char          *drive_id,
               gpointer             data)
 {
   Sampler *self = data;
+  GsmProxyWriter proxy;
 
   /* cgroup accounting names the device, so these rows are exact. */
   gsm_health_db_record_blame_row (self->db, drive_id, delta->name, "",
                                   delta->basis, delta->wbytes);
+
+  /* The same bytes are split again, by cause, when the interval closes. */
+  if (gsm_on_behalf_proxy_for_cgroup (delta->cgroup, &proxy))
+    gsm_on_behalf_charge (self->on_behalf, drive_id, proxy, delta->wbytes);
+}
+
+
+static void
+record_on_behalf (const char *drive_id,
+                  const char *name,
+                  const char *via,
+                  const char *basis,
+                  uint64_t    wbytes,
+                  gpointer    data)
+{
+  Sampler *self = data;
+
+  gsm_health_db_record_blame_row (self->db, drive_id, name, via, basis, wbytes);
+}
+
+
+/*
+ * Close the interval for the proxy writers: read the journal since the last
+ * flush, split what they were charged by cause, and move the cursor to the
+ * end of what was read. Without journal access the bytes become one row that
+ * says so, and the cursor starts over when access returns.
+ */
+static void
+settle_on_behalf (Sampler *self)
+{
+  g_autofree char *reason = NULL;
+  g_autofree char *next_cursor = NULL;
+  GsmJournalSource *source = gsm_journal_open_system (self->journal_cursor, 0, &reason);
+
+  if (source == NULL)
+    {
+      if (gsm_on_behalf_has_charges (self->on_behalf))
+        g_warning ("sampler: writes by core dumps and journald stay unattributed: %s", reason);
+      gsm_on_behalf_settle (self->on_behalf, NULL, record_on_behalf, self);
+      g_clear_pointer (&self->journal_cursor, g_free);
+      return;
+    }
+
+  gsm_on_behalf_settle (self->on_behalf, source, record_on_behalf, self);
+  next_cursor = source->end_cursor (source->data);
+  gsm_journal_source_free (source);
+
+  if (next_cursor == NULL)
+    return;
+
+  g_free (self->journal_cursor);
+  self->journal_cursor = g_steal_pointer (&next_cursor);
+  gsm_health_db_set_meta (self->db, "journal_cursor", self->journal_cursor);
 }
 
 
@@ -340,6 +422,8 @@ flush (Sampler  *self,
       sample_batteries (self);
       gsm_health_db_roll_up (self->db);
     }
+
+  settle_on_behalf (self);
 
   if (!gsm_health_db_flush (self->db, &error))
     g_warning ("sampler: could not write the record: %s", error->message);
@@ -488,6 +572,7 @@ main (int   argc,
 
   self.tracker = gsm_blame_tracker_new (NULL);
   self.hold = gsm_blame_hold_new ();
+  self.on_behalf = gsm_on_behalf_new ();
   self.prev_proc = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
   self.device_to_drive = g_hash_table_new_full (g_str_hash, g_str_equal,
                                                 g_free, g_free);
@@ -515,6 +600,20 @@ main (int   argc,
       store_value (self.prev_proc, key, entry->wbytes);
     }
   }
+  {
+    /* The journal's baseline, taken with the tracker's. */
+    g_autofree char *reason = NULL;
+    GsmJournalSource *source = gsm_journal_open_system (NULL, 0, &reason);
+
+    if (source != NULL)
+      {
+        self.journal_cursor = source->end_cursor (source->data);
+        gsm_journal_source_free (source);
+      }
+    else
+      g_warning ("sampler: no journal access, so core dump and journald writes "
+                 "will be unattributed: %s", reason);
+  }
   flush (&self, FALSE);
 
   g_timeout_add_seconds (self.interval, tick, &self);
@@ -532,6 +631,8 @@ main (int   argc,
   g_clear_pointer (&self.loop, g_main_loop_unref);
   g_clear_pointer (&self.tracker, gsm_blame_tracker_free);
   g_clear_pointer (&self.hold, gsm_blame_hold_free);
+  g_clear_pointer (&self.on_behalf, gsm_on_behalf_free);
+  g_clear_pointer (&self.journal_cursor, g_free);
   g_clear_pointer (&self.prev_proc, g_hash_table_unref);
   g_clear_pointer (&self.device_to_drive, g_hash_table_unref);
   g_clear_pointer (&self.unknown_devices, g_hash_table_unref);

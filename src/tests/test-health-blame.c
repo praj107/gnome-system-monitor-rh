@@ -776,7 +776,8 @@ test_a_version_1_database_keeps_its_bytes_and_gains_a_basis (void)
   g_assert_cmpint (sqlite3_prepare_v2 (raw, "SELECT value FROM meta WHERE key = 'schema_version'",
                                        -1, &stmt, NULL), ==, SQLITE_OK);
   g_assert_cmpint (sqlite3_step (stmt), ==, SQLITE_ROW);
-  g_assert_cmpstr ((const char *) sqlite3_column_text (stmt, 0), ==, "2");
+  /* A version 1 database migrates all the way to the current version. */
+  g_assert_cmpstr ((const char *) sqlite3_column_text (stmt, 0), ==, "3");
   sqlite3_finalize (stmt);
   sqlite3_close (raw);
 

@@ -74,8 +74,10 @@ G_DEFINE_FINAL_TYPE (GsmHealthDb, gsm_health_db, G_TYPE_OBJECT)
  * hundred KB per decade, and a multi-year wear curve is the whole point. */
 
 /* 1: blame_daily(drive_id, day, name, wbytes, exact).
- * 2: blame_daily(drive_id, day, name, via, basis, wbytes). */
-#define SCHEMA_VERSION 2
+ * 2: blame_daily(drive_id, day, name, via, basis, wbytes).
+ * 3: power_on_hours (NULL when unknown) on drive_sample, drive_hourly and
+ *    drive_daily. */
+#define SCHEMA_VERSION 3
 
 /* A flush keeps this many rows per drive, day and kind, and folds the rest
  * into one "other" row, so a burst of short-lived writers cannot grow the
@@ -120,6 +122,7 @@ static const char *SCHEMA_SQL =
   "  bytes_written INTEGER,"
   "  percent_used  INTEGER,"
   "  temperature   INTEGER,"
+  "  power_on_hours INTEGER,"
   "  PRIMARY KEY (drive_id, ts)"
   ") WITHOUT ROWID;"
 
@@ -131,6 +134,7 @@ static const char *SCHEMA_SQL =
   "  bytes_written INTEGER,"
   "  percent_used  INTEGER,"
   "  temperature   INTEGER,"
+  "  power_on_hours INTEGER,"
   "  PRIMARY KEY (drive_id, ts)"
   ") WITHOUT ROWID;"
 
@@ -140,6 +144,7 @@ static const char *SCHEMA_SQL =
   "  bytes_written INTEGER,"
   "  percent_used  INTEGER,"
   "  temperature   INTEGER,"
+  "  power_on_hours INTEGER,"
   "  PRIMARY KEY (drive_id, ts)"
   ") WITHOUT ROWID;"
 
@@ -308,6 +313,62 @@ blame_table_is_version_1 (GsmHealthDb *self)
 }
 
 
+static gboolean
+table_lacks_power_on_hours (GsmHealthDb *self,
+                            const char  *table)
+{
+  g_autofree char *sql =
+    g_strdup_printf ("SELECT COUNT (*) FROM pragma_table_info ('%s') "
+                     " WHERE name = 'power_on_hours'", table);
+  sqlite3_stmt *stmt = NULL;
+  gboolean lacks = FALSE;
+
+  if (sqlite3_prepare_v2 (self->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+    return FALSE;
+
+  if (sqlite3_step (stmt) == SQLITE_ROW)
+    lacks = sqlite3_column_int (stmt, 0) == 0;
+  sqlite3_finalize (stmt);
+
+  return lacks;
+}
+
+
+/*
+ * Version 3 adds power_on_hours to the three drive tables. Existing rows get
+ * NULL, which reads as unknown. Run after the tables exist; each ALTER is
+ * guarded by a check so a second process opening the file is harmless.
+ */
+static gboolean
+migrate_drive_tables_to_version_3 (GsmHealthDb *self,
+                                   GError     **error)
+{
+  static const char *const tables[] = { "drive_sample", "drive_hourly", "drive_daily" };
+  gboolean altered = FALSE;
+
+  for (guint i = 0; i < G_N_ELEMENTS (tables); i++)
+    {
+      g_autofree char *sql = NULL;
+
+      if (!table_lacks_power_on_hours (self, tables[i]))
+        continue;
+
+      sql = g_strdup_printf ("ALTER TABLE %s ADD COLUMN power_on_hours INTEGER", tables[i]);
+      if (!exec_sql (self, sql, error))
+        return FALSE;
+      altered = TRUE;
+    }
+
+  if (!altered)
+    return TRUE;
+
+  return exec_sql (self,
+                   "INSERT OR REPLACE INTO meta (key, value) "
+                   "VALUES ('schema_version', '" G_STRINGIFY (SCHEMA_VERSION) "');",
+                   error);
+}
+
+
 /*
  * Version 1 stored `exact` (1 = from cgroup counters, 0 = from /proc) and
  * no via. Rows keep their bytes: exact becomes basis kernel, the rest
@@ -371,7 +432,8 @@ gsm_health_db_new (const char  *path,
       !exec_sql (self, "PRAGMA journal_size_limit=" G_STRINGIFY (WAL_SIZE_LIMIT_BYTES) ";", error) ||
       !exec_sql (self, "PRAGMA wal_autocheckpoint=" G_STRINGIFY (WAL_AUTOCHECKPOINT_PAGES) ";", error) ||
       !migrate_blame_to_version_2 (self, error) ||
-      !exec_sql (self, SCHEMA_SQL, error))
+      !exec_sql (self, SCHEMA_SQL, error) ||
+      !migrate_drive_tables_to_version_3 (self, error))
     return NULL;
 
   {
@@ -523,14 +585,19 @@ gsm_health_db_record_drive (GsmHealthDb *self,
   stmt = NULL;
   if (sqlite3_prepare_v2 (self->db,
                           "INSERT OR REPLACE INTO drive_sample "
-                          "(drive_id, ts, bytes_written, percent_used, temperature) "
-                          "VALUES (?1, ?2, ?3, ?4, ?5)",
+                          "(drive_id, ts, bytes_written, percent_used, temperature, power_on_hours) "
+                          "VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                           -1, &stmt, NULL) == SQLITE_OK) {
     sqlite3_bind_text (stmt, 1, drive_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64 (stmt, 2, now);
     sqlite3_bind_int64 (stmt, 3, (sqlite3_int64) gsm_drive_get_bytes_written (drive));
     sqlite3_bind_int (stmt, 4, gsm_drive_get_percent_used (drive));
     sqlite3_bind_int (stmt, 5, gsm_drive_get_temperature (drive));
+    /* Zero is "the drive did not say", stored as NULL, never as an hour count. */
+    if (gsm_drive_get_power_on_hours (drive) > 0)
+      sqlite3_bind_int64 (stmt, 6, (sqlite3_int64) gsm_drive_get_power_on_hours (drive));
+    else
+      sqlite3_bind_null (stmt, 6);
     sqlite3_step (stmt);
     sqlite3_finalize (stmt);
 
@@ -832,6 +899,53 @@ gsm_health_db_flush (GsmHealthDb  *self,
 }
 
 
+void
+gsm_health_db_set_meta (GsmHealthDb *self,
+                        const char  *key,
+                        const char  *value)
+{
+  sqlite3_stmt *stmt = NULL;
+
+  g_return_if_fail (GSM_IS_HEALTH_DB (self));
+  g_return_if_fail (key != NULL && value != NULL);
+
+  begin (self);
+
+  if (sqlite3_prepare_v2 (self->db,
+                          "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                          -1, &stmt, NULL) != SQLITE_OK)
+    return;
+
+  sqlite3_bind_text (stmt, 1, key, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text (stmt, 2, value, -1, SQLITE_TRANSIENT);
+  sqlite3_step (stmt);
+  sqlite3_finalize (stmt);
+}
+
+
+char *
+gsm_health_db_get_meta (GsmHealthDb *self,
+                        const char  *key)
+{
+  sqlite3_stmt *stmt = NULL;
+  char *out = NULL;
+
+  g_return_val_if_fail (GSM_IS_HEALTH_DB (self), NULL);
+  g_return_val_if_fail (key != NULL, NULL);
+
+  if (sqlite3_prepare_v2 (self->db, "SELECT value FROM meta WHERE key = ?1",
+                          -1, &stmt, NULL) != SQLITE_OK)
+    return NULL;
+
+  sqlite3_bind_text (stmt, 1, key, -1, SQLITE_TRANSIENT);
+  if (sqlite3_step (stmt) == SQLITE_ROW && sqlite3_column_text (stmt, 0) != NULL)
+    out = g_strdup ((const char *) sqlite3_column_text (stmt, 0));
+  sqlite3_finalize (stmt);
+
+  return out;
+}
+
+
 int64_t
 gsm_health_db_get_last_flush (GsmHealthDb *self)
 {
@@ -886,8 +1000,8 @@ gsm_health_db_roll_up (GsmHealthDb *self)
    * ten minutes is the interesting fact, not its comfortable hourly mean.
    */
   sql = g_strdup_printf (
-    "INSERT OR REPLACE INTO drive_hourly (drive_id, ts, bytes_written, percent_used, temperature) "
-    "SELECT drive_id, (ts / 3600) * 3600, MAX (bytes_written), MAX (percent_used), MAX (temperature) "
+    "INSERT OR REPLACE INTO drive_hourly (drive_id, ts, bytes_written, percent_used, temperature, power_on_hours) "
+    "SELECT drive_id, (ts / 3600) * 3600, MAX (bytes_written), MAX (percent_used), MAX (temperature), MAX (power_on_hours) "
     "  FROM drive_sample WHERE ts < %" G_GINT64_FORMAT
     "  GROUP BY drive_id, ts / 3600;"
     "DELETE FROM drive_sample WHERE ts < %" G_GINT64_FORMAT ";",
@@ -897,8 +1011,8 @@ gsm_health_db_roll_up (GsmHealthDb *self)
   g_clear_pointer (&sql, g_free);
 
   sql = g_strdup_printf (
-    "INSERT OR REPLACE INTO drive_daily (drive_id, ts, bytes_written, percent_used, temperature) "
-    "SELECT drive_id, (ts / 86400) * 86400, MAX (bytes_written), MAX (percent_used), MAX (temperature) "
+    "INSERT OR REPLACE INTO drive_daily (drive_id, ts, bytes_written, percent_used, temperature, power_on_hours) "
+    "SELECT drive_id, (ts / 86400) * 86400, MAX (bytes_written), MAX (percent_used), MAX (temperature), MAX (power_on_hours) "
     "  FROM drive_hourly WHERE ts < %" G_GINT64_FORMAT
     "  GROUP BY drive_id, ts / 86400;"
     "DELETE FROM drive_hourly WHERE ts < %" G_GINT64_FORMAT ";",
@@ -983,13 +1097,13 @@ gsm_health_db_get_history (GsmHealthDb     *self,
    * interpolating it is safe; values are still bound.
    */
   sql = g_strdup_printf (
-    "SELECT ts, bytes_written, percent_used, temperature FROM drive_sample "
+    "SELECT ts, bytes_written, percent_used, temperature, power_on_hours FROM drive_sample "
     "  WHERE drive_id = ?1 AND ts >= ?2 "
     "UNION ALL "
-    "SELECT ts, bytes_written, percent_used, temperature FROM drive_hourly "
+    "SELECT ts, bytes_written, percent_used, temperature, power_on_hours FROM drive_hourly "
     "  WHERE drive_id = ?1 AND ts >= ?2 "
     "UNION ALL "
-    "SELECT ts, bytes_written, percent_used, temperature FROM drive_daily "
+    "SELECT ts, bytes_written, percent_used, temperature, power_on_hours FROM drive_daily "
     "  WHERE drive_id = ?1 AND ts >= ?2 "
     "ORDER BY ts ASC");
 
@@ -1006,6 +1120,8 @@ gsm_health_db_get_history (GsmHealthDb     *self,
     p.bytes_written = (uint64_t) sqlite3_column_int64 (stmt, 1);
     p.percent_used = sqlite3_column_int (stmt, 2);
     p.temperature = sqlite3_column_int (stmt, 3);
+    p.power_on_hours = sqlite3_column_type (stmt, 4) == SQLITE_NULL
+                       ? -1 : sqlite3_column_int64 (stmt, 4);
 
     g_array_append_val (points, p);
   }

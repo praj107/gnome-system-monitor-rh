@@ -10,7 +10,9 @@ libgsm_health_sources = [
   'gsm-drive-spec.c',
   'gsm-health-db.c',
   'gsm-history-chart.c',
+  'gsm-onbehalf.c',
   'gsm-procio.c',
+  'gsm-smart-file.c',
   'gsm-udisks.c',
   'health.c',
 ]
@@ -22,7 +24,9 @@ libgsm_health_headers = [
   'gsm-drive-spec.h',
   'gsm-health-db.h',
   'gsm-history-chart.h',
+  'gsm-onbehalf.h',
   'gsm-procio.h',
+  'gsm-smart-file.h',
   'gsm-udisks.h',
   'health.h',
 ]
@@ -33,6 +37,7 @@ libgsm_health_dependencies = [
   gtk,
   libadwaita,
   sqlite,
+  libsystemd,
 ]
 
 libgsm_health = static_library(
@@ -46,16 +51,6 @@ libgsm_health_dep = declare_dependency(
   dependencies: libgsm_health_dependencies,
   include_directories: include_directories('.'),
   link_with: libgsm_health,
-)
-
-# The privileged SMART reader. Runs as root via pkexec, reads one device, and
-# exits. Talks to the hardware directly (NVMe admin ioctl, SG_IO ATA
-# passthrough) rather than shelling out to smartctl, so it adds no runtime
-# dependency and no shell.
-executable('gsm-smart',
-  ['gsm-smart-helper.c'],
-  install: true,
-  install_dir: get_option('libexecdir') / meson.project_name(),
 )
 
 # The system SMART reader for USB-attached disks. Run by a systemd timer as
@@ -80,6 +75,27 @@ test('smart-reader',
     ['../tests/test-smart-reader.c'] + gsm_smart_reader_core_sources,
     include_directories: include_directories('.'),
     dependencies: [glib],
+  ),
+  protocol: 'tap',
+)
+
+# On-behalf-of attribution of core dump and journald writes, over synthetic
+# journal records through the module's source seam.
+test('health-onbehalf',
+  executable('test-health-onbehalf',
+    ['../tests/test-health-onbehalf.c'],
+    include_directories: [rootInclude, include_directories('..')],
+    dependencies: [libgsm_health_dep, glib, sqlite],
+  ),
+  protocol: 'tap',
+)
+
+# The system SMART reader's smart.ini, parsed: every state is explicit.
+test('smart-file',
+  executable('test-smart-file',
+    ['../tests/test-smart-file.c'],
+    include_directories: [rootInclude, include_directories('..')],
+    dependencies: [libgsm_health_dep, glib, sqlite],
   ),
   protocol: 'tap',
 )
