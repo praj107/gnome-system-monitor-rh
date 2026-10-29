@@ -1,4 +1,4 @@
-gnome-system-monitor-rh (50.0+rh.3) UNRELEASED; urgency=medium
+gnome-system-monitor-rh (50.0+rh.3) noble; urgency=medium
 
   * Health: USB-attached drives are read by a system service instead of a
     password prompt. gsm-smart-reader.service (a hardened oneshot with
@@ -16,8 +16,35 @@ gnome-system-monitor-rh (50.0+rh.3) UNRELEASED; urgency=medium
     back; the service, timer and rule are removed by the downgrade.
   * Release gate: the service's units must verify cleanly and score at most
     2.0 in systemd-analyze security (the reader scores 1.1).
+  * Health: the SMART reader never probes a USB bridge it does not know.
+    The old helper tried three vendor tunnels on any unknown enclosure, and
+    JMicron's is ATA PASS-THROUGH(12), which a SATA bridge reads as a hard
+    reset. Bridges are matched by exact USB vendor, product and bcdDevice
+    from smartmontools' drive database; a sleeping drive is not woken; a
+    figure that fails a sanity check is shown as such, never as zero.
+  * Health: "What writes to this drive" counts every byte once. Every
+    cgroup's io.stat is split exactly, so the rows add up to the drive's
+    own count; bytes of units that have exited stay with their parent,
+    named "(own and exited units)". It used to read only the deepest
+    cgroups, name a slice by its top-level ancestor (a crash-handler slice
+    showed as "system.slice") and lose or double-count short-lived units.
+  * Health: the bytes systemd-coredump and journald write for others are
+    divided, from the journal, among the units that caused them (the
+    crashing programs, the units that log), each split labelled as an
+    estimate or a measurement.
+  * Health: endurance ratings only where the maker publishes one, per exact
+    model and capacity, with the document named; "not published by the
+    maker" otherwise. Several old ratings were wrong (a 2 TB Crucial P3
+    showed 880 TB for its 440). The drive's own wear counter is shown beside
+    the rating as a range, and both projections are given.
+  * Health: the wear chart spans the recorded history instead of a
+    projection years away, and does not join readings far apart. History
+    says "Recorded since <date>; N days with data". Power-on hours are "as
+    counted by the drive".
+  * File Systems: mounts that refuse statvfs (the document portal) are
+    skipped quietly instead of logging a warning on every refresh.
 
- -- Pranav <pranavrajput321@gmail.com>  Thu, 29 Oct 2026 17:30:45 +0800
+ -- Pranav <pranavrajput321@gmail.com>  Thu, 29 Oct 2026 19:45:00 +0800
 
 gnome-system-monitor-rh (50.0+rh.2) noble; urgency=medium
 
