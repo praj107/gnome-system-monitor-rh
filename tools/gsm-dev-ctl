@@ -21,6 +21,8 @@ window is buried behind your editor, and it cannot photograph the wrong window.
   gsm-dev-ctl action win.show-page::processes   # activate an app/window action
   gsm-dev-ctl set show-whose-processes all      # write a GSettings key
   gsm-dev-ctl select systemd       # select the first process row matching
+  gsm-dev-ctl select pid:1234      # select exactly the row of process 1234
+  gsm-dev-ctl rows /dev/shm/x/r.tsv  # dump every process row (raw values, TSV)
   gsm-dev-ctl close                # close the main window, as its button does
   gsm-dev-ctl quit
 

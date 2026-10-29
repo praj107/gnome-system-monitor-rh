@@ -107,7 +107,7 @@
     </key>
 
     <key name="process-source" type="s">
-      <default>'libgtop'</default>
+      <default>'collector'</default>
       <choices>
         <choice value="libgtop"/>
         <choice value="collector"/>

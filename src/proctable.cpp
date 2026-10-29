@@ -1213,8 +1213,10 @@ update_info_from_collector (ProcInfo             *info,
   info->pcpu = figures.cpu_known ? figures.cpu_percent : 0.0;
 
   // if the cpu time has increased reset the status to running
-  // regardless of kernel state (#606579)
-  if (figures.cpu_known && figures.cpu_percent > 0.0)
+  // regardless of kernel state (#606579). The increase is of the clock-tick
+  // counter, as on the libgtop path: the scheduler's nanoseconds in
+  // cpu_percent would mark a process Running for microseconds of work.
+  if (figures.cpu_known && figures.cpu_time_ticks > info->cpu_time)
     info->status = GLIBTOP_PROCESS_RUNNING;
 
   // The rate baseline of this path is the collector's previous snapshot, not

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Headless regression tests for two crashes that no unit test reaches, and for
-one rendering race in the developer screenshot:
+one rendering race in the developer screenshot, and for two developer verbs
+that the process-source comparison relies on:
 
   * closing the main window (what the close button does) must end the
     application with status 0; a signal group bound to the window used to be
@@ -13,7 +14,11 @@ one rendering race in the developer screenshot:
     list of toplevels and then open a dialog with no parent;
   * a screenshot taken right after the `tab` verb must show the header's view
     switcher on the page that is showing; it used to be captured before the
-    switcher's new state reached its render node.
+    switcher's new state reached its render node;
+  * `select pid:N` must select exactly the row of process N, even when
+    another process has N in its command line, and `rows PATH` must list a
+    process the test spawned with its pid and start time, under a comment
+    line that names the process source, which is the collector by default.
 
 The application runs in a private headless Weston on its own runtime
 directory, with in-memory settings, no D-Bus session and the developer
@@ -266,6 +271,98 @@ def test_switcher_follows_the_tab_verb(session, app, ctl_path):
             proc.kill()
 
 
+def read_rows(path):
+    """(comment line, [row dict]) of a `rows` dump."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    check(lines and lines[0].startswith("# "), "no comment line in " + path)
+    names = lines[1].split("\t")
+    rows = [dict(zip(names, line.split("\t"))) for line in lines[2:]]
+    return lines[0], rows
+
+
+def proc_start_time_s(pid):
+    """Start of a process as the epoch second, from /proc (proc_pid_stat(5))."""
+    with open("/proc/%d/stat" % pid) as f:
+        stat = f.read()
+    # comm may hold spaces and parentheses: fields count from the last ')'
+    fields = stat[stat.rindex(")") + 2:].split()
+    start_ticks = int(fields[19])
+    with open("/proc/stat") as f:
+        btime = next(int(line.split()[1]) for line in f if line.startswith("btime"))
+    return btime + start_ticks // os.sysconf("SC_CLK_TCK")
+
+
+def wait_for_row(session, ctl_path, pid, name):
+    """Poll `rows` until the process is listed (the list fills on a timer)."""
+    path = os.path.join(session.root, name)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        status, out = ctl(session, ctl_path, "rows", path)
+        check(status == 0 and out.startswith("OK"), "rows: " + out)
+        comment, rows = read_rows(path)
+        for row in rows:
+            if row["pid"] == str(pid):
+                return comment, rows, row
+        time.sleep(0.5)
+    raise AssertionError("pid %d never appeared in the rows" % pid)
+
+
+def test_select_by_pid_and_rows(session, app, ctl_path):
+    target_path = os.path.join(session.root, "gsmrowtarget")
+    shutil.copy(shutil.which("sleep"), target_path)
+    target = subprocess.Popen([target_path, "600"])
+    # A decoy whose command line is the target's pid: a substring select of
+    # that number can land on it, `pid:` must not.
+    decoy_path = os.path.join(session.root, "gsmrowdecoy")
+    shutil.copy(shutil.which("sleep"), decoy_path)
+    decoy = subprocess.Popen([decoy_path, "600", str(target.pid)])
+    proc, log = session.start_app(app, "rows.log")
+    try:
+        status, out = ctl(session, ctl_path, "action", "win.show-page::processes")
+        check(status == 0 and out.startswith("OK"), "show processes: " + out)
+        status, out = ctl(session, ctl_path, "set", "show-whose-processes", "all")
+        check(status == 0 and out.startswith("OK"), "set: " + out)
+
+        comment, rows, row = wait_for_row(session, ctl_path, target.pid, "rows.tsv")
+        check("process-source=collector" in comment,
+              "a fresh start does not default to the collector: " + comment)
+        check("show-whose-processes=all" in comment, "comment line: " + comment)
+        check(row["name"] == "gsmrowtarget", "row name: %r" % row["name"])
+        expected = proc_start_time_s(target.pid)
+        check(abs(int(row["start_time_s"]) - expected) <= 1,
+              "start time %s, /proc says %d" % (row["start_time_s"], expected))
+        check(row["uid"] == str(os.getuid()), "uid %s" % row["uid"])
+        pids = [r["pid"] for r in rows]
+        check(len(pids) == len(set(pids)), "a pid is listed twice")
+        check(str(decoy.pid) in pids, "the decoy is not listed")
+
+        status, out = ctl(session, ctl_path, "select", "pid:%d" % target.pid)
+        check(status == 0 and out.startswith("OK selected pid:%d (pid %d, 1 row"
+                                             % (target.pid, target.pid)),
+              "select pid:N chose another row: " + out)
+        status, out = ctl(session, ctl_path, "select", "pid:%d" % decoy.pid)
+        check(status == 0 and "(pid %d, 1 row" % decoy.pid in out,
+              "select pid:N of the decoy: " + out)
+        status, out = ctl(session, ctl_path, "select", "pid:4194999")
+        check(status != 0 and out.startswith("ERR"), "a missing pid: " + out)
+        status, out = ctl(session, ctl_path, "select", "pid:x")
+        check(status != 0 and out.startswith("ERR"), "a bad pid: " + out)
+        status, out = ctl(session, ctl_path, "select", "gsmrowdecoy")
+        check(status == 0 and "(pid %d," % decoy.pid in out,
+              "the text form no longer matches by substring: " + out)
+
+        ctl(session, ctl_path, "close")
+        check(proc.wait(timeout=APP_EXIT_TIMEOUT_S) == 0,
+              "the app did not exit cleanly")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        for child in (target, decoy):
+            child.send_signal(signal.SIGTERM)
+            child.wait(timeout=10)
+
+
 def main():
     if len(sys.argv) != 4:
         print(__doc__)
@@ -281,7 +378,7 @@ def main():
 
     failures = 0
     tests = (test_close_exits_cleanly, test_refused_kill_keeps_the_app_running,
-             test_switcher_follows_the_tab_verb)
+             test_switcher_follows_the_tab_verb, test_select_by_pid_and_rows)
     with tempfile.TemporaryDirectory(prefix="gsm-headless-", dir="/dev/shm") as root:
         session = Session(root, schema_dir)
         try:

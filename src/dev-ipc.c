@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 
 #include "dev-ipc.h"
+#include "dev-ipc-rows.h"
 #include "settings-keys.h"
 
 typedef struct {
@@ -527,9 +528,31 @@ cmd_set (G_GNUC_UNUSED DevIpc *self,
 
 typedef struct {
   const char *needle;
+  guint pid;                   /* matched against the pid column when has_pid */
+  gboolean has_pid;
+  guint selected_pid;          /* the pid column of the row selected */
   GtkTreeView *view;
   gboolean found;
 } SelectSearch;
+
+
+static void
+select_row (SelectSearch *search,
+            GtkTreePath  *path,
+            GtkTreeIter  *iter)
+{
+  GtkTreeSelection *selection = gtk_tree_view_get_selection (search->view);
+
+  gtk_tree_view_expand_to_path (search->view, path);
+  /* The list allows several rows: select replaces the selection, so that
+   * what is selected afterwards is exactly the row named. */
+  gtk_tree_selection_unselect_all (selection);
+  gtk_tree_selection_select_iter (selection, iter);
+  gtk_tree_view_scroll_to_cell (search->view, path, NULL, FALSE, 0, 0);
+  gtk_tree_model_get (gtk_tree_view_get_model (search->view), iter,
+                      gsm_dev_ipc_pid_column (), &search->selected_pid, -1);
+  search->found = TRUE;
+}
 
 
 static gboolean
@@ -540,6 +563,17 @@ select_row_matching (GtkTreeModel *model,
 {
   SelectSearch *search = user_data;
   int n_columns = gtk_tree_model_get_n_columns (model);
+
+  if (search->has_pid) {
+    guint pid = 0;
+
+    gtk_tree_model_get (model, iter, gsm_dev_ipc_pid_column (), &pid, -1);
+    if (pid != search->pid)
+      return FALSE;
+
+    select_row (search, path, iter);
+    return TRUE;
+  }
 
   for (int column = 0; column < n_columns; column++) {
     g_auto (GValue) value = G_VALUE_INIT;
@@ -553,11 +587,7 @@ select_row_matching (GtkTreeModel *model,
     if (text == NULL || strstr (text, search->needle) == NULL)
       continue;
 
-    gtk_tree_view_expand_to_path (search->view, path);
-    gtk_tree_selection_select_iter (gtk_tree_view_get_selection (search->view),
-                                    iter);
-    gtk_tree_view_scroll_to_cell (search->view, path, NULL, FALSE, 0, 0);
-    search->found = TRUE;
+    select_row (search, path, iter);
     return TRUE;
   }
 
@@ -565,8 +595,10 @@ select_row_matching (GtkTreeModel *model,
 }
 
 
-/* select TEXT: select the first process row with a text column containing
- * TEXT. Selecting is all it does; acting on the row is a separate verb. */
+/* select TEXT: select (only) the first process row with a text column containing
+ * TEXT. select pid:N selects exactly the row of process N, which TEXT could
+ * not do: a pid also occurs inside command lines. Selecting is all it does;
+ * acting on the row is a separate verb. */
 static char *
 cmd_select (DevIpc     *self,
             const char *text)
@@ -582,15 +614,63 @@ cmd_select (DevIpc     *self,
     return g_strdup ("ERR no process list\n");
 
   search.needle = text;
+  search.pid = 0;
+  search.has_pid = FALSE;
+  search.selected_pid = 0;
   search.view = GTK_TREE_VIEW (tree);
   search.found = FALSE;
+
+  if (g_str_has_prefix (text, "pid:")) {
+    guint64 pid;
+
+    if (!g_ascii_string_to_unsigned (text + strlen ("pid:"), 10, 1, G_MAXUINT,
+                                     &pid, NULL))
+      return g_strdup_printf ("ERR bad pid in: %s\n", text);
+
+    search.pid = (guint) pid;
+    search.has_pid = TRUE;
+  }
+
   gtk_tree_model_foreach (gtk_tree_view_get_model (search.view),
                           select_row_matching, &search);
 
   if (!search.found)
     return g_strdup_printf ("ERR no row matching: %s\n", text);
 
-  return g_strdup_printf ("OK selected %s\n", text);
+  /* Say which row it is, so a harness can tell the right one was chosen. */
+  {
+    GtkTreeSelection *selection = gtk_tree_view_get_selection (search.view);
+
+    return g_strdup_printf ("OK selected %s (pid %u, %d row selected)\n", text,
+                            search.selected_pid,
+                            gtk_tree_selection_count_selected_rows (selection));
+  }
+}
+
+
+/* rows PATH: write every process row to PATH as TSV (see dev-ipc-rows.cpp). */
+static char *
+cmd_rows (DevIpc     *self,
+          const char *path)
+{
+  g_autoptr (GError) error = NULL;
+  GtkWidget *tree;
+  GtkTreeModel *store;
+  int rows;
+
+  if (path == NULL || *path == '\0')
+    return g_strdup ("ERR rows needs a path\n");
+
+  tree = find_descendant (GTK_WIDGET (self->window), GTK_TYPE_TREE_VIEW);
+  store = tree != NULL ? gsm_dev_ipc_base_store (GTK_TREE_VIEW (tree)) : NULL;
+  if (store == NULL)
+    return g_strdup ("ERR no process list\n");
+
+  rows = gsm_dev_ipc_write_rows (store, path, &error);
+  if (rows < 0)
+    return g_strdup_printf ("ERR %s\n", error->message);
+
+  return g_strdup_printf ("OK %d rows %s\n", rows, path);
 }
 
 
@@ -631,6 +711,8 @@ handle_command (DevIpc *self,
     return cmd_set (self, arg);
   if (g_strcmp0 (line, "select") == 0)
     return cmd_select (self, arg);
+  if (g_strcmp0 (line, "rows") == 0)
+    return cmd_rows (self, arg);
   if (g_strcmp0 (line, "close") == 0) {
     g_idle_add (close_window_idle, self->window);
     return g_strdup ("OK closing\n");

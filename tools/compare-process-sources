@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+Compare the Processes tab's rows from the two sources, field by field, on the
+machine this runs on.
+
+The application (a developer build, -Ddev_ipc=true) runs in a private headless
+Weston with in-memory settings, the way src/tests/test-headless-crashes.py runs
+it. With the same window showing the same processes it dumps the rows three
+times, through the `rows` verb of the control socket:
+
+    A1  process-source=libgtop
+    B   process-source=collector (after a few refreshes)
+    A2  process-source=libgtop
+    B2  process-source=collector again
+
+and compares the processes present in A1, B and A2 with the same start time
+in A1 and A2. B2 only tells a transient from a lasting difference: a figure
+that moved while the dumps were taken (a thread count, a mapping, resident
+memory of a busy process) is skipped when the collector's own two readings
+differ, or when a differing memory figure keeps changing in /proc during a
+burst of readings right afterwards, or when statm and status read back to
+back agree every time (the definitions match; the dumps caught the process
+at different moments). A constant offset between the two files read
+together is never skipped.
+
+  * exact fields: ppid, start time, name, user (uid), nice, cgroup, unit;
+  * stable fields (threads, the four memory figures, disk read total): only
+    where A1 equals A2, and then B must equal them;
+  * status: the same, for a process whose CPU-time counter did not move in
+    any of the four dumps (the "ran, so Running" rule follows the counter);
+  * disk write: B must equal A minus cancelled_write_bytes of
+    /proc/PID/io (proc_pid_io(5)), floored at 0, where that can be read;
+  * CPU time: B lies between A1 and A2 (a counter only grows);
+  * pid sets: a process alive through A1 and A2 must be in B; one that is
+    only in B, or in only one of A1 and A2, must have been born or gone
+    between the dumps.
+
+A difference is "expected" when the collector's documented definition makes
+it different (the user's real uid against the owner of /proc/PID, which is
+root for a process that is not dumpable; the disk-write definition), and
+"unexplained" otherwise. The exit status is 1 if anything is unexplained.
+
+Usage: compare-process-sources BUILD_DIR [--whose all,user] [--settle SECONDS]
+
+BUILD_DIR is a Meson build directory configured with -Ddev_ipc=true. Needs
+weston; exits 77 without it. Writes only into a directory of its own under
+/dev/shm that it removes on exit.
+"""
+
+import argparse
+import importlib.util
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+SKIP = 77
+EXAMPLES = 5
+UPDATE_INTERVAL_MS = 1000
+
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR = os.path.dirname(TOOLS_DIR)
+HARNESS = os.path.join(REPO_DIR, "src", "tests", "test-headless-crashes.py")
+
+EXACT_FIELDS = ("ppid", "start_time_s", "name", "uid", "nice", "cgroup", "unit")
+STABLE_FIELDS = ("status", "threads", "private_bytes", "resident_bytes",
+                 "shared_bytes", "virtual_bytes", "disk_read_bytes")
+
+# The lines of proc_pid_status(5) each memory figure is made of; the kernel
+# omits them for a process with no address space (a kernel thread, a zombie).
+STATUS_LINES = {"private_bytes": ("RssAnon:",),
+                "resident_bytes": ("RssAnon:", "RssFile:", "RssShmem:"),
+                "shared_bytes": ("RssFile:", "RssShmem:"),
+                "virtual_bytes": ("VmSize:",)}
+TABLE_FIELDS = (("presence",) + EXACT_FIELDS + STABLE_FIELDS
+                + ("disk_write_bytes", "cpu_time_ticks", "cpu_percent"))
+
+
+def load_harness():
+    spec = importlib.util.spec_from_file_location("gsm_headless", HARNESS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Tally:
+    """Per field: compared, equal, expected, unexplained, with examples."""
+
+    def __init__(self):
+        self.fields = {name: {"compared": 0, "equal": 0, "expected": [],
+                              "unexplained": [], "skipped": 0}
+                       for name in TABLE_FIELDS}
+
+    def equal(self, field):
+        entry = self.fields[field]
+        entry["compared"] += 1
+        entry["equal"] += 1
+
+    def expected(self, field, example):
+        entry = self.fields[field]
+        entry["compared"] += 1
+        entry["expected"].append(example)
+
+    def unexplained(self, field, example):
+        entry = self.fields[field]
+        entry["compared"] += 1
+        entry["unexplained"].append(example)
+
+    def skip(self, field):
+        self.fields[field]["skipped"] += 1
+
+    def unjudged(self):
+        """Fields skipped more often than compared: a run that skipped most of
+        a field cannot say the two sources agree on it."""
+        return [name for name, e in self.fields.items()
+                if e["skipped"] > e["compared"]]
+
+    def unexplained_count(self):
+        return (sum(len(e["unexplained"]) for e in self.fields.values())
+                + len(self.unjudged()))
+
+    def report(self, title):
+        print("\n== %s" % title)
+        print("%-18s %9s %7s %9s %11s %8s" % (
+            "field", "compared", "equal", "expected", "unexplained", "skipped"))
+        for name in TABLE_FIELDS:
+            e = self.fields[name]
+            print("%-18s %9d %7d %9d %11d %8d" % (
+                name, e["compared"], e["equal"], len(e["expected"]),
+                len(e["unexplained"]), e["skipped"]))
+        for kind in ("expected", "unexplained"):
+            for name in TABLE_FIELDS:
+                for example in self.fields[name][kind][:EXAMPLES]:
+                    print("  %s %s: %s" % (kind, name, example))
+        for name in self.unjudged():
+            print("  unjudged %s: skipped %d, compared only %d" % (
+                name, self.fields[name]["skipped"], self.fields[name]["compared"]))
+
+
+def proc_status_uids(pid):
+    """(real uid, effective uid) from proc_pid_status(5), or None."""
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    fields = line.split()
+                    return int(fields[1]), int(fields[2])
+    except OSError:
+        pass
+    return None
+
+
+def proc_owner(pid):
+    try:
+        return os.stat("/proc/%d" % pid).st_uid
+    except OSError:
+        return None
+
+
+def cancelled_write_bytes(pid):
+    """cancelled_write_bytes of proc_pid_io(5), or None when unreadable."""
+    try:
+        with open("/proc/%d/io" % pid) as f:
+            for line in f:
+                if line.startswith("cancelled_write_bytes:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
+
+
+LIVE_READS = 400
+LIVE_READ_GAP_S = 0.005
+
+
+def is_moving(pid, field, dumped):
+    """True when a memory difference between the dumps is the process
+    changing, not the two definitions disagreeing: either file alone,
+    proc_pid_statm(5) (libgtop's) or proc_pid_status(5) (the collector's),
+    changes while /proc is read for a couple of seconds; or the two files,
+    read back to back, agree every time on a value that is neither of the
+    dumped ones, so the process has been at three values and the dumps only
+    caught it at different moments (a process can change by a page every few
+    seconds and look still for two). A wrong mapping on either path reads
+    back as one of the dumped values and stays unexplained, and a constant
+    difference between the two files read together is never moving."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    from_statm, from_status = set(), set()
+    agree = True
+    reads = 0
+    for _ in range(LIVE_READS):
+        try:
+            with open("/proc/%d/statm" % pid) as f:
+                statm = f.read().split()
+            with open("/proc/%d/status" % pid) as f:
+                status = {line.split()[0]: int(line.split()[1])
+                          for line in f if line.startswith(("RssAnon:", "RssFile:",
+                                                            "RssShmem:", "VmSize:"))}
+        except (OSError, IndexError):
+            break
+        reads += 1
+        kib = lambda *names: sum(status.get(n, 0) for n in names) * 1024
+        statm_value = {"private_bytes": (int(statm[1]) - int(statm[2])) * page,
+                       "resident_bytes": int(statm[1]) * page,
+                       "shared_bytes": int(statm[2]) * page,
+                       "virtual_bytes": int(statm[0]) * page}[field]
+        status_value = {"private_bytes": kib("RssAnon:"),
+                        "resident_bytes": kib("RssAnon:", "RssFile:", "RssShmem:"),
+                        "shared_bytes": kib("RssFile:", "RssShmem:"),
+                        "virtual_bytes": kib("VmSize:")}[field]
+        from_statm.add(statm_value)
+        from_status.add(status_value)
+        agree = agree and statm_value == status_value
+        if len(from_statm) > 1 or len(from_status) > 1:
+            return True
+        time.sleep(LIVE_READ_GAP_S)
+    return (reads > 0 and agree and len(from_status) == 1
+            and next(iter(from_status)) not in dumped)
+
+
+def status_lacks_lines(pid, field):
+    """True when /proc/PID/status has no line the memory figure is made of."""
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            present = {line.split()[0] for line in f if line.strip()}
+    except OSError:
+        return False
+    return any(name not in present for name in STATUS_LINES[field])
+
+
+def describe(pid, row):
+    return "pid %s %s" % (pid, row.get("name", "?"))
+
+
+def compare(whose, dumps, taken_at, cancelled):
+    """Compare the three dumps (lists of dicts keyed by pid); returns a Tally."""
+    a1, b, a2, b2 = dumps
+    tally = Tally()
+    me = os.getuid()
+
+    for pid in sorted(set(a1) | set(a2) | set(b), key=int):
+        in_a1, in_a2, in_b = pid in a1, pid in a2, pid in b
+        row = (b.get(pid) or a1.get(pid) or a2.get(pid))
+        label = describe(pid, row)
+        ipid = int(pid)
+
+        if in_a1 and in_a2 and a1[pid]["start_time_s"] != a2[pid]["start_time_s"]:
+            tally.skip("presence")      # the pid was reused between A1 and A2
+            continue
+
+        if in_a1 and in_a2 and in_b:
+            tally.equal("presence")
+        elif in_a1 and in_a2 and not in_b:
+            if whose == "user":
+                uids = proc_status_uids(ipid)
+                if uids is not None and uids[0] != me:
+                    tally.expected("presence", "%s: libgtop lists it (owner of "
+                                   "/proc/PID is me), real uid is %d" % (label, uids[0]))
+                    continue
+            tally.unexplained("presence", "%s is in both libgtop dumps, not in "
+                              "the collector's" % label)
+            continue
+        elif in_b and not in_a1 and not in_a2:
+            uids = proc_status_uids(ipid)
+            owner = proc_owner(ipid)
+            if whose == "user" and uids is not None and uids[0] == me and owner != me:
+                tally.expected("presence", "%s: real uid is me, /proc/PID is owned "
+                               "by %s (not dumpable)" % (label, owner))
+                continue
+            born_after_a1 = int(b[pid]["start_time_s"]) >= taken_at[0] - 2
+            if born_after_a1 or uids is None:
+                tally.expected("presence", "%s: born or gone between the dumps" % label)
+            else:
+                tally.unexplained("presence", "%s is only in the collector's dump" % label)
+            continue
+        else:
+            # in only one of A1 / A2 (with or without B): churn, or the
+            # ownership rule of the user filter
+            alive = proc_status_uids(ipid) is not None
+            born_after_a1 = in_a2 and int(a2[pid]["start_time_s"]) >= taken_at[0] - 2
+            if in_a1 and not in_a2 and not in_b:
+                tally.expected("presence", "%s: gone between the dumps" % label)
+            elif born_after_a1 or not alive or (in_a1 and not in_a2):
+                tally.expected("presence", "%s: born or gone between the dumps" % label)
+            elif whose == "user" and in_b != in_a2:
+                tally.expected("presence", "%s: user filter, in A1=%s B=%s A2=%s" % (
+                    label, in_a1, in_b, in_a2))
+            else:
+                tally.unexplained("presence", "%s: A1=%s B=%s A2=%s" % (
+                    label, in_a1, in_b, in_a2))
+            continue
+
+        r1, rb, r2 = a1[pid], b[pid], a2[pid]
+
+        for field in EXACT_FIELDS:
+            if r1[field] != r2[field]:
+                tally.skip(field)       # libgtop itself changed it between dumps
+                continue
+            if rb[field] == r1[field]:
+                tally.equal(field)
+                continue
+            if field == "uid":
+                uids = proc_status_uids(ipid)
+                owner = proc_owner(ipid)
+                if (uids is not None and str(uids[0]) == rb[field]
+                        and owner is not None and str(owner) == r1[field]):
+                    tally.expected(field, "%s: libgtop %s is the owner of /proc/PID, "
+                                   "collector %s the real uid" % (label, r1[field], rb[field]))
+                    continue
+            tally.unexplained(field, "%s: libgtop %r, collector %r" % (
+                label, r1[field], rb[field]))
+
+        rb2 = b2.get(pid)
+        ticks = [int(r["cpu_time_ticks"]) for r in (r1, rb, r2, rb2) if r is not None]
+        cpu_idle = len(set(ticks)) == 1
+
+        for field in STABLE_FIELDS:
+            if r1[field] != r2[field]:
+                tally.skip(field)
+            elif field == "status" and not cpu_idle:
+                tally.skip(field)       # the process ran: Running by the CPU rule
+            elif rb[field] == r1[field]:
+                tally.equal(field)
+            elif rb2 is None or rb2[field] != rb[field]:
+                tally.skip(field)       # the collector's own reading moved
+            elif (field in STATUS_LINES and r1[field] == "0" and rb[field] == "unknown"
+                  and status_lacks_lines(ipid, field)):
+                tally.expected(field, "%s: libgtop 0, collector unknown; the kernel "
+                               "gives no address-space lines for it" % label)
+            elif (field in STATUS_LINES and "unknown" not in (r1[field], rb[field])
+                  and is_moving(ipid, field, {int(r1[field]), int(rb[field])})):
+                tally.skip(field)       # the figure changes while /proc is read
+            else:
+                tally.unexplained(field, "%s: libgtop %s, collector %s (second "
+                                  "collector reading %s)" % (
+                                      label, r1[field], rb[field],
+                                      rb2[field] if rb2 is not None else "gone"))
+
+        # disk write: the collector's definition subtracts cancelled bytes
+        if r1["disk_write_bytes"] != r2["disk_write_bytes"]:
+            tally.skip("disk_write_bytes")
+        elif r1["disk_write_bytes"] == "unknown" or rb["disk_write_bytes"] == "unknown":
+            if r1["disk_write_bytes"] == rb["disk_write_bytes"]:
+                tally.equal("disk_write_bytes")
+            else:
+                tally.unexplained("disk_write_bytes", "%s: libgtop %s, collector %s" % (
+                    label, r1["disk_write_bytes"], rb["disk_write_bytes"]))
+        else:
+            before, after = cancelled.get(pid, (None, None))
+            if before is None or before != after:
+                tally.skip("disk_write_bytes")
+            else:
+                wanted = max(int(r1["disk_write_bytes"]) - before, 0)
+                if int(rb["disk_write_bytes"]) == int(r1["disk_write_bytes"]):
+                    tally.equal("disk_write_bytes")
+                elif int(rb["disk_write_bytes"]) == wanted:
+                    tally.expected("disk_write_bytes", "%s: libgtop %s, collector %s, "
+                                   "cancelled_write_bytes %d" % (
+                                       label, r1["disk_write_bytes"],
+                                       rb["disk_write_bytes"], before))
+                else:
+                    tally.unexplained("disk_write_bytes", "%s: libgtop %s, collector %s, "
+                                      "cancelled_write_bytes %d" % (
+                                          label, r1["disk_write_bytes"],
+                                          rb["disk_write_bytes"], before))
+
+        # a CPU-time counter only grows: B was taken between A1 and A2
+        low, mid, high = int(r1["cpu_time_ticks"]), int(rb["cpu_time_ticks"]), int(r2["cpu_time_ticks"])
+        if low <= mid <= high:
+            tally.equal("cpu_time_ticks")
+        else:
+            tally.unexplained("cpu_time_ticks", "%s: A1 %d, B %d, A2 %d" % (
+                label, low, mid, high))
+
+        # CPU %: after a few refreshes the collector knows a rate for a
+        # process that was already there
+        if rb["cpu_percent"] == "unknown":
+            tally.unexplained("cpu_percent", "%s: unknown in the collector's "
+                              "dump after several refreshes" % label)
+        else:
+            tally.equal("cpu_percent")
+
+    return tally
+
+
+def parse_rows(harness, path):
+    comment, rows = harness.read_rows(path)
+    by_pid = {}
+    for row in rows:
+        by_pid[row["pid"]] = row
+    return comment, by_pid
+
+
+def dump(harness, session, ctl_path, directory, name):
+    path = os.path.join(directory, name + ".tsv")
+    status, out = harness.ctl(session, ctl_path, "rows", path)
+    if status != 0 or not out.startswith("OK"):
+        raise AssertionError("rows %s: %s" % (name, out))
+    return parse_rows(harness, path), time.time()
+
+
+def set_key(harness, session, ctl_path, key, value):
+    status, out = harness.ctl(session, ctl_path, "set", key, value)
+    if status != 0 or not out.startswith("OK"):
+        raise AssertionError("set %s %s: %s" % (key, value, out))
+
+
+def run_mode(harness, session, app, ctl_path, whose, settle_s):
+    proc, _ = session.start_app(app, "compare-%s.log" % whose)
+    try:
+        for args in (("action", "win.show-page::processes"),):
+            status, out = harness.ctl(session, ctl_path, *args)
+            if status != 0 or not out.startswith("OK"):
+                raise AssertionError("%s: %s" % (" ".join(args), out))
+        set_key(harness, session, ctl_path, "update-interval", str(UPDATE_INTERVAL_MS))
+        set_key(harness, session, ctl_path, "show-whose-processes", whose)
+
+        directory = session.root
+        set_key(harness, session, ctl_path, "process-source", "libgtop")
+        time.sleep(settle_s)
+        (c1, a1), t_a1 = dump(harness, session, ctl_path, directory, whose + "-a1")
+
+        set_key(harness, session, ctl_path, "process-source", "collector")
+        time.sleep(settle_s)
+        # cancelled_write_bytes just before and just after the collector's dump
+        pids = list(a1)
+        before = {pid: cancelled_write_bytes(int(pid)) for pid in pids}
+        (cb, b), t_b = dump(harness, session, ctl_path, directory, whose + "-b")
+        after = {pid: cancelled_write_bytes(int(pid)) for pid in pids}
+        cancelled = {pid: (before[pid], after[pid]) for pid in pids}
+
+        set_key(harness, session, ctl_path, "process-source", "libgtop")
+        time.sleep(settle_s)
+        (c2, a2), t_a2 = dump(harness, session, ctl_path, directory, whose + "-a2")
+
+        set_key(harness, session, ctl_path, "process-source", "collector")
+        time.sleep(settle_s)
+        (cb2, b2), t_b2 = dump(harness, session, ctl_path, directory, whose + "-b2")
+
+        for comment, source in ((c1, "libgtop"), (cb, "collector"), (c2, "libgtop"),
+                                (cb2, "collector")):
+            if "process-source=%s" % source not in comment:
+                raise AssertionError("dump says %r, expected %s" % (comment, source))
+            if "show-whose-processes=%s" % whose not in comment:
+                raise AssertionError("dump says %r, expected %s" % (comment, whose))
+
+        harness.ctl(session, ctl_path, "close")
+        proc.wait(timeout=harness.APP_EXIT_TIMEOUT_S)
+        return compare(whose, (a1, b, a2, b2), (t_a1, t_b, t_a2), cancelled)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("build_dir")
+    parser.add_argument("--whose", default="all,user",
+                        help="comma-separated show-whose-processes values to compare")
+    parser.add_argument("--settle", type=float, default=3.5,
+                        help="seconds to wait for refreshes after a source change")
+    args = parser.parse_args()
+
+    app = os.path.join(args.build_dir, "src", "gnome-system-monitor-rh")
+    schema_dir = os.path.join(args.build_dir, "src")
+    ctl_path = os.path.join(TOOLS_DIR, "gsm-dev-ctl")
+    if not os.access(app, os.X_OK):
+        sys.exit("compare-process-sources: no %s (build with -Ddev_ipc=true)" % app)
+
+    harness = load_harness()
+    if shutil.which("weston") is None:
+        print("SKIP: weston is not installed")
+        return SKIP
+
+    failed = False
+    with tempfile.TemporaryDirectory(prefix="gsm-compare-", dir="/dev/shm") as root:
+        session = harness.Session(root, schema_dir)
+        try:
+            for whose in args.whose.split(","):
+                tally = run_mode(harness, session, app, ctl_path, whose, args.settle)
+                tally.report("show-whose-processes=%s" % whose)
+                failed = failed or tally.unexplained_count() > 0
+        finally:
+            session.stop()
+
+    print("\n%s" % ("DIFFERENCES: unexplained differences above" if failed
+                    else "OK: every difference is expected"))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
