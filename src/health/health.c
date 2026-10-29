@@ -11,6 +11,8 @@
 
 #include "config.h"
 
+#include <string.h>
+
 #include <glib/gi18n.h>
 
 #include "gsm-battery.h"
@@ -19,6 +21,7 @@
 #include "gsm-health-db.h"
 #include "gsm-history-chart.h"
 #include "gsm-procio.h"
+#include "gsm-smart-file.h"
 #include "gsm-udisks.h"
 #include "health.h"
 #include "dev-ipc.h"
@@ -30,15 +33,58 @@
  * of days, so there is nothing to gain from doing it often. */
 #define REFRESH_INTERVAL_SECS 30
 
+/* The timer that runs the system SMART reader, asked about over D-Bus. */
+#define SMART_READER_TIMER "gsm-smart-reader.timer"
+
+/* The reader runs every ten minutes (the file goes stale after three runs). */
+#define SMART_READER_PERIOD_MINUTES 10
+
+/*
+ * The shortest stretch of recorded write counts the database needs before it
+ * reports a write rate. Kept equal to the database's own minimum so the
+ * "collecting history" line can say how much more is needed.
+ */
+#define RATE_NEEDS_SECONDS (6 * 3600)
+
+/* The trailing window the write rate is measured over. */
+#define RATE_WINDOW_DAYS 30
+
+/* Whether the system SMART reader's service is installed and switched on,
+ * as systemd's unit-file state says. Only asked when the reader's snapshot
+ * is missing, because only then does it explain anything. */
+typedef enum {
+  SERVICE_UNKNOWN,         /* systemd could not say */
+  SERVICE_NOT_INSTALLED,
+  SERVICE_TURNED_OFF,
+  SERVICE_TURNED_ON,
+} ServiceState;
+
+/* What the reader's snapshot says about one USB disk udisks cannot read. */
+typedef struct {
+  gboolean            applies;       /* a USB disk with no udisks SMART */
+  ServiceState        service;
+  GsmSmartFileState   file_state;
+  int64_t             generated_at;  /* when the snapshot was written */
+  gboolean            listed;        /* the snapshot names this disk */
+  GsmSmartDriveStatus status;
+  char               *usb_id;        /* "0634:5605" */
+  char               *bridge;        /* "asmedia" */
+  gboolean            observed;      /* bridge basis: not in smartmontools */
+  int64_t             last_ok_at;    /* 0 when never */
+  gboolean            have_figures;  /* figures taken from the snapshot */
+} UsbReading;
+
 typedef struct {
   GsmHealthView *view;
   GsmDrive      *drive;
+  UsbReading     usb;
 
   AdwPreferencesGroup *group;
   AdwBanner           *banner;
 
   GtkLabel  *headline;
   GtkLabel  *basis;
+  GtkLabel  *source_note;
   GtkLabel  *endurance;
 
   GtkWidget *wear_heading;
@@ -46,8 +92,6 @@ typedef struct {
   GtkWidget *blame_heading;
   GtkWidget *blame_chart;
   GtkLabel  *blame_note;
-
-  GtkWidget *unlock_button;
 
   /* Trailing 30-day write rate, in bytes/day; -1 when there is not yet enough
    * history to say. Computed once per refresh — the headline and the chart's
@@ -91,19 +135,312 @@ static void refresh (GsmHealthView *self);
 
 
 static void
+usb_reading_clear (UsbReading *usb)
+{
+  g_clear_pointer (&usb->usb_id, g_free);
+  g_clear_pointer (&usb->bridge, g_free);
+  memset (usb, 0, sizeof *usb);
+}
+
+
+static void
 drive_card_free (DriveCard *card)
 {
   if (card == NULL)
     return;
 
+  usb_reading_clear (&card->usb);
   g_clear_object (&card->drive);
   g_free (card);
 }
 
 
 /* ------------------------------------------------------------------ */
+/* Saying where the figures came from                                  */
+/* ------------------------------------------------------------------ */
+
+/* "5 minutes", "2 hours", "3 days": an age to read, rounded down. */
+static char *
+age_text (int64_t seconds)
+{
+  if (seconds < 60)
+    return g_strdup (_("less than a minute"));
+
+  if (seconds < 3600) {
+    int minutes = (int) (seconds / 60);
+
+    return g_strdup_printf (ngettext ("%d minute", "%d minutes", minutes), minutes);
+  }
+
+  if (seconds < 86400) {
+    int hours = (int) (seconds / 3600);
+
+    return g_strdup_printf (ngettext ("%d hour", "%d hours", hours), hours);
+  }
+
+  {
+    int days = (int) (seconds / 86400);
+
+    return g_strdup_printf (ngettext ("%d day", "%d days", days), days);
+  }
+}
+
+
+static int64_t
+now_seconds (void)
+{
+  return g_get_real_time () / G_USEC_PER_SEC;
+}
+
+
+/* The bridge as a person writes it. The reader names the protocol in
+ * lower case; an unfamiliar word is shown as it came. */
+static const char *
+bridge_display_name (const char *bridge)
+{
+  if (g_strcmp0 (bridge, "asmedia") == 0)
+    return "ASMedia";
+  if (g_strcmp0 (bridge, "jmicron") == 0)
+    return "JMicron";
+  if (g_strcmp0 (bridge, "realtek") == 0)
+    return "Realtek";
+  if (g_strcmp0 (bridge, "sat") == 0)
+    return "SAT";
+
+  return bridge != NULL ? bridge : "unknown";
+}
+
+
+/*
+ * A drive's figures are shown only when this refresh produced them: from
+ * udisks, or from a fresh snapshot of the system SMART reader. A USB disk
+ * the snapshot could not describe keeps nothing on screen from an earlier
+ * refresh that would look current.
+ */
+static gboolean
+card_has_figures (DriveCard *card)
+{
+  GsmSmartSource source = gsm_drive_get_smart_source (card->drive);
+
+  if (source != GSM_SMART_SOURCE_UDISKS && source != GSM_SMART_SOURCE_HELPER)
+    return FALSE;
+
+  return !card->usb.applies || card->usb.have_figures;
+}
+
+
+/*
+ * Why a USB disk has no figures, in words, from the service's state, the
+ * snapshot's state and the disk's own status: never a zero, never "locked".
+ * Sets the headline (a static string) and returns the explanation.
+ */
+static char *
+usb_explanation (const UsbReading *usb,
+                 const char      **headline)
+{
+  g_autofree char *age = NULL;
+
+  *headline = _("No health data");
+
+  switch (usb->file_state) {
+    case GSM_SMART_FILE_MISSING:
+      switch (usb->service) {
+        case SERVICE_NOT_INSTALLED:
+          return g_strdup (_("SMART for USB drives comes from the "
+                             "gsm-smart-reader service, which is not installed."));
+        case SERVICE_TURNED_OFF:
+          return g_strdup (_("SMART for USB drives comes from the "
+                             "gsm-smart-reader service, which is turned off. "
+                             "To turn it on: "
+                             "sudo systemctl enable --now " SMART_READER_TIMER));
+        case SERVICE_TURNED_ON:
+          return g_strdup_printf (_("SMART for USB drives comes from the "
+                                    "gsm-smart-reader service. It is turned on "
+                                    "but has not run yet; it runs shortly after "
+                                    "boot and every %d minutes."),
+                                  SMART_READER_PERIOD_MINUTES);
+        case SERVICE_UNKNOWN:
+        default:
+          return g_strdup (_("SMART for USB drives comes from the "
+                             "gsm-smart-reader service. It has not written "
+                             "anything yet, and whether it is installed could "
+                             "not be determined."));
+      }
+    case GSM_SMART_FILE_UNREADABLE:
+      return g_strdup (_("The gsm-smart-reader service has written a "
+                         "snapshot, but this program cannot read it."));
+    case GSM_SMART_FILE_MALFORMED:
+      return g_strdup (_("The gsm-smart-reader snapshot could not be "
+                         "understood, so nothing from it is shown."));
+    case GSM_SMART_FILE_UNKNOWN_SCHEMA:
+      return g_strdup (_("The gsm-smart-reader snapshot is in a newer format "
+                         "than this version reads."));
+    case GSM_SMART_FILE_STALE:
+      age = age_text (now_seconds () - usb->generated_at);
+      *headline = _("Reading is out of date");
+      return g_strdup_printf (_("The gsm-smart-reader service last ran %s ago, "
+                                "more than %d minutes, so its figures are not "
+                                "shown. It should run every %d minutes; check "
+                                "that " SMART_READER_TIMER " is active."),
+                              age, GSM_SMART_FILE_MAX_AGE_SECONDS / 60,
+                              SMART_READER_PERIOD_MINUTES);
+    case GSM_SMART_FILE_OK:
+    default:
+      break;
+  }
+
+  if (!usb->listed)
+    return g_strdup_printf (_("The last gsm-smart-reader run did not list this "
+                              "drive. It reads USB drives every %d minutes and "
+                              "when one is plugged in."),
+                            SMART_READER_PERIOD_MINUTES);
+
+  switch (usb->status) {
+    case GSM_SMART_DRIVE_ASLEEP:
+      *headline = _("Asleep");
+      return g_strdup (_("This drive is asleep. The reader leaves a sleeping "
+                         "drive alone rather than wake it, and has no earlier "
+                         "reading of it."));
+    case GSM_SMART_DRIVE_UNSUPPORTED:
+      *headline = _("Enclosure not supported");
+      return g_strdup_printf (_("This USB enclosure (USB %s) is not one the "
+                                "reader knows how to talk to, so it sends it "
+                                "nothing."),
+                              usb->usb_id != NULL ? usb->usb_id : _("id unknown"));
+    case GSM_SMART_DRIVE_FAILED:
+      *headline = _("Could not be read");
+      return g_strdup (_("The reader asked this drive for SMART data and got "
+                         "no usable answer."));
+    case GSM_SMART_DRIVE_GARBLED:
+      *headline = _("Answer not believed");
+      return g_strdup (_("This drive answered, but the answer failed the "
+                         "reader's sanity checks, so it is not shown."));
+    case GSM_SMART_DRIVE_UNKNOWN_STATUS:
+      return g_strdup (_("The reader reported a state this version does not "
+                         "know."));
+    case GSM_SMART_DRIVE_OK:
+    default:
+      return g_strdup (_("The reader read this drive, but it gave none of the "
+                         "figures shown here."));
+  }
+}
+
+
+/*
+ * One or two sentences on where this card's health figures come from, and
+ * how much to trust them. Empty (and hidden) when there are none.
+ */
+static void
+update_source_note (DriveCard *card)
+{
+  const UsbReading *usb = &card->usb;
+  GString *text = g_string_new (NULL);
+
+  if (!card_has_figures (card)) {
+    /* nothing to attribute */
+  } else if (usb->applies) {
+    g_autofree char *age = NULL;
+
+    if (usb->status == GSM_SMART_DRIVE_ASLEEP) {
+      if (usb->last_ok_at > 0) {
+        age = age_text (now_seconds () - usb->last_ok_at);
+        g_string_append_printf (text,
+                                _("This drive is asleep, so the reader left it "
+                                  "alone. These are its last good figures, read "
+                                  "%s ago."), age);
+      } else {
+        g_string_append (text,
+                         _("This drive is asleep, so the reader left it alone. "
+                           "These are its last good figures."));
+      }
+    } else {
+      age = age_text (now_seconds () - usb->generated_at);
+      g_string_append_printf (text,
+                              _("Health figures from the gsm-smart-reader "
+                                "service, read %s ago."), age);
+    }
+
+    if (usb->observed) {
+      g_string_append_c (text, '\n');
+      g_string_append_printf (text,
+                              _("This enclosure (USB %s) is not in "
+                                "smartmontools' drive database. Its figures "
+                                "come through the %s tunnel and pass sanity "
+                                "checks, but are unverified."),
+                              usb->usb_id != NULL ? usb->usb_id : _("id unknown"),
+                              bridge_display_name (usb->bridge));
+    }
+  } else {
+    g_string_append (text, _("Health figures read through udisks."));
+  }
+
+  gtk_label_set_text (card->source_note, text->str);
+  gtk_widget_set_visible (GTK_WIDGET (card->source_note), text->len > 0);
+  g_string_free (text, TRUE);
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Formatting the headline                                             */
 /* ------------------------------------------------------------------ */
+
+/*
+ * How long the recorded write counts for this drive span, in seconds: what
+ * the database measures its write rate over, from the same trailing window.
+ */
+static int64_t
+recorded_write_span_seconds (DriveCard *card)
+{
+  g_autoptr (GArray) history = NULL;
+  int64_t first = 0;
+  int64_t last = 0;
+
+  history = gsm_health_db_get_history (card->view->db,
+                                       gsm_drive_get_id (card->drive),
+                                       GSM_HISTORY_RANGE_MONTH);
+
+  for (guint i = 0; i < history->len; i++) {
+    const GsmHistoryPoint *p = &g_array_index (history, GsmHistoryPoint, i);
+
+    if (p->bytes_written == 0)
+      continue;
+    if (first == 0)
+      first = p->ts;
+    last = p->ts;
+  }
+
+  return last - first;
+}
+
+
+/* The "Collecting history" line: how much is recorded and how much the
+ * estimate needs. */
+static char *
+collecting_history_text (DriveCard *card)
+{
+  int64_t recorded = recorded_write_span_seconds (card);
+  g_autofree char *needed = age_text (RATE_NEEDS_SECONDS);
+
+  if (recorded >= RATE_NEEDS_SECONDS)
+    return g_strdup_printf (_("Collecting history: the write counts recorded "
+                              "so far do not yet give a usable write rate "
+                              "(a lifespan estimate needs at least %s of "
+                              "them rising)."), needed);
+
+  if (recorded <= 0)
+    return g_strdup_printf (_("Collecting history: nothing recorded for this "
+                              "drive yet; a lifespan estimate needs at least "
+                              "%s of write counts."), needed);
+
+  {
+    g_autofree char *have = age_text (recorded);
+
+    return g_strdup_printf (_("Collecting history: %s of write counts "
+                              "recorded; a lifespan estimate needs at least "
+                              "%s."), have, needed);
+  }
+}
+
 
 /*
  * The one number a user actually wants. Everything else on the card exists to
@@ -114,29 +451,34 @@ static void
 update_headline (DriveCard *card)
 {
   GsmDrive *drive = card->drive;
-  GsmSmartSource source = gsm_drive_get_smart_source (drive);
   double rate = card->write_rate;
   double years;
   g_autofree char *basis = NULL;
 
-  if (source == GSM_SMART_SOURCE_LOCKED) {
-    gtk_label_set_text (card->headline, _("Health data is locked"));
-    gtk_label_set_text (card->basis,
-                        _("This drive’s controller will not report health "
-                          "without administrator access."));
-    gtk_widget_set_visible (card->unlock_button, TRUE);
+  if (card->usb.applies && !card->usb.have_figures) {
+    const char *headline = NULL;
+
+    basis = usb_explanation (&card->usb, &headline);
+    gtk_label_set_text (card->headline, headline);
+    gtk_label_set_text (card->basis, basis);
     return;
   }
 
-  if (source == GSM_SMART_SOURCE_UNSUPPORTED || source == GSM_SMART_SOURCE_NONE) {
-    gtk_label_set_text (card->headline, _("No health data"));
-    gtk_label_set_text (card->basis,
-                        _("This drive does not report SMART data."));
-    gtk_widget_set_visible (card->unlock_button, FALSE);
+  if (!card_has_figures (card)) {
+    GsmSmartSource source = gsm_drive_get_smart_source (drive);
+
+    if (source == GSM_SMART_SOURCE_UNSUPPORTED) {
+      gtk_label_set_text (card->headline, _("No health data"));
+      gtk_label_set_text (card->basis,
+                          _("This drive does not report SMART data."));
+    } else {
+      gtk_label_set_text (card->headline, _("No health data yet"));
+      gtk_label_set_text (card->basis,
+                          _("The system's disk service (udisks) has not read "
+                            "SMART data from this drive."));
+    }
     return;
   }
-
-  gtk_widget_set_visible (card->unlock_button, FALSE);
 
   /*
    * Some enclosures answer "am I dying?" but not "how worn am I?" — a plain
@@ -174,10 +516,12 @@ update_headline (DriveCard *card)
       gtk_label_set_text (card->headline, _("Healthy"));
     }
 
+    if (card->view->tracking_enabled && card->view->db != NULL)
+      basis = collecting_history_text (card);
+
     gtk_label_set_text (card->basis,
-                        card->view->tracking_enabled
-                        ? _("Collecting history — a lifespan estimate needs "
-                            "a few hours of data")
+                        basis != NULL
+                        ? basis
                         : _("Turn on wear tracking below to project a lifespan"));
     return;
   }
@@ -206,6 +550,62 @@ update_headline (DriveCard *card)
 }
 
 
+/* g_format_size() with a whole number left whole: "400 TB", not "400.0 TB",
+ * as a maker writes a rating. */
+static char *
+format_size_plain (uint64_t bytes)
+{
+  char *text = g_format_size (bytes);
+  char *unit = text;
+
+  /* The number ends where the digits and the decimal mark do; GLib puts a
+   * no-break space, not a plain one, between it and the unit. */
+  while (g_ascii_isdigit (*unit) || *unit == '.' || *unit == ',')
+    unit++;
+
+  if (unit - text >= 3 && unit[-1] == '0' && (unit[-2] == '.' || unit[-2] == ','))
+    memmove (unit - 2, unit, strlen (unit) + 1);
+
+  return text;
+}
+
+
+/* "1.67-1.81 PB": both ends in the unit of the larger, two decimals each,
+ * because the range is the point and one decimal would hide it. */
+static char *
+format_endurance_range (uint64_t low_bytes,
+                        uint64_t high_bytes)
+{
+  static const char *const units[] = { "B", "kB", "MB", "GB", "TB", "PB", "EB" };
+  double scale = 1;
+  gsize unit = 0;
+
+  while (unit + 1 < G_N_ELEMENTS (units) && (double) high_bytes / scale >= 1000) {
+    scale *= 1000;
+    unit++;
+  }
+
+  return g_strdup_printf ("%.2f-%.2f %s",
+                          (double) low_bytes / scale,
+                          (double) high_bytes / scale, units[unit]);
+}
+
+
+/* What share of the maker's rating has been written, in whole percent. */
+static int
+written_share_percent (uint64_t written_bytes,
+                       uint64_t rated_bytes)
+{
+  return (int) (100.0 * (double) written_bytes / (double) rated_bytes + 0.5);
+}
+
+
+/*
+ * Two truths about endurance, kept apart and each with its source: what the
+ * maker publishes (an exact model and capacity, with the document it came
+ * from, or "not published"), and what the drive's own wear counter says.
+ * The counter is whole percent, so what it implies is a range.
+ */
 static void
 update_endurance (DriveCard *card)
 {
@@ -213,69 +613,100 @@ update_endurance (DriveCard *card)
   GString *text = g_string_new (NULL);
   int percent = gsm_drive_get_percent_used (drive);
   uint64_t written = gsm_drive_get_bytes_written (drive);
-  uint64_t rated = gsm_drive_get_rated_tbw (drive);
+  uint64_t maker = gsm_drive_get_maker_rated_tbw (drive);
   uint64_t hours = gsm_drive_get_power_on_hours (drive);
+  uint64_t low = 0, high = 0;
+  gboolean implied;
 
-  if (percent >= 0)
-    g_string_append_printf (text, _("%d%% worn"), percent);
+  if (!card_has_figures (card)) {
+    gtk_label_set_text (card->endurance, "");
+    gtk_widget_set_visible (GTK_WIDGET (card->endurance), FALSE);
+    g_string_free (text, TRUE);
+    return;
+  }
+
+  implied = gsm_drive_get_implied_endurance (drive, &low, &high);
 
   if (written > 0) {
     g_autofree char *size = g_format_size (written);
 
-    if (text->len > 0)
-      g_string_append (text, " · ");
     g_string_append_printf (text, _("%s written"), size);
   }
 
+  /* The drive's own hour count: some controllers do not count wall-clock
+   * time (570 h on a drive in daily use), so it is never used for a rate. */
   if (hours > 0) {
     if (text->len > 0)
       g_string_append (text, " · ");
-    g_string_append_printf (text, _("%" G_GUINT64_FORMAT " h powered on"), hours);
+    g_string_append_printf (text, _("%" G_GUINT64_FORMAT " h powered on, as "
+                                    "counted by the drive"), hours);
   }
 
-  if (rated > 0) {
-    g_autofree char *size = g_format_size (rated);
-    const char *provenance;
+  /* The maker's truth. */
+  if (text->len > 0)
+    g_string_append_c (text, '\n');
 
-    switch (gsm_drive_get_endurance_source (drive)) {
-      case GSM_ENDURANCE_USER:
-        provenance = _("you set this");
-        break;
-      case GSM_ENDURANCE_DERIVED:
-        provenance = _("implied by the drive’s own wear");
-        break;
-      case GSM_ENDURANCE_SPEC_DB:
-        provenance = _("from the datasheet");
-        break;
-      case GSM_ENDURANCE_UNKNOWN:
-      default:
-        provenance = NULL;
-        break;
+  if (maker > 0) {
+    g_autofree char *rated = format_size_plain (maker);
+    const char *label = gsm_drive_get_maker_source_label (drive);
+
+    g_string_append_printf (text, _("Rated %s written by the maker (%s)"),
+                            rated, label != NULL ? label : _("source unnamed"));
+
+    if (written > 0) {
+      g_autofree char *size = format_size_plain (written);
+
+      g_string_append_printf (text, _("; %s written is %d %% of it"), size,
+                              written_share_percent (written, maker));
     }
+  } else {
+    g_string_append (text, _("Endurance not published by the maker"));
+  }
+
+  /* The drive's truth. */
+  if (percent >= 0) {
+    g_string_append_c (text, '\n');
+    g_string_append_printf (text, _("The drive's own wear counter: %d %% used"),
+                            percent);
+
+    if (implied) {
+      g_autofree char *range = format_endurance_range (low, high);
+
+      g_string_append_printf (text, _(" (implies %s)"), range);
+    } else {
+      g_string_append (text, _(" (too little worn to imply an endurance)"));
+    }
+  }
+
+  if (gsm_drive_get_endurance_source (drive) == GSM_ENDURANCE_USER) {
+    g_autofree char *size = format_size_plain (gsm_drive_get_rated_tbw (drive));
 
     g_string_append_c (text, '\n');
-    g_string_append_printf (text, _("Rated endurance %s"), size);
-
-    /* Never present a number without saying where it came from: a figure
-     * derived from this drive and a figure copied off a datasheet deserve
-     * very different amounts of trust. */
-    if (provenance != NULL)
-      g_string_append_printf (text, " (%s)", provenance);
+    g_string_append_printf (text, _("Endurance you set: %s"), size);
   }
 
   /*
-   * When the drive's own wear estimate and the datasheet disagree, say so.
-   * Silently picking one would make the number look more certain than it is —
-   * and on a WD SN740 the two differ by more than threefold.
+   * When the drive's own wear estimate and the maker's rating disagree, say
+   * so. Silently picking one would make the number look more certain than it
+   * is — on a WD SN740 the two differ by more than threefold.
    */
   if (gsm_drive_endurance_is_conflicted (drive)) {
+    gboolean drive_says_less = implied && maker > 0 && high > maker;
+
     g_string_append_c (text, '\n');
-    g_string_append (text,
-                     _("The drive reports far less wear than its rating "
-                       "predicts. Projections follow the drive."));
+    g_string_append_printf (text,
+                            drive_says_less
+                            ? _("The drive reports far less wear than the "
+                                "maker's rating predicts. %s")
+                            : _("The drive reports far more wear than the "
+                                "maker's rating predicts. %s"),
+                            gsm_drive_get_endurance_source (drive) == GSM_ENDURANCE_USER
+                            ? _("Projections follow the figure you set.")
+                            : _("Projections follow the drive."));
   }
 
   gtk_label_set_text (card->endurance, text->str);
+  gtk_widget_set_visible (GTK_WIDGET (card->endurance), text->len > 0);
   g_string_free (text, TRUE);
 }
 
@@ -294,6 +725,12 @@ update_banner (DriveCard *card)
   uint64_t reallocated = gsm_drive_get_reallocated (drive);
   uint64_t media_errors = gsm_drive_get_media_errors (drive);
   g_autofree char *message = NULL;
+
+  /* A verdict from an earlier refresh is not a warning about now. */
+  if (!card_has_figures (card)) {
+    adw_banner_set_revealed (card->banner, FALSE);
+    return;
+  }
 
   if (health == GSM_DRIVE_HEALTH_FAILING) {
     message = g_strdup_printf (
@@ -480,190 +917,6 @@ update_charts (DriveCard *card)
 
 
 /* ------------------------------------------------------------------ */
-/* The privileged unlock                                               */
-/* ------------------------------------------------------------------ */
-
-/*
- * Parse the helper's key=value output. Deliberately a dumb format: the helper
- * runs as root, and the less it has to serialise the smaller the surface for
- * getting that wrong.
- */
-static void
-apply_helper_output (DriveCard  *card,
-                     const char *output)
-{
-  g_auto (GStrv) lines = g_strsplit (output, "\n", -1);
-  GsmDriveInfo info = { 0 };
-
-  info.temperature = -1;
-  info.percent_used = -1;
-  info.spare_percent = -1;
-  info.spare_threshold = -1;
-  info.present = TRUE;
-  info.smart_source = GSM_SMART_SOURCE_HELPER;
-
-  for (guint i = 0; lines[i] != NULL; i++) {
-    char *eq = strchr (lines[i], '=');
-    const char *key, *value;
-
-    if (eq == NULL)
-      continue;
-
-    *eq = '\0';
-    key = lines[i];
-    value = eq + 1;
-
-    if (g_strcmp0 (key, "model") == 0)
-      info.model = g_strdup (value);
-    else if (g_strcmp0 (key, "serial") == 0)
-      info.serial = g_strdup (value);
-    else if (g_strcmp0 (key, "firmware") == 0)
-      info.firmware = g_strdup (value);
-    else if (g_strcmp0 (key, "percent_used") == 0)
-      info.percent_used = atoi (value);
-    else if (g_strcmp0 (key, "temperature_c") == 0)
-      info.temperature = atoi (value);
-    else if (g_strcmp0 (key, "available_spare") == 0)
-      info.spare_percent = atoi (value);
-    else if (g_strcmp0 (key, "available_spare_threshold") == 0)
-      info.spare_threshold = atoi (value);
-    else if (g_strcmp0 (key, "data_units_written_bytes") == 0)
-      info.bytes_written = g_ascii_strtoull (value, NULL, 10);
-    else if (g_strcmp0 (key, "data_units_read_bytes") == 0)
-      info.bytes_read = g_ascii_strtoull (value, NULL, 10);
-    else if (g_strcmp0 (key, "power_on_hours") == 0)
-      info.power_on_hours = g_ascii_strtoull (value, NULL, 10);
-    else if (g_strcmp0 (key, "power_cycles") == 0)
-      info.power_cycles = g_ascii_strtoull (value, NULL, 10);
-    else if (g_strcmp0 (key, "unsafe_shutdowns") == 0)
-      info.unsafe_shutdowns = g_ascii_strtoull (value, NULL, 10);
-    else if (g_strcmp0 (key, "media_errors") == 0)
-      info.media_errors = g_ascii_strtoull (value, NULL, 10);
-    else if (g_strcmp0 (key, "smart_failing") == 0)
-      info.smart_failing = atoi (value) != 0;
-    else if (g_strcmp0 (key, "wear_unavailable") == 0)
-      info.wear_unavailable = atoi (value) != 0;
-    else if (g_strcmp0 (key, "attr.5.raw") == 0)
-      info.reallocated = g_ascii_strtoull (value, NULL, 10);
-  }
-
-  gsm_drive_apply_info (card->drive, &info);
-  gsm_drive_resolve_endurance (
-    card->drive,
-    gsm_health_db_get_user_tbw (card->view->db, gsm_drive_get_id (card->drive)));
-
-  gsm_health_db_record_drive (card->view->db, card->drive);
-  gsm_health_db_commit (card->view->db, NULL);
-
-  gsm_drive_info_clear (&info);
-
-  update_headline (card);
-  update_endurance (card);
-  update_banner (card);
-  update_charts (card);
-}
-
-
-static void
-unlock_finished (GObject      *source,
-                 GAsyncResult *result,
-                 gpointer      user_data)
-{
-  DriveCard *card = user_data;
-  g_autoptr (GError) error = NULL;
-  g_autofree char *stdout_text = NULL;
-  g_autofree char *stderr_text = NULL;
-
-  if (!g_subprocess_communicate_utf8_finish (G_SUBPROCESS (source), result,
-                                             &stdout_text, &stderr_text,
-                                             &error)) {
-    g_warning ("health: SMART helper failed: %s", error->message);
-    return;
-  }
-
-  gtk_widget_set_sensitive (card->unlock_button, TRUE);
-
-  if (!g_subprocess_get_successful (G_SUBPROCESS (source))) {
-    /*
-     * pkexec exits 126 when the user dismisses the prompt. That is a choice,
-     * not a fault, so it must not raise an error dialog at them.
-     */
-    if (g_subprocess_get_exit_status (G_SUBPROCESS (source)) == 126)
-      return;
-
-    adw_banner_set_title (card->banner,
-                          stderr_text != NULL && *stderr_text != '\0'
-                          ? g_strchomp (stderr_text)
-                          : _("Could not read SMART data from this drive."));
-    adw_banner_set_revealed (card->banner, TRUE);
-    return;
-  }
-
-  apply_helper_output (card, stdout_text);
-}
-
-
-/*
- * Where the privileged helper lives.
- *
- * In a release build this is fixed at compile time and nothing can redirect
- * it: it is the binary we are about to ask pkexec to run as root, and letting
- * the environment choose that would be handing an attacker a root exec. The
- * override exists only so an uninstalled dev build can reach its own helper,
- * and is compiled out entirely otherwise — the same lock the dev IPC socket
- * uses.
- */
-static char *
-smart_helper_path (void)
-{
-#ifdef HAVE_DEV_IPC
-  const char *override = g_getenv ("GSM_SMART_HELPER");
-
-  if (override != NULL && *override != '\0')
-    return g_strdup (override);
-#endif
-
-  return g_build_filename (GSM_LIBEXEC_DIR, "gsm-smart", NULL);
-}
-
-
-static void
-on_unlock_clicked (GtkButton *button,
-                   gpointer   user_data)
-{
-  DriveCard *card = user_data;
-  g_autoptr (GSubprocess) proc = NULL;
-  g_autoptr (GError) error = NULL;
-  const char *device = gsm_drive_get_device (card->drive);
-  g_autofree char *helper = smart_helper_path ();
-
-  if (device == NULL)
-    return;
-
-  if (gsm_dev_sandbox_enabled ()) {
-    gtk_widget_set_tooltip_text (GTK_WIDGET (button), gsm_dev_sandbox_reason ());
-    return;
-  }
-
-  gtk_widget_set_sensitive (GTK_WIDGET (button), FALSE);
-
-  /* One drive, one read, then the helper exits. Nothing privileged stays
-   * resident, and the background sampler never goes down this path at all. */
-  proc = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                           G_SUBPROCESS_FLAGS_STDERR_PIPE,
-                           &error,
-                           "pkexec", helper, device, NULL);
-  if (proc == NULL) {
-    g_warning ("health: cannot launch helper: %s", error->message);
-    gtk_widget_set_sensitive (GTK_WIDGET (button), TRUE);
-    return;
-  }
-
-  g_subprocess_communicate_utf8_async (proc, NULL, NULL, unlock_finished, card);
-}
-
-
-/* ------------------------------------------------------------------ */
 /* Building a drive card                                               */
 /* ------------------------------------------------------------------ */
 
@@ -753,6 +1006,7 @@ drive_card_new (GsmHealthView *self,
   GtkWidget *box;
   GtkWidget *headline;
   GtkWidget *basis;
+  GtkWidget *source_note;
   GtkWidget *endurance;
   GtkWidget *note;
 
@@ -778,17 +1032,21 @@ drive_card_new (GsmHealthView *self,
   gtk_widget_add_css_class (basis, "dim-label");
   gtk_widget_set_halign (basis, GTK_ALIGN_START);
   gtk_label_set_wrap (GTK_LABEL (basis), TRUE);
+  gtk_label_set_xalign (GTK_LABEL (basis), 0);
+  /* So the command that turns the SMART service on can be copied. */
+  gtk_label_set_selectable (GTK_LABEL (basis), TRUE);
   card->basis = GTK_LABEL (basis);
   gtk_box_append (GTK_BOX (box), basis);
 
-  card->unlock_button = gtk_button_new_with_label (_("Unlock Full SMART…"));
-  gtk_widget_add_css_class (card->unlock_button, "suggested-action");
-  gtk_widget_set_halign (card->unlock_button, GTK_ALIGN_START);
-  gtk_widget_set_margin_top (card->unlock_button, 6);
-  gtk_widget_set_visible (card->unlock_button, FALSE);
-  g_signal_connect (card->unlock_button, "clicked",
-                    G_CALLBACK (on_unlock_clicked), card);
-  gtk_box_append (GTK_BOX (box), card->unlock_button);
+  source_note = gtk_label_new (NULL);
+  gtk_widget_add_css_class (source_note, "dim-label");
+  gtk_widget_add_css_class (source_note, "caption");
+  gtk_widget_set_halign (source_note, GTK_ALIGN_START);
+  gtk_label_set_wrap (GTK_LABEL (source_note), TRUE);
+  gtk_label_set_xalign (GTK_LABEL (source_note), 0);
+  gtk_widget_set_visible (source_note, FALSE);
+  card->source_note = GTK_LABEL (source_note);
+  gtk_box_append (GTK_BOX (box), source_note);
 
   endurance = gtk_label_new (NULL);
   gtk_widget_add_css_class (endurance, "dim-label");
@@ -981,6 +1239,118 @@ refresh_batteries (GsmHealthView *self)
  * seconds. So it runs on a worker thread and the widgets are only touched once
  * it comes back.
  */
+/* Everything one refresh learned, handed from the worker to the main loop. */
+typedef struct {
+  GPtrArray    *infos;        /* GsmDriveInfo*, from udisks */
+  GsmSmartFile *smart_file;   /* NULL unless a USB disk needed it */
+  ServiceState  service;      /* only asked when the snapshot is missing */
+} Snapshot;
+
+
+static void
+snapshot_free (Snapshot *snapshot)
+{
+  if (snapshot == NULL)
+    return;
+
+  g_clear_pointer (&snapshot->infos, g_ptr_array_unref);
+  g_clear_pointer (&snapshot->smart_file, gsm_smart_file_free);
+  g_free (snapshot);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (Snapshot, snapshot_free)
+
+
+static gboolean
+info_is_usb (const GsmDriveInfo *info)
+{
+  return g_strcmp0 (info->connection, "usb") == 0;
+}
+
+
+/* A USB disk udisks gave no SMART for: the only kind the reader's snapshot
+ * is for. */
+static gboolean
+info_needs_smart_file (const GsmDriveInfo *info)
+{
+  return info_is_usb (info) && info->smart_source != GSM_SMART_SOURCE_UDISKS;
+}
+
+
+/*
+ * Where the reader's snapshot lives. A developer build can point it at a
+ * scratch file to show each state; a release build cannot be redirected.
+ */
+static const char *
+smart_file_path (void)
+{
+#ifdef HAVE_DEV_IPC
+  const char *override = g_getenv ("GSM_SMART_FILE");
+
+  if (override != NULL && *override != '\0')
+    return override;
+#endif
+
+  return GSM_SMART_FILE_DEFAULT_PATH;
+}
+
+
+/*
+ * Is the reader's timer installed and switched on? systemd's unit-file state
+ * answers without privilege. Anything but a clear answer is "unknown": the
+ * card then says it could not tell, rather than guessing "not installed".
+ */
+static ServiceState
+query_service_state (GDBusConnection *bus)
+{
+  g_autoptr (GVariant) reply = NULL;
+  g_autoptr (GError) error = NULL;
+  const char *state = NULL;
+
+  reply = g_dbus_connection_call_sync (bus,
+                                       "org.freedesktop.systemd1",
+                                       "/org/freedesktop/systemd1",
+                                       "org.freedesktop.systemd1.Manager",
+                                       "GetUnitFileState",
+                                       g_variant_new ("(s)", SMART_READER_TIMER),
+                                       G_VARIANT_TYPE ("(s)"),
+                                       G_DBUS_CALL_FLAGS_NONE, 2000,
+                                       NULL, &error);
+  if (reply == NULL) {
+    g_autofree char *remote = g_dbus_error_get_remote_error (error);
+
+    /* systemd answers FileNotFound for a unit file that does not exist. */
+    if (g_strcmp0 (remote, "org.freedesktop.DBus.Error.FileNotFound") == 0 ||
+        g_strcmp0 (remote, "org.freedesktop.systemd1.NoSuchUnit") == 0)
+      return SERVICE_NOT_INSTALLED;
+
+    return SERVICE_UNKNOWN;
+  }
+
+  g_variant_get (reply, "(&s)", &state);
+
+  if (g_strcmp0 (state, "enabled") == 0 || g_strcmp0 (state, "enabled-runtime") == 0 ||
+      g_strcmp0 (state, "static") == 0 || g_strcmp0 (state, "generated") == 0 ||
+      g_strcmp0 (state, "transient") == 0 || g_strcmp0 (state, "alias") == 0)
+    return SERVICE_TURNED_ON;
+
+  if (g_strcmp0 (state, "disabled") == 0 || g_strcmp0 (state, "masked") == 0 ||
+      g_strcmp0 (state, "masked-runtime") == 0 || g_strcmp0 (state, "linked") == 0 ||
+      g_strcmp0 (state, "linked-runtime") == 0)
+    return SERVICE_TURNED_OFF;
+
+  return SERVICE_UNKNOWN;
+}
+
+
+/*
+ * Reading SMART means a GetManagedObjects round trip plus a SmartGetAttributes
+ * call per drive, all synchronous. Doing that on the main loop would freeze the
+ * entire window — including the Processes tab — for as long as udisksd takes to
+ * answer, which on a drive that has spun down or a wedged USB bridge can be
+ * seconds. So it runs on a worker thread and the widgets are only touched once
+ * it comes back. The reader's snapshot is one small file read, taken here too.
+ */
 static void
 collect_in_thread (GTask        *task,
                    gpointer      source,
@@ -989,17 +1359,141 @@ collect_in_thread (GTask        *task,
 {
   GDBusConnection *bus = task_data;
   GError *error = NULL;
+  Snapshot *snapshot;
   GPtrArray *infos;
+  gboolean wants_file = FALSE;
 
   (void) source;
   (void) cancellable;
 
   infos = gsm_udisks_collect (bus, &error);
 
-  if (infos == NULL)
+  if (infos == NULL) {
     g_task_return_error (task, error);
-  else
-    g_task_return_pointer (task, infos, (GDestroyNotify) g_ptr_array_unref);
+    return;
+  }
+
+  snapshot = g_new0 (Snapshot, 1);
+  snapshot->infos = infos;
+
+  for (guint i = 0; i < infos->len && !wants_file; i++)
+    wants_file = info_needs_smart_file (g_ptr_array_index (infos, i));
+
+  if (wants_file) {
+    snapshot->smart_file = gsm_smart_file_load (smart_file_path (),
+                                                now_seconds (),
+                                                GSM_SMART_FILE_MAX_AGE_SECONDS);
+
+    if (snapshot->smart_file->state == GSM_SMART_FILE_MISSING)
+      snapshot->service = query_service_state (bus);
+  }
+
+  g_task_return_pointer (task, snapshot, (GDestroyNotify) snapshot_free);
+}
+
+
+/*
+ * What the reader's snapshot says about this USB disk, and its figures into
+ * `info` when it has fresh ones. An asleep disk's snapshot entry keeps the
+ * last good figures; they are taken as that, with their age shown.
+ */
+static void
+usb_reading_update (DriveCard          *card,
+                    GsmDriveInfo       *info,
+                    const Snapshot     *snapshot)
+{
+  UsbReading *usb = &card->usb;
+  const GsmSmartFile *file = snapshot->smart_file;
+  const GsmSmartFileDrive *entry;
+
+  usb_reading_clear (usb);
+
+  if (file == NULL || !info_needs_smart_file (info))
+    return;
+
+  usb->applies = TRUE;
+  usb->service = snapshot->service;
+  usb->file_state = file->state;
+  usb->generated_at = file->generated_at;
+
+  entry = gsm_smart_file_find (file, info->serial);
+  if (entry == NULL)
+    return;
+
+  usb->listed = TRUE;
+  usb->status = entry->status;
+  usb->usb_id = g_strdup (entry->usb_id);
+  usb->bridge = g_strdup (entry->bridge);
+  usb->observed = g_strcmp0 (entry->basis, "observed") == 0;
+  usb->last_ok_at = entry->last_ok_generated_at;
+
+  if (entry->status == GSM_SMART_DRIVE_OK) {
+    usb->have_figures = gsm_smart_file_fill_info (file, entry, info);
+  } else if (entry->status == GSM_SMART_DRIVE_ASLEEP) {
+    /* fill_info takes figures only from an ok entry; an asleep entry's
+     * figures are the last good ones, so ask it about a copy that says ok. */
+    GsmSmartFileDrive as_last_good = *entry;
+
+    as_last_good.status = GSM_SMART_DRIVE_OK;
+    usb->have_figures = gsm_smart_file_fill_info (file, &as_last_good, info);
+  }
+}
+
+
+/* The local calendar day of a timestamp, as a comparable number. */
+static guint
+local_day_key (int64_t ts)
+{
+  g_autoptr (GDateTime) when = g_date_time_new_from_unix_local (ts);
+
+  return when != NULL
+         ? (guint) (g_date_time_get_year (when) * 1000 + g_date_time_get_day_of_year (when))
+         : 0;
+}
+
+
+/*
+ * "Recorded since <date>; N days with data": the first record, and how many
+ * calendar days actually hold one. The span alone ("107 days of history")
+ * would call a single leftover row from months ago a long history.
+ */
+static void
+update_history_row (GsmHealthView *self)
+{
+  uint64_t bytes = gsm_health_db_get_size_bytes (self->db);
+  int64_t oldest = gsm_health_db_get_oldest_sample (self->db);
+  g_autofree char *size = g_format_size (bytes);
+  g_autofree char *subtitle = NULL;
+
+  if (oldest > 0) {
+    g_autoptr (GHashTable) days = g_hash_table_new (g_direct_hash, g_direct_equal);
+    g_autoptr (GDateTime) since = g_date_time_new_from_unix_local (oldest);
+    g_autofree char *since_text = since != NULL ? g_date_time_format (since, "%x") : NULL;
+    GHashTableIter iter;
+    gpointer id;
+    guint with_data;
+
+    g_hash_table_iter_init (&iter, self->cards);
+    while (g_hash_table_iter_next (&iter, &id, NULL)) {
+      g_autoptr (GArray) history =
+        gsm_health_db_get_history (self->db, id, GSM_HISTORY_RANGE_YEAR);
+
+      for (guint i = 0; i < history->len; i++)
+        g_hash_table_add (days,
+                          GUINT_TO_POINTER (local_day_key (
+                            g_array_index (history, GsmHistoryPoint, i).ts)));
+    }
+    with_data = g_hash_table_size (days);
+
+    subtitle = g_strdup_printf (
+      ngettext ("Recorded since %s; %u day with data · %s",
+                "Recorded since %s; %u days with data · %s", with_data),
+      since_text != NULL ? since_text : "?", with_data, size);
+  } else {
+    subtitle = g_strdup_printf (_("No history yet · %s"), size);
+  }
+
+  adw_action_row_set_subtitle (self->history_row, subtitle);
 }
 
 
@@ -1008,9 +1502,10 @@ collect_in_thread (GTask        *task,
  * widgets.
  */
 static void
-apply_drives (GsmHealthView *self,
-              GPtrArray     *infos)
+apply_drives (GsmHealthView  *self,
+              const Snapshot *snapshot)
 {
+  GPtrArray *infos = snapshot->infos;
   g_autoptr (GHashTable) seen =
     g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   GHashTableIter iter;
@@ -1036,21 +1531,24 @@ apply_drives (GsmHealthView *self,
       push_trailing_groups_down (self);
     }
 
-    /*
-     * A drive that has already been unlocked keeps its richer data: the
-     * merge rules in GsmDrive refuse to let this thinner unprivileged
-     * snapshot overwrite what the helper read.
-     */
+    /* A USB disk udisks cannot read gets its figures, or the reason it has
+     * none, from the system SMART reader's snapshot. */
+    usb_reading_update (card, info, snapshot);
+
+    /* The merge rules in GsmDrive refuse to let a thinner reading overwrite
+     * a richer one, so a source that gave less never downgrades a card. */
     gsm_drive_apply_info (card->drive, info);
     gsm_drive_resolve_endurance (
       card->drive, gsm_health_db_get_user_tbw (self->db, info->serial));
 
     /* Both the headline and the chart's projection are built from this, so
      * measure it once rather than running the same query twice. */
-    card->write_rate = gsm_health_db_get_write_rate (self->db, info->serial, 30);
+    card->write_rate = gsm_health_db_get_write_rate (self->db, info->serial,
+                                                 RATE_WINDOW_DAYS);
 
     update_card_title (card);
     update_headline (card);
+    update_source_note (card);
     update_endurance (card);
     update_banner (card);
     update_charts (card);
@@ -1069,27 +1567,7 @@ apply_drives (GsmHealthView *self,
 
   refresh_batteries (self);
 
-  /* History size / retention, so the record we keep is never a mystery. */
-  {
-    uint64_t bytes = gsm_health_db_get_size_bytes (self->db);
-    int64_t oldest = gsm_health_db_get_oldest_sample (self->db);
-    g_autofree char *size = g_format_size (bytes);
-    g_autofree char *subtitle = NULL;
-
-    if (oldest > 0) {
-      int64_t now = g_get_real_time () / G_USEC_PER_SEC;
-      int days = (int) ((now - oldest) / 86400);
-
-      subtitle = g_strdup_printf (
-        ngettext ("%d day of history · %s",
-                  "%d days of history · %s", days),
-        days, size);
-    } else {
-      subtitle = g_strdup_printf (_("No history yet · %s"), size);
-    }
-
-    adw_action_row_set_subtitle (self->history_row, subtitle);
-  }
+  update_history_row (self);
 }
 
 
@@ -1099,16 +1577,16 @@ refresh_finished (GObject      *source,
                   gpointer      user_data)
 {
   GsmHealthView *self = GSM_HEALTH_VIEW (source);
-  g_autoptr (GPtrArray) infos = NULL;
+  g_autoptr (Snapshot) snapshot = NULL;
   g_autoptr (GError) error = NULL;
 
   (void) user_data;
 
   self->refreshing = FALSE;
 
-  infos = g_task_propagate_pointer (G_TASK (result), &error);
+  snapshot = g_task_propagate_pointer (G_TASK (result), &error);
 
-  if (infos == NULL) {
+  if (snapshot == NULL) {
     if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
       g_warning ("health: %s", error->message);
     return;
@@ -1120,7 +1598,7 @@ refresh_finished (GObject      *source,
   if (self->db == NULL)
     return;
 
-  apply_drives (self, infos);
+  apply_drives (self, snapshot);
 }
 
 
