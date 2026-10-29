@@ -96,18 +96,24 @@ fill_cpu (const GsmProcWindow *window,
           GsmProcFigures      *figures)
 {
   const gsm_process *previous = window->previous;
-  double ns_per_s;
+  double ticks_per_s;
 
+  /* utime + stime of /proc/PID/stat count every thread of the group, which
+   * the scheduler statistics of /proc/PID/schedstat do not: those are the
+   * thread-group leader's alone (sched-stats.rst). The ticks are part of the
+   * key file of a record, so they are always present; what can be missing is
+   * a baseline or the tick rate. */
   if (previous == NULL || previous->start_ticks != record->start_ticks)
     return;
-  if (!has (record, GSM_PROCESS_HAS_RUN_NS) || !has (previous, GSM_PROCESS_HAS_RUN_NS))
+  if (window->clock_ticks_per_s <= 0)
     return;
-  if (!gsm_rate_per_s (previous->run_ns, record->run_ns,
-                       window->previous_at_ns, window->current_at_ns, &ns_per_s))
+  if (!gsm_rate_per_s (previous->utime_ticks + previous->stime_ticks,
+                       record->utime_ticks + record->stime_ticks,
+                       window->previous_at_ns, window->current_at_ns, &ticks_per_s))
     return;
 
-  /* ns of CPU per s of wall time: 1e9 is one whole CPU, i.e. 100 %. */
-  double percent = ns_per_s / 1e7;
+  /* CPU seconds per s of wall time: 1 is one whole CPU, i.e. 100 %. */
+  double percent = ticks_per_s / (double) window->clock_ticks_per_s * 100.0;
   double cap = 100.0 * window->cpu_count;
 
   if (window->solaris_mode)

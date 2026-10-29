@@ -3,6 +3,9 @@
 //! numbers, "time spent on the cpu" (ns), "time spent waiting on a runqueue"
 //! (ns), "# of timeslices run on this cpu". Readable unprivileged and
 //! without `kernel.sched_schedstats` (verified on kernel 7.0, 2026-10-28).
+//! The statistics are per task: `/proc/<pid>/schedstat` is the first thread's
+//! alone, not the thread group's (a 77-thread JVM read 8 ms here against
+//! 513 s of `stat` utime + stime). A process's CPU time is `stat`'s.
 const std = @import("std");
 const numbers = @import("numbers.zig");
 

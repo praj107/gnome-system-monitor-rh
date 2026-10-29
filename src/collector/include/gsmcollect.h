@@ -188,8 +188,13 @@ typedef struct gsm_process
   uint64_t rss_shmem_bytes;    /* resident shared-memory pages */
   uint64_t vm_swap_bytes;
   uint64_t vm_size_bytes;      /* address space, not memory use */
-  uint64_t run_ns;             /* cumulative time on a CPU */
-  uint64_t run_delay_ns;       /* cumulative time waiting on a run queue */
+  uint64_t run_ns;             /* cumulative time on a CPU of the thread-group leader ONLY:
+                                  /proc/<pid>/schedstat is per task, and <pid> names the
+                                  first thread (sched-stats.rst). Not the process's CPU
+                                  time when it has other threads: use utime_ticks +
+                                  stime_ticks, which cover the whole group */
+  uint64_t run_delay_ns;       /* cumulative run-queue wait of the leader thread only,
+                                  as run_ns */
   uint64_t timeslices;
   uint32_t ppid;
   uint32_t pgrp;

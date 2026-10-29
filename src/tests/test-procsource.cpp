@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include <string>
+#include <utility>
 
 #include <glib.h>
 #include <glibtop/procstate.h>
@@ -126,14 +127,24 @@ test_cpu_time_and_start_time (void)
   g_assert_false (figures.start_time_known);
 }
 
+/* Two records one 2 s window apart whose utime + stime grew by cpu_ticks. */
 static void
-test_cpu_share_is_run_time_over_wall_time (void)
+make_pair (guint64      cpu_ticks,
+           gsm_process *previous,
+           gsm_process *record)
 {
-  gsm_process previous = make_record ();
-  gsm_process record = make_record ();
+  *previous = make_record ();
+  *record = make_record ();
+  record->utime_ticks = previous->utime_ticks + cpu_ticks * 7 / 10;
+  record->stime_ticks = previous->stime_ticks + (cpu_ticks - cpu_ticks * 7 / 10);
+}
 
-  previous.run_ns = 3 * second_ns;
-  record.run_ns = 4 * second_ns;   /* 1 s of CPU in a 2 s window */
+static void
+test_cpu_share_is_cpu_ticks_over_wall_time (void)
+{
+  gsm_process previous, record;
+
+  make_pair (100, &previous, &record);   /* 1 s of CPU in a 2 s window at 100 ticks/s */
 
   GsmProcWindow window = make_window (&previous);
   GsmProcFigures figures = figures_of (window, record);
@@ -145,15 +156,64 @@ test_cpu_share_is_run_time_over_wall_time (void)
   figures = figures_of (window, record);
   g_assert_true (figures.cpu_known);
   g_assert_cmpfloat_with_epsilon (figures.cpu_percent, 12.5, 1e-9);
+
+  window.solaris_mode = FALSE;
+  window.clock_ticks_per_s = 250;   /* the tick rate converts, it is not assumed */
+  figures = figures_of (window, record);
+  g_assert_cmpfloat_with_epsilon (figures.cpu_percent, 20.0, 1e-9);
+}
+
+static void
+test_a_multithreaded_process_shows_its_whole_group_not_the_leaders_run_time (void)
+{
+  gsm_process previous, record;
+
+  /* 3 CPUs' worth of utime + stime in the 2 s window, while schedstat (the
+   * leader thread alone) says almost nothing: a JVM or a browser */
+  make_pair (600, &previous, &record);
+  previous.run_ns = 8 * 1000 * 1000;
+  record.run_ns = 8 * 1000 * 1000 + 100 * 1000;
+
+  GsmProcWindow window = make_window (&previous);
+  GsmProcFigures figures = figures_of (window, record);
+
+  g_assert_true (figures.cpu_known);
+  g_assert_cmpfloat_with_epsilon (figures.cpu_percent, 300.0, 1e-9);
+
+  window.solaris_mode = TRUE;
+  figures = figures_of (window, record);
+  g_assert_cmpfloat_with_epsilon (figures.cpu_percent, 300.0 / 4, 1e-9);
+
+  /* and the other way round: schedstat claiming a lot is not believed */
+  make_pair (0, &previous, &record);
+  record.run_ns = 100 * second_ns;
+  window = make_window (&previous);
+  figures = figures_of (window, record);
+  g_assert_true (figures.cpu_known);
+  g_assert_cmpfloat (figures.cpu_percent, ==, 0.0);
+}
+
+static void
+test_cpu_share_is_known_without_the_scheduler_statistics (void)
+{
+  gsm_process previous, record;
+
+  make_pair (100, &previous, &record);
+  previous.known &= ~GSM_PROCESS_HAS_RUN_NS;
+  record.known &= ~GSM_PROCESS_HAS_RUN_NS;
+
+  GsmProcFigures figures = figures_of (make_window (&previous), record);
+
+  g_assert_true (figures.cpu_known);
+  g_assert_cmpfloat_with_epsilon (figures.cpu_percent, 50.0, 1e-9);
 }
 
 static void
 test_cpu_share_is_capped_at_the_scale (void)
 {
-  gsm_process previous = make_record ();
-  gsm_process record = make_record ();
+  gsm_process previous, record;
 
-  record.run_ns = 100 * second_ns;
+  make_pair (100 * 100, &previous, &record);   /* 100 CPU s in a 2 s window */
   GsmProcWindow window = make_window (&previous);
   GsmProcFigures figures = figures_of (window, record);
 
@@ -168,39 +228,32 @@ test_cpu_share_is_capped_at_the_scale (void)
 static void
 test_cpu_share_is_unknown_without_a_baseline (void)
 {
-  gsm_process record = make_record ();
+  gsm_process previous, record;
+
+  make_pair (5000, &previous, &record);
 
   /* first sample */
   g_assert_false (figures_of (make_window (NULL), record).cpu_known);
 
-  gsm_process previous = make_record ();
-
   /* a reused pid: another start time, and a larger counter than before */
   previous.start_ticks = 4000;
-  previous.run_ns = 1;
-  record.run_ns = 50 * second_ns;
-  g_assert_false (figures_of (make_window (&previous), record).cpu_known);
-
-  /* the same process, but the scheduler statistics were missing in one */
-  previous = make_record ();
-  previous.known &= ~GSM_PROCESS_HAS_RUN_NS;
-  g_assert_false (figures_of (make_window (&previous), record).cpu_known);
-
-  previous = make_record ();
-  record.known &= ~GSM_PROCESS_HAS_RUN_NS;
   g_assert_false (figures_of (make_window (&previous), record).cpu_known);
 
   /* a counter that went backwards */
-  record = make_record ();
-  previous = make_record ();
-  previous.run_ns = 9 * second_ns;
-  record.run_ns = 8 * second_ns;
+  make_pair (100, &previous, &record);
+  std::swap (previous.utime_ticks, record.utime_ticks);
+  std::swap (previous.stime_ticks, record.stime_ticks);
   g_assert_false (figures_of (make_window (&previous), record).cpu_known);
 
   /* no time passed */
-  record.run_ns = 10 * second_ns;
+  make_pair (100, &previous, &record);
   GsmProcWindow window = make_window (&previous);
   window.current_at_ns = window.previous_at_ns;
+  g_assert_false (figures_of (window, record).cpu_known);
+
+  /* no tick rate to convert with */
+  window = make_window (&previous);
+  window.clock_ticks_per_s = 0;
   g_assert_false (figures_of (window, record).cpu_known);
 }
 
@@ -634,7 +687,9 @@ main (int    argc,
   g_test_add_func ("/procsource/memory/follows-the-definitions", test_memory_columns_follow_the_definitions);
   g_test_add_func ("/procsource/memory/unknown-bits", test_memory_without_the_status_bits_is_unknown_not_zero);
   g_test_add_func ("/procsource/time", test_cpu_time_and_start_time);
-  g_test_add_func ("/procsource/cpu/share", test_cpu_share_is_run_time_over_wall_time);
+  g_test_add_func ("/procsource/cpu/share", test_cpu_share_is_cpu_ticks_over_wall_time);
+  g_test_add_func ("/procsource/cpu/whole-thread-group", test_a_multithreaded_process_shows_its_whole_group_not_the_leaders_run_time);
+  g_test_add_func ("/procsource/cpu/without-schedstat", test_cpu_share_is_known_without_the_scheduler_statistics);
   g_test_add_func ("/procsource/cpu/cap", test_cpu_share_is_capped_at_the_scale);
   g_test_add_func ("/procsource/cpu/unknown", test_cpu_share_is_unknown_without_a_baseline);
   g_test_add_func ("/procsource/io/cancelled", test_disk_write_excludes_cancelled_writes);

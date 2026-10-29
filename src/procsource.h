@@ -4,17 +4,19 @@
  * The Processes tab's figures from the collector library (gsmcollect.h)
  * instead of libgtop's per-process calls.
  *
- * Definitions, over proc_pid_stat(5), proc_pid_status(5), proc_pid_io(5) and
- * the scheduler's /proc/PID/schedstat:
+ * Definitions, over proc_pid_stat(5), proc_pid_status(5) and proc_pid_io(5):
  *
  *   Private (anon)  RssAnon
  *   Resident        RssAnon + RssFile + RssShmem
  *   Shared          RssFile + RssShmem
  *   Virtual         VmSize
  *   CPU time        utime + stime, in clock ticks
- *   CPU %           delta run_ns / delta wall ns * 100 between two snapshots,
- *                   a share of one logical CPU (the Irix convention) or, in
- *                   Solaris mode, of the whole machine; capped at the scale
+ *   CPU %           delta (utime + stime) / CLK_TCK / delta wall s * 100
+ *                   between two snapshots of the same process (same pid and
+ *                   start time): all threads of the group, a share of one
+ *                   logical CPU (the Irix convention) or, in Solaris mode, of
+ *                   the whole machine; capped at the scale. Not schedstat's
+ *                   run time, which is the group leader's thread alone
  *   Disk read       read_bytes of /proc/PID/io
  *   Disk write      write_bytes - cancelled_write_bytes, 0 when more was
  *                   cancelled than written: a process that truncates pages
