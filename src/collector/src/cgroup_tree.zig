@@ -70,6 +70,11 @@ pub const Group = struct {
     /// Index of the parent in `Tree.groups`; null for the first group of the
     /// walk. Parents come before their children.
     parent: ?u32,
+    /// The directory's inode number from the parent's listing (cgroupfs
+    /// gives each cgroup its 64-bit id here), so a group removed and created
+    /// again under the same path has another one. Null for the first group of
+    /// the walk, which no listing yielded.
+    inode: ?u64 = null,
     memory_current_bytes: ?u64 = null,
     memory_peak_bytes: ?u64 = null,
     memory_max: ?files.Limit = null,
@@ -146,7 +151,7 @@ pub const Tree = struct {
         defer start.close(io);
 
         var walker: Walker = .{ .tree = self, .io = io };
-        try walker.visit(start, try self.strings.allocator().dupe(u8, root_path), null, 0);
+        try walker.visit(start, try self.strings.allocator().dupe(u8, root_path), null, null, 0);
         self.counts.groups = @intCast(self.groups.items.len);
     }
 };
@@ -173,16 +178,19 @@ const Walker = struct {
     io: Io,
     buffer: [read_buffer_bytes]u8 = undefined,
 
-    fn visit(self: *Walker, dir: Io.Dir, path: []const u8, parent: ?u32, depth: u32) Allocator.Error!void {
+    /// A child found in a directory listing, still to be opened.
+    const Child = struct { path: []const u8, inode: u64 };
+
+    fn visit(self: *Walker, dir: Io.Dir, path: []const u8, parent: ?u32, inode: ?u64, depth: u32) Allocator.Error!void {
         const tree = self.tree;
-        const group = (try self.readGroup(dir, path, parent)) orelse {
+        const group = (try self.readGroup(dir, path, parent, inode)) orelse {
             tree.counts.vanished += 1;
             return;
         };
         const index: u32 = @intCast(tree.groups.items.len);
         try tree.groups.append(tree.gpa, group);
 
-        var children: std.ArrayList([]const u8) = .empty;
+        var children: std.ArrayList(Child) = .empty;
         defer children.deinit(tree.gpa);
         var entries = dir.iterate();
         while (true) {
@@ -192,18 +200,19 @@ const Walker = struct {
             } orelse break;
             if (entry.kind != .directory and entry.kind != .unknown) continue;
             const prefix = if (path.len == 1) "" else path;
-            try children.append(tree.gpa, try std.fmt.allocPrint(tree.strings.allocator(), "{s}/{s}", .{ prefix, entry.name }));
+            const child_path = try std.fmt.allocPrint(tree.strings.allocator(), "{s}/{s}", .{ prefix, entry.name });
+            try children.append(tree.gpa, .{ .path = child_path, .inode = entry.inode });
         }
         if (children.items.len == 0) return;
         if (depth >= max_depth) {
             tree.counts.too_deep += 1;
             return;
         }
-        std.mem.sort([]const u8, children.items, {}, lessThan);
+        std.mem.sort(Child, children.items, {}, lessThan);
 
         const name_start = (if (path.len == 1) 0 else path.len) + 1;
-        for (children.items) |child_path| {
-            var child = dir.openDir(self.io, child_path[name_start..], .{ .iterate = true }) catch |err| switch (err) {
+        for (children.items) |listed| {
+            var child = dir.openDir(self.io, listed.path[name_start..], .{ .iterate = true }) catch |err| switch (err) {
                 error.FileNotFound => {
                     tree.counts.vanished += 1;
                     continue;
@@ -216,17 +225,17 @@ const Walker = struct {
                 },
             };
             defer child.close(self.io);
-            try self.visit(child, child_path, index, depth + 1);
+            try self.visit(child, listed.path, index, listed.inode, depth + 1);
         }
     }
 
-    fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-        return std.mem.lessThan(u8, a, b);
+    fn lessThan(_: void, a: Child, b: Child) bool {
+        return std.mem.lessThan(u8, a.path, b.path);
     }
 
     /// The group's record, or null when it was removed during the read.
-    fn readGroup(self: *Walker, dir: Io.Dir, path: []const u8, parent: ?u32) Allocator.Error!?Group {
-        var group: Group = .{ .path = path, .parent = parent };
+    fn readGroup(self: *Walker, dir: Io.Dir, path: []const u8, parent: ?u32, inode: ?u64) Allocator.Error!?Group {
+        var group: Group = .{ .path = path, .parent = parent, .inode = inode };
         var local: Counts = .{};
         var trouble = false;
 
@@ -358,6 +367,21 @@ test "a walk over a captured tree reads each group's own counters" {
     try testing.expectEqual(@as(u64, 0), scope.memory_pressure.?.some.total_us);
     // This scope's cpu.stat has no throttle counters: unknown, not zero.
     try testing.expectEqual(@as(?u64, null), scope.cpu_stat.?.nr_throttled);
+}
+
+test "a group's inode comes from its parent's listing and the walk's first group has none" {
+    var base = try Io.Dir.cwd().openDir(testing.io, "testdata/cgroup", .{});
+    defer base.close(testing.io);
+    var tree: Tree = .init(testing.allocator);
+    defer tree.deinit();
+    try tree.walk(testing.io, base, "/");
+
+    try testing.expectEqual(@as(?u64, null), tree.groups.items[0].inode);
+    for (tree.groups.items[1..], 1..) |group, at| {
+        // Directories have distinct inode numbers within one filesystem.
+        try testing.expect(group.inode != null);
+        for (tree.groups.items[at + 1 ..]) |other| try testing.expect(other.inode.? != group.inode.?);
+    }
 }
 
 test "the root has no memory.current and a group without the memory controller has no memory files" {

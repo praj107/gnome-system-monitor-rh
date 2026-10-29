@@ -13,6 +13,10 @@
 //!   gsmcollect-probe --cgroups [--cgroup-root DIR] [--under PATH] [--list]
 //!       the cgroup tree (default root /sys/fs/cgroup, default PATH "/");
 //!       --under implies --list, which prints one line per group
+//!   gsmcollect-probe --groups [--root DIR] [--cgroup-root DIR] [--interval-ms N]
+//!       the workload group table: two samples N ms apart (default 2000), one
+//!       line per row with its marks, memory, tasks and CPU over the interval,
+//!       the residue against meminfo, and what building the table cost
 const std = @import("std");
 const gsm = @import("gsmcollect");
 
@@ -21,10 +25,11 @@ const usage =
     \\       gsmcollect-probe --memory [--root DIR]
     \\       gsmcollect-probe --pressure [--root DIR] [--window-ms N]
     \\       gsmcollect-probe --cgroups [--cgroup-root DIR] [--under PATH] [--list]
+    \\       gsmcollect-probe --groups [--root DIR] [--cgroup-root DIR] [--interval-ms N]
     \\
 ;
 
-const Mode = enum { none, once, memory, pressure, cgroups };
+const Mode = enum { none, once, memory, pressure, cgroups, groups };
 
 const Options = struct {
     mode: Mode = .none,
@@ -33,6 +38,7 @@ const Options = struct {
     under: []const u8 = "/",
     show_pid: ?u32 = null,
     window_ms: u32 = 0,
+    interval_ms: u32 = 2000,
     list: bool = false,
 };
 
@@ -57,6 +63,11 @@ pub fn main(init: std.process.Init) !void {
             options.mode = .pressure;
         } else if (std.mem.eql(u8, arg, "--cgroups")) {
             options.mode = .cgroups;
+        } else if (std.mem.eql(u8, arg, "--groups")) {
+            options.mode = .groups;
+        } else if (std.mem.eql(u8, arg, "--interval-ms") and value != null) {
+            index += 1;
+            options.interval_ms = gsm.numbers.unsigned(u32, value.?) catch return fail(out, "bad interval\n");
         } else if (std.mem.eql(u8, arg, "--list")) {
             options.list = true;
         } else if (std.mem.eql(u8, arg, "--root") and value != null) {
@@ -84,6 +95,7 @@ pub fn main(init: std.process.Init) !void {
         .memory => try probeMemory(io, out, options),
         .pressure => try probePressure(io, out, options),
         .cgroups => try probeCgroups(init, out, options),
+        .groups => try probeGroups(init, out, options),
     }
 }
 
@@ -322,4 +334,167 @@ fn failFmt(out: *std.Io.Writer, comptime format: []const u8, args: anytype) !voi
     try out.print(format, args);
     try out.flush();
     std.process.exit(2);
+}
+
+// ---- --groups ----
+
+/// Everything one sample of the group table reads, kept between samples so
+/// the walks reuse their memory as the collector does.
+const GroupSampler = struct {
+    snapshot: gsm.Snapshot,
+    tree: gsm.cgroup_tree.Tree,
+    process_classes: std.ArrayList(gsm.classify.Classification) = .empty,
+    group_classes: std.ArrayList(gsm.classify.Classification) = .empty,
+    gpa: std.mem.Allocator,
+
+    fn init(gpa: std.mem.Allocator) GroupSampler {
+        return .{ .snapshot = .init(gpa), .tree = .init(gpa), .gpa = gpa };
+    }
+
+    fn deinit(self: *GroupSampler) void {
+        self.snapshot.deinit();
+        self.tree.deinit();
+        self.process_classes.deinit(self.gpa);
+        self.group_classes.deinit(self.gpa);
+    }
+
+    const Taken = struct { input: gsm.group.Input, classify_ns: i96 };
+
+    /// One sample. The clocks are read before the walks (see `group.Input`).
+    fn take(self: *GroupSampler, io: std.Io, out: *std.Io.Writer, options: Options) !Taken {
+        const now_ns: u64 = @intCast(nowNs(io).nanoseconds);
+        const boot_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds);
+
+        var proc_root = std.Io.Dir.cwd().openDir(io, options.root_path, .{ .iterate = true }) catch |err| {
+            try failFmt(out, "cannot open {s}: {s}\n", .{ options.root_path, @errorName(err) });
+            unreachable;
+        };
+        defer proc_root.close(io);
+        try self.snapshot.walk(io, proc_root);
+
+        var base = std.Io.Dir.cwd().openDir(io, options.cgroup_root_path, .{}) catch |err| {
+            try failFmt(out, "cannot open {s}: {s}\n", .{ options.cgroup_root_path, @errorName(err) });
+            unreachable;
+        };
+        defer base.close(io);
+        self.tree.walk(io, base, "/") catch |err| {
+            try failFmt(out, "cannot walk the cgroup tree: {s}\n", .{@errorName(err)});
+            unreachable;
+        };
+
+        const classify_started = nowNs(io);
+        const processes = self.snapshot.processes.items;
+        try self.process_classes.resize(self.gpa, processes.len);
+        try gsm.classify.classifyProcesses(self.gpa, processes, self.process_classes.items);
+        const groups = self.tree.groups.items;
+        try self.group_classes.resize(self.gpa, groups.len);
+        for (groups, self.group_classes.items) |group, *slot| slot.* = gsm.classify.classifyPath(group.path);
+        const classify_ns = classify_started.durationTo(nowNs(io)).nanoseconds;
+
+        var buffer: [16384]u8 = undefined;
+        const info: ?gsm.meminfo.Meminfo = switch (gsm.readfile.read(io, proc_root, "meminfo", &buffer)) {
+            .bytes => |bytes| gsm.meminfo.parse(bytes) catch null,
+            else => null,
+        };
+        var cpu_buffer: [256]u8 = undefined;
+        const online_cpus: u32 = blk: {
+            var cpu_dir = std.Io.Dir.cwd().openDir(io, "/sys/devices/system/cpu", .{}) catch break :blk 0;
+            defer cpu_dir.close(io);
+            switch (gsm.readfile.read(io, cpu_dir, "online", &cpu_buffer)) {
+                .bytes => |bytes| break :blk gsm.group.countCpus(bytes) orelse 0,
+                else => break :blk 0,
+            }
+        };
+        const counts = self.tree.counts;
+        return .{
+            .input = .{
+                .cgroups_complete = counts.directory_errors == 0 and counts.too_deep == 0,
+                .online_cpus = online_cpus,
+                .processes = processes,
+                .process_classes = self.process_classes.items,
+                .groups = groups,
+                .group_classes = self.group_classes.items,
+                .meminfo = info,
+                .now_ns = now_ns,
+                .now_boot_ticks = boot_ns / (std.time.ns_per_s / gsm.group.ticks_per_second),
+            },
+            .classify_ns = classify_ns,
+        };
+    }
+};
+
+fn probeGroups(init: std.process.Init, out: *std.Io.Writer, options: Options) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    var sampler = GroupSampler.init(gpa);
+    defer sampler.deinit();
+
+    const first_taken = try sampler.take(io, out, options);
+    var first = try gsm.group.build(gpa, first_taken.input, null);
+    first.table.deinit(gpa);
+    defer first.next.deinit(gpa);
+
+    try io.sleep(std.Io.Duration.fromMilliseconds(options.interval_ms), .awake);
+
+    const taken = try sampler.take(io, out, options);
+    const build_started = nowNs(io);
+    var result = try gsm.group.build(gpa, taken.input, &first.next);
+    const build_ns = build_started.durationTo(nowNs(io)).nanoseconds;
+    defer result.table.deinit(gpa);
+    defer result.next.deinit(gpa);
+    const table = &result.table;
+
+    try out.print("processes: {d}\ncgroups: {d}\ninterval_ms: {d}\nrows: {d}\n", .{
+        taken.input.processes.len, taken.input.groups.len, table.interval_ns / std.time.ns_per_ms, table.rows.len,
+    });
+    try out.writeAll("columns: row | marks | anon file shmem (bytes) | tasks | processes | cpu% (>= is a lower bound)\n");
+    for (table.rows) |*row| try printGroupRow(out, table, row);
+
+    const residue = table.residue;
+    if (residue.known) {
+        try out.print("residue user_space_bytes (AnonPages + Cached + Buffers): {d}\n", .{residue.user_space_bytes});
+        try out.print("residue classes_bytes (overlays once): {d}\nresidue overlay_bytes (left out of the classes): {d}\n", .{ residue.classes_bytes, residue.overlay_bytes });
+        try out.print("residue unaccounted_bytes: {d}\nresidue overlap_bytes: {d}\nresidue classes_incomplete: {}\n", .{ residue.unaccounted_bytes, residue.overlap_bytes, residue.classes_incomplete });
+    } else try out.writeAll("residue: unknown (meminfo lacks AnonPages, Cached or Buffers)\n");
+
+    // The table's own cost: the build over the second sample's inputs, repeated.
+    const repeats = 200;
+    var total_ns: i96 = 0;
+    for (0..repeats) |_| {
+        const started = nowNs(io);
+        var again = try gsm.group.build(gpa, taken.input, &first.next);
+        total_ns += started.durationTo(nowNs(io)).nanoseconds;
+        again.table.deinit(gpa);
+        again.next.deinit(gpa);
+    }
+    try out.print("cost: classify_us {d}, build_us {d} (first), build_us_mean {d} over {d} builds\n", .{
+        @divTrunc(taken.classify_ns, 1000), @divTrunc(build_ns, 1000), @divTrunc(total_ns, repeats * 1000), repeats,
+    });
+}
+
+fn printGroupRow(out: *std.Io.Writer, table: *const gsm.group.Table, row: *const gsm.group.Row) !void {
+    if (row.level == .class) try out.print("{s}", .{gsm.classify.classLabel(row.class)}) else try out.print("    {s}", .{row.key});
+    if (row.key_kind == .agent_process) try out.print(" (pid {d})", .{row.agent_pid});
+    if (row.level == .group) try out.print(" [{s}]", .{gsm.classify.classLabel(row.class)});
+    try out.writeAll(" |");
+    inline for (@typeInfo(gsm.group.Marks).@"struct".fields) |field| {
+        if (comptime std.mem.startsWith(u8, field.name, "_")) continue;
+        if (@field(row.marks, field.name)) try out.print(" {s}", .{field.name});
+    }
+    if (row.host_row) |host| {
+        const host_row = table.rows[host];
+        try out.print(" host={s}", .{if (host_row.level == .class) gsm.classify.classLabel(host_row.class) else host_row.key});
+    }
+    try out.writeAll(" |");
+    if (row.known.memory_anon) {
+        try out.print(" {d} {d} {d}", .{ row.figures.anon_bytes, row.figures.file_bytes, row.figures.shmem_bytes });
+    } else try out.writeAll(" unknown");
+    if (row.known.tasks) try out.print(" | {d}", .{row.figures.tasks}) else try out.writeAll(" | unknown");
+    try out.print(" | {d} | ", .{row.figures.processes});
+    if (table.cpuPercent(row)) |percent| {
+        try out.print("{s}{d:.2}\n", .{ if (row.marks.cpu_lower_bound) ">=" else "", percent });
+    } else try out.writeAll("unknown\n");
+    if (row.marks.hosts_overlays) {
+        try out.print("    hosts overlays: anon {d} file {d} shmem {d} processes {d}\n", .{ row.hosted.anon_bytes, row.hosted.file_bytes, row.hosted.shmem_bytes, row.hosted.processes });
+    }
 }

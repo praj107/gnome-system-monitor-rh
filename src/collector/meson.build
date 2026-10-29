@@ -37,6 +37,7 @@ collector_sources = files(
   'src/cgroup_files.zig',
   'src/cgroup_tree.zig',
   'src/classify.zig',
+  'src/group.zig',
   'src/meminfo.zig',
   'src/numbers.zig',
   'src/pressure.zig',
