@@ -291,6 +291,20 @@ test(
   timeout: 120,
 )
 
+# Write attribution over fake cgroup trees (the tracker's root-path seam) and
+# the blame table's schema migration.
+test(
+  'health-blame',
+  executable(
+    'test-health-blame',
+    ['tests/test-health-blame.c'],
+    include_directories: rootInclude,
+    dependencies: [libgsm_health_dep, glib, sqlite],
+  ),
+  protocol: 'tap',
+  timeout: 120,
+)
+
 gsm_app = executable('gnome-system-monitor-rh',
   ['main.cpp'],
   dependencies: libgsm_dep,

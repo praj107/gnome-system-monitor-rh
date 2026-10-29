@@ -519,11 +519,10 @@ old_tick (sqlite3 *raw)
   sqlite3_free (sql);
 
   g_assert_cmpint (sqlite3_prepare_v2 (raw,
-                                       "INSERT INTO blame_daily (drive_id, day, name, wbytes, exact) "
-                                       "VALUES ('SERIAL-0001', ?1, ?2, ?3, ?4) "
-                                       "ON CONFLICT (drive_id, day, name) DO UPDATE SET "
-                                       "  wbytes = wbytes + excluded.wbytes,"
-                                       "  exact  = MIN (exact, excluded.exact)",
+                                       "INSERT INTO blame_daily (drive_id, day, name, via, basis, wbytes) "
+                                       "VALUES ('SERIAL-0001', ?1, ?2, '', ?4, ?3) "
+                                       "ON CONFLICT (drive_id, day, name, via, basis) DO UPDATE SET "
+                                       "  wbytes = wbytes + excluded.wbytes",
                                        -1, &stmt, NULL), ==, SQLITE_OK);
   for (int w = 0; w < WRITER_COUNT; w++) {
     uint64_t delta = draw_delta (w);
@@ -535,7 +534,8 @@ old_tick (sqlite3 *raw)
     sqlite3_bind_int64 (stmt, 1, day);
     sqlite3_bind_text (stmt, 2, writer_names[w], -1, SQLITE_STATIC);
     sqlite3_bind_int64 (stmt, 3, (sqlite3_int64) delta);
-    sqlite3_bind_int (stmt, 4, writer_is_exact (w));
+    sqlite3_bind_text (stmt, 4, writer_is_exact (w) ? "kernel" : "procfs", -1,
+                       SQLITE_STATIC);
     sqlite3_step (stmt);
     sqlite3_reset (stmt);
   }

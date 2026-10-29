@@ -44,8 +44,9 @@ typedef struct {
   char     *drive_id;
   int64_t   day;
   char     *name;
+  char     *via;
+  char     *basis;
   uint64_t  wbytes;
-  gboolean  exact;
 } PendingBlame;
 
 struct _GsmHealthDb {
@@ -58,7 +59,7 @@ struct _GsmHealthDb {
   GsmHealthClock clock;
   gpointer clock_data;
 
-  GHashTable *pending_blame;   /* "drive\nday\nname" -> PendingBlame */
+  GHashTable *pending_blame;   /* "drive\nday\nname\nvia\nbasis" -> PendingBlame */
   GHashTable *drive_state;     /* drive id -> DriveState */
   GHashTable *battery_state;   /* battery id -> BatteryState */
   int64_t last_roll_up;
@@ -72,7 +73,15 @@ G_DEFINE_FINAL_TYPE (GsmHealthDb, gsm_health_db, G_TYPE_OBJECT)
 /* Daily rollups are kept indefinitely: one row per drive per day is a few
  * hundred KB per decade, and a multi-year wear curve is the whole point. */
 
-#define SCHEMA_VERSION 1
+/* 1: blame_daily(drive_id, day, name, wbytes, exact).
+ * 2: blame_daily(drive_id, day, name, via, basis, wbytes). */
+#define SCHEMA_VERSION 2
+
+/* A flush keeps this many rows per drive, day and kind, and folds the rest
+ * into one "other" row, so a burst of short-lived writers cannot grow the
+ * table or the bytes written per hour. */
+#define BLAME_ROWS_PER_KIND 20
+#define BLAME_OTHER_NAME    "other"
 
 /* Drive identity and an unchanged health reading are rewritten at most this
  * often: a "last seen" accurate to the hour is as honest as one accurate to
@@ -144,9 +153,10 @@ static const char *SCHEMA_SQL =
   "  drive_id TEXT NOT NULL,"
   "  day      INTEGER NOT NULL,"
   "  name     TEXT NOT NULL,"
+  "  via      TEXT NOT NULL DEFAULT '',"
+  "  basis    TEXT NOT NULL DEFAULT 'kernel',"
   "  wbytes   INTEGER NOT NULL DEFAULT 0,"
-  "  exact    INTEGER NOT NULL DEFAULT 0,"
-  "  PRIMARY KEY (drive_id, day, name)"
+  "  PRIMARY KEY (drive_id, day, name, via, basis)"
   ") WITHOUT ROWID;"
 
   "CREATE TABLE IF NOT EXISTS battery_daily ("
@@ -176,6 +186,8 @@ pending_blame_free (PendingBlame *pending)
 {
   g_free (pending->drive_id);
   g_free (pending->name);
+  g_free (pending->via);
+  g_free (pending->basis);
   g_free (pending);
 }
 
@@ -276,6 +288,63 @@ exec_sql (GsmHealthDb  *self,
 }
 
 
+static gboolean
+blame_table_is_version_1 (GsmHealthDb *self)
+{
+  sqlite3_stmt *stmt = NULL;
+  gboolean old = FALSE;
+
+  if (sqlite3_prepare_v2 (self->db,
+                          "SELECT COUNT (*) FROM pragma_table_info ('blame_daily') "
+                          " WHERE name = 'exact'",
+                          -1, &stmt, NULL) != SQLITE_OK)
+    return FALSE;
+
+  if (sqlite3_step (stmt) == SQLITE_ROW)
+    old = sqlite3_column_int (stmt, 0) > 0;
+  sqlite3_finalize (stmt);
+
+  return old;
+}
+
+
+/*
+ * Version 1 stored `exact` (1 = from cgroup counters, 0 = from /proc) and
+ * no via. Rows keep their bytes: exact becomes basis kernel, the rest
+ * procfs. One immediate transaction, re-checked inside it, because the UI
+ * and the sampler open the same file and either may be first.
+ */
+static gboolean
+migrate_blame_to_version_2 (GsmHealthDb *self,
+                            GError     **error)
+{
+  if (!blame_table_is_version_1 (self))
+    return TRUE;
+
+  if (!exec_sql (self, "BEGIN IMMEDIATE", error))
+    return FALSE;
+
+  if (blame_table_is_version_1 (self) &&
+      (!exec_sql (self, "ALTER TABLE blame_daily RENAME TO blame_daily_v1", error) ||
+       !exec_sql (self, SCHEMA_SQL, error) ||
+       !exec_sql (self,
+                  "INSERT INTO blame_daily (drive_id, day, name, via, basis, wbytes) "
+                  "SELECT drive_id, day, name, '', "
+                  "       CASE exact WHEN 1 THEN 'kernel' ELSE 'procfs' END, wbytes "
+                  "  FROM blame_daily_v1;"
+                  "DROP TABLE blame_daily_v1;"
+                  "INSERT OR REPLACE INTO meta (key, value) "
+                  "VALUES ('schema_version', '" G_STRINGIFY (SCHEMA_VERSION) "');",
+                  error)))
+    {
+      sqlite3_exec (self->db, "ROLLBACK", NULL, NULL, NULL);
+      return FALSE;
+    }
+
+  return exec_sql (self, "COMMIT", error);
+}
+
+
 GsmHealthDb *
 gsm_health_db_new (const char  *path,
                    GError     **error)
@@ -301,6 +370,7 @@ gsm_health_db_new (const char  *path,
       !exec_sql (self, "PRAGMA synchronous=NORMAL;", error) ||
       !exec_sql (self, "PRAGMA journal_size_limit=" G_STRINGIFY (WAL_SIZE_LIMIT_BYTES) ";", error) ||
       !exec_sql (self, "PRAGMA wal_autocheckpoint=" G_STRINGIFY (WAL_AUTOCHECKPOINT_PAGES) ";", error) ||
+      !migrate_blame_to_version_2 (self, error) ||
       !exec_sql (self, SCHEMA_SQL, error))
     return NULL;
 
@@ -474,11 +544,12 @@ gsm_health_db_record_drive (GsmHealthDb *self,
 
 
 void
-gsm_health_db_record_blame (GsmHealthDb *self,
-                            const char  *drive_id,
-                            const char  *name,
-                            uint64_t     delta_wbytes,
-                            gboolean     exact)
+gsm_health_db_record_blame_row (GsmHealthDb *self,
+                                const char  *drive_id,
+                                const char  *name,
+                                const char  *via,
+                                const char  *basis,
+                                uint64_t     delta_wbytes)
 {
   g_autofree char *key = NULL;
   PendingBlame *pending;
@@ -486,63 +557,180 @@ gsm_health_db_record_blame (GsmHealthDb *self,
 
   g_return_if_fail (GSM_IS_HEALTH_DB (self));
 
-  if (drive_id == NULL || name == NULL || delta_wbytes == 0)
+  if (drive_id == NULL || name == NULL || basis == NULL || delta_wbytes == 0)
     return;
+
+  if (via == NULL)
+    via = "";
 
   /* The day is taken now, when the delta is read, so a flush after midnight
    * still fills the bucket of the day the bytes were written in. */
   day = db_now (self) / 86400;
-  key = g_strdup_printf ("%s\n%" G_GINT64_FORMAT "\n%s", drive_id, day, name);
+  key = g_strdup_printf ("%s\n%" G_GINT64_FORMAT "\n%s\n%s\n%s",
+                         drive_id, day, name, via, basis);
 
   pending = g_hash_table_lookup (self->pending_blame, key);
-  if (pending == NULL) {
-    pending = g_new0 (PendingBlame, 1);
-    pending->drive_id = g_strdup (drive_id);
-    pending->day = day;
-    pending->name = g_strdup (name);
-    pending->exact = exact;
-    g_hash_table_insert (self->pending_blame, g_steal_pointer (&key), pending);
-  } else {
-    /* `exact` is sticky-pessimistic: one heuristic contribution makes the
-     * whole row an estimate, so the UI never overstates its confidence. */
-    pending->exact = pending->exact && exact;
-  }
+  if (pending == NULL)
+    {
+      pending = g_new0 (PendingBlame, 1);
+      pending->drive_id = g_strdup (drive_id);
+      pending->day = day;
+      pending->name = g_strdup (name);
+      pending->via = g_strdup (via);
+      pending->basis = g_strdup (basis);
+      g_hash_table_insert (self->pending_blame, g_steal_pointer (&key), pending);
+    }
 
   pending->wbytes += delta_wbytes;
+}
+
+
+void
+gsm_health_db_record_blame (GsmHealthDb *self,
+                            const char  *drive_id,
+                            const char  *name,
+                            uint64_t     delta_wbytes,
+                            gboolean     exact)
+{
+  /* Estimated bytes are those /proc/<pid>/io gave: the device is inferred. */
+  gsm_health_db_record_blame_row (self, drive_id, name, "",
+                                  exact ? GSM_HEALTH_BASIS_KERNEL
+                                        : GSM_HEALTH_BASIS_PROCFS,
+                                  delta_wbytes);
+}
+
+
+/* How far a basis can be trusted, lowest first: when rows with different
+ * bases are folded together, the folded row carries the least certain one. */
+static int
+basis_uncertainty (const char *basis)
+{
+  if (g_strcmp0 (basis, GSM_HEALTH_BASIS_PROCFS) == 0)
+    return 3;
+  if (g_strcmp0 (basis, GSM_HEALTH_BASIS_COREDUMP_PROPORTIONAL) == 0 ||
+      g_strcmp0 (basis, GSM_HEALTH_BASIS_JOURNALD_LINES) == 0)
+    return 2;
+  if (g_strcmp0 (basis, GSM_HEALTH_BASIS_COREDUMP_EXACT) == 0)
+    return 1;
+
+  return 0;           /* kernel, residue */
+}
+
+
+/* Order a drive's pending rows by drive, day, kind, then biggest first. */
+static int
+compare_pending (gconstpointer a,
+                 gconstpointer b)
+{
+  const PendingBlame *x = *(PendingBlame * const *) a;
+  const PendingBlame *y = *(PendingBlame * const *) b;
+  int order = g_strcmp0 (x->drive_id, y->drive_id);
+
+  if (order != 0)
+    return order;
+  if (x->day != y->day)
+    return x->day < y->day ? -1 : 1;
+  if ((x->via[0] != '\0') != (y->via[0] != '\0'))
+    return x->via[0] != '\0' ? 1 : -1;
+  if (x->wbytes != y->wbytes)
+    return x->wbytes > y->wbytes ? -1 : 1;
+
+  return g_strcmp0 (x->name, y->name);
+}
+
+
+static gboolean
+same_group (const PendingBlame *a,
+            const PendingBlame *b)
+{
+  return g_strcmp0 (a->drive_id, b->drive_id) == 0 && a->day == b->day &&
+         (a->via[0] != '\0') == (b->via[0] != '\0');
+}
+
+
+static void
+store_blame_row (sqlite3_stmt *stmt,
+                 const char   *drive_id,
+                 int64_t       day,
+                 const char   *name,
+                 const char   *via,
+                 const char   *basis,
+                 uint64_t      wbytes)
+{
+  sqlite3_bind_text (stmt, 1, drive_id, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64 (stmt, 2, day);
+  sqlite3_bind_text (stmt, 3, name, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text (stmt, 4, via, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text (stmt, 5, basis, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64 (stmt, 6, (sqlite3_int64) wbytes);
+  sqlite3_step (stmt);
+  sqlite3_reset (stmt);
 }
 
 
 static void
 write_pending_blame (GsmHealthDb *self)
 {
+  g_autoptr (GPtrArray) rows = g_ptr_array_new ();
   GHashTableIter iter;
   PendingBlame *pending;
   sqlite3_stmt *stmt = NULL;
+  guint start = 0;
 
   if (g_hash_table_size (self->pending_blame) == 0)
     return;
 
-  /* Added to the stored day's total; `exact` combined with MIN against what
-   * earlier flushes stored, for the same reason as above. */
+  /* Added to the stored day's total. */
   if (sqlite3_prepare_v2 (self->db,
-                          "INSERT INTO blame_daily (drive_id, day, name, wbytes, exact) "
-                          "VALUES (?1, ?2, ?3, ?4, ?5) "
-                          "ON CONFLICT (drive_id, day, name) DO UPDATE SET "
-                          "  wbytes = wbytes + excluded.wbytes,"
-                          "  exact  = MIN (exact, excluded.exact)",
+                          "INSERT INTO blame_daily (drive_id, day, name, via, basis, wbytes) "
+                          "VALUES (?1, ?2, ?3, ?4, ?5, ?6) "
+                          "ON CONFLICT (drive_id, day, name, via, basis) DO UPDATE SET "
+                          "  wbytes = wbytes + excluded.wbytes",
                           -1, &stmt, NULL) != SQLITE_OK)
     return;
 
   g_hash_table_iter_init (&iter, self->pending_blame);
-  while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &pending)) {
-    sqlite3_bind_text (stmt, 1, pending->drive_id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64 (stmt, 2, pending->day);
-    sqlite3_bind_text (stmt, 3, pending->name, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64 (stmt, 4, (sqlite3_int64) pending->wbytes);
-    sqlite3_bind_int (stmt, 5, pending->exact ? 1 : 0);
-    sqlite3_step (stmt);
-    sqlite3_reset (stmt);
-  }
+  while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &pending))
+    {
+      g_ptr_array_add (rows, pending);
+    }
+  g_ptr_array_sort (rows, compare_pending);
+
+  while (start < rows->len)
+    {
+      const PendingBlame *first = g_ptr_array_index (rows, start);
+      guint end = start;
+      uint64_t other_wbytes = 0;
+      const char *other_basis = NULL;
+
+      while (end < rows->len && same_group (first, g_ptr_array_index (rows, end)))
+        {
+          end++;
+        }
+
+      for (guint i = start; i < end; i++)
+        {
+          const PendingBlame *row = g_ptr_array_index (rows, i);
+
+          if (i - start < BLAME_ROWS_PER_KIND)
+            {
+              store_blame_row (stmt, row->drive_id, row->day, row->name, row->via,
+                               row->basis, row->wbytes);
+              continue;
+            }
+
+          other_wbytes += row->wbytes;
+          if (other_basis == NULL ||
+              basis_uncertainty (row->basis) > basis_uncertainty (other_basis))
+            other_basis = row->basis;
+        }
+
+      if (other_wbytes > 0)
+        store_blame_row (stmt, first->drive_id, first->day, BLAME_OTHER_NAME, "",
+                         other_basis, other_wbytes);
+
+      start = end;
+    }
 
   sqlite3_finalize (stmt);
 }
@@ -725,6 +913,19 @@ gsm_health_db_roll_up (GsmHealthDb *self)
 /* ------------------------------------------------------------------ */
 
 void
+gsm_blame_detail_free (GsmBlameDetail *row)
+{
+  if (row == NULL)
+    return;
+
+  g_free (row->name);
+  g_free (row->via);
+  g_free (row->basis);
+  g_free (row);
+}
+
+
+void
 gsm_blame_row_free (GsmBlameRow *row)
 {
   if (row == NULL)
@@ -837,9 +1038,10 @@ gsm_health_db_get_blame (GsmHealthDb     *self,
   }
 
   if (sqlite3_prepare_v2 (self->db,
-                          "SELECT name, SUM (wbytes) AS total, MIN (exact) "
+                          "SELECT name, SUM (wbytes) AS total, "
+                          "       MIN (basis IN ('kernel', 'residue')) "
                           "  FROM blame_daily "
-                          " WHERE drive_id = ?1 AND day >= ?2 "
+                          " WHERE drive_id = ?1 AND day >= ?2 AND via = '' "
                           " GROUP BY name ORDER BY total DESC LIMIT 25",
                           -1, &stmt, NULL) != SQLITE_OK)
     return rows;
@@ -856,6 +1058,62 @@ gsm_health_db_get_blame (GsmHealthDb     *self,
 
     g_ptr_array_add (rows, row);
   }
+
+  sqlite3_finalize (stmt);
+
+  return rows;
+}
+
+
+GPtrArray *
+gsm_health_db_get_blame_detail (GsmHealthDb    *self,
+                                const char     *drive_id,
+                                GsmHistoryRange range)
+{
+  GPtrArray *rows =
+    g_ptr_array_new_with_free_func ((GDestroyNotify) gsm_blame_detail_free);
+  sqlite3_stmt *stmt = NULL;
+  int64_t today = db_now (self) / 86400;
+  int days;
+
+  g_return_val_if_fail (GSM_IS_HEALTH_DB (self), rows);
+  g_return_val_if_fail (drive_id != NULL, rows);
+
+  switch (range)
+    {
+      case GSM_HISTORY_RANGE_DAY:   days = 1;
+        break;
+
+      case GSM_HISTORY_RANGE_MONTH: days = 30;
+        break;
+
+      case GSM_HISTORY_RANGE_YEAR:
+      default:                      days = 365;
+        break;
+    }
+
+  if (sqlite3_prepare_v2 (self->db,
+                          "SELECT name, via, basis, SUM (wbytes) AS total "
+                          "  FROM blame_daily "
+                          " WHERE drive_id = ?1 AND day >= ?2 "
+                          " GROUP BY name, via, basis ORDER BY total DESC",
+                          -1, &stmt, NULL) != SQLITE_OK)
+    return rows;
+
+  sqlite3_bind_text (stmt, 1, drive_id, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64 (stmt, 2, today - days + 1);
+
+  while (sqlite3_step (stmt) == SQLITE_ROW)
+    {
+      GsmBlameDetail *row = g_new0 (GsmBlameDetail, 1);
+
+      row->name = g_strdup ((const char *) sqlite3_column_text (stmt, 0));
+      row->via = g_strdup ((const char *) sqlite3_column_text (stmt, 1));
+      row->basis = g_strdup ((const char *) sqlite3_column_text (stmt, 2));
+      row->wbytes = (uint64_t) sqlite3_column_int64 (stmt, 3);
+
+      g_ptr_array_add (rows, row);
+    }
 
   sqlite3_finalize (stmt);
 

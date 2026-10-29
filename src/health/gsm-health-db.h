@@ -40,6 +40,33 @@ typedef struct {
 void         gsm_blame_row_free (GsmBlameRow *row);
 
 /*
+ * How a stored row of bytes was arrived at (the `basis` column). `kernel`
+ * and `residue` come from cgroup io.stat and are exact; `procfs` is
+ * /proc/<pid>/io, which names the bytes but not the device, so which drive
+ * they landed on is inferred. The `coredump-*` and `journald-lines` bases
+ * are reserved for rows that reassign a proxy writer's bytes to whoever
+ * caused them (the `via` column names the proxy); those are estimates or
+ * per-event figures, not the kernel's.
+ */
+#define GSM_HEALTH_BASIS_KERNEL               "kernel"
+#define GSM_HEALTH_BASIS_RESIDUE              "residue"
+#define GSM_HEALTH_BASIS_PROCFS               "procfs"
+#define GSM_HEALTH_BASIS_COREDUMP_PROPORTIONAL "coredump-proportional"
+#define GSM_HEALTH_BASIS_COREDUMP_EXACT       "coredump-exact"
+#define GSM_HEALTH_BASIS_JOURNALD_LINES       "journald-lines"
+
+/* One stored row of the blame table, as written: nothing summed away. */
+typedef struct
+{
+  char    *name;
+  char    *via;            /* proxy writer for an on-behalf row, else "" */
+  char    *basis;          /* GSM_HEALTH_BASIS_* */
+  uint64_t wbytes;
+} GsmBlameDetail;
+
+void          gsm_blame_detail_free (GsmBlameDetail *row);
+
+/*
  * Open (creating if needed) the history database. Path defaults to
  * $XDG_DATA_HOME/gnome-system-monitor-rh/health.db; pass an explicit path for
  * tests. Both the UI and the sampler open the same file, so every write is
@@ -81,6 +108,22 @@ void         gsm_health_db_record_blame     (GsmHealthDb *self,
                                              uint64_t     delta_wbytes,
                                              gboolean     exact);
 
+/*
+ * The same with the row's full identity: `via` is "" for bytes charged to
+ * `name` by the kernel, or the proxy writer for bytes reassigned to `name`;
+ * `basis` is one of GSM_HEALTH_BASIS_*. gsm_health_db_record_blame() is this
+ * with an empty via and basis kernel (exact) or procfs (not exact).
+ *
+ * A flush writes at most the 20 largest rows per drive, day and kind
+ * (charged-to or on-behalf), and folds the rest into one row named "other".
+ */
+void gsm_health_db_record_blame_row (GsmHealthDb *self,
+                                     const char  *drive_id,
+                                     const char  *name,
+                                     const char  *via,
+                                     const char  *basis,
+                                     uint64_t     delta_wbytes);
+
 void         gsm_health_db_record_battery   (GsmHealthDb *self,
                                              const char  *battery_id,
                                              int          health_percent,
@@ -111,10 +154,24 @@ GArray      *gsm_health_db_get_history      (GsmHealthDb     *self,
                                              const char      *drive_id,
                                              GsmHistoryRange  range);
 
-/* Returns a GPtrArray of GsmBlameRow*, biggest writer first. */
+/*
+ * Returns a GPtrArray of GsmBlameRow*, biggest writer first: the bytes the
+ * kernel charged (and /proc attributed), summed over basis per name.
+ * `exact` is derived: every contributing row is kernel or residue.
+ * On-behalf rows are left out, since they re-divide bytes already counted
+ * under their proxy writer.
+ */
 GPtrArray   *gsm_health_db_get_blame        (GsmHealthDb     *self,
                                              const char      *drive_id,
                                              GsmHistoryRange  range);
+
+/*
+ * Every stored charged-to and on-behalf row for this drive over the range,
+ * summed per (name, via, basis), biggest first. Returns GsmBlameDetail*.
+ */
+GPtrArray * gsm_health_db_get_blame_detail (GsmHealthDb    *self,
+                                            const char     *drive_id,
+                                            GsmHistoryRange range);
 
 /*
  * Average bytes/day written to this drive over the trailing window, measured
