@@ -1,6 +1,7 @@
 #!/bin/sh
 # Release gates for debian/rules. Fails the build, naming the gate.
-#   gate-check.sh configured BUILDDIR   meson was configured as a release build without dev IPC
+#   gate-check.sh configured BUILDDIR   meson was configured as a release build without dev IPC,
+#                                       and its project version is the changelog's
 #   gate-check.sh symbols ROOT          nothing installed under ROOT carries dev IPC
 set -eu
 
@@ -23,6 +24,17 @@ for option in json.load(sys.stdin):
         [ "$got" = "$want" ] || fail "$name" "configured as '$got', a release needs '$want'"
     done
     echo "gate-check: dev_ipc gate passed (dev_ipc=false, development=false, buildtype=release)"
+
+    # The binary reports meson's project version (--version, About); the
+    # package is named by debian/changelog. They must say the same release,
+    # a development build's ~dev suffix aside.
+    package=$(dpkg-parsechangelog -S Version)
+    project=$(meson introspect --projectinfo "$builddir" | python3 -I -c '
+import json, sys
+print(json.load(sys.stdin)["version"])
+')
+    [ "$project" = "${package%%~*}" ] || fail version "meson.build says '$project', debian/changelog says '$package'"
+    echo "gate-check: version gate passed ($project)"
 }
 
 symbols() {
