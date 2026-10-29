@@ -1,4 +1,4 @@
-gnome-system-monitor-rh (50.0+rh.2) UNRELEASED; urgency=medium
+gnome-system-monitor-rh (50.0+rh.2) noble; urgency=medium
 
   * Packaging: the health sampler's user unit is installed but no longer
     enabled for every user. Version 50.0+rh.1 linked it into
@@ -7,8 +7,21 @@ gnome-system-monitor-rh (50.0+rh.2) UNRELEASED; urgency=medium
     system-wide link and the state deb-systemd-helper kept for it; a unit a
     user enabled in their own home is left alone, and fresh installs enable
     nothing.
+  * Processes: CPU % now covers every thread of a process. 50.0+rh.1 took
+    it from /proc/PID/schedstat, which is the first thread's alone, so
+    browsers, editors and JVMs showed near 0 %. It is now utime + stime of
+    /proc/PID/stat over the measured interval.
+  * Health: the wear sampler reads the per-process and per-cgroup write
+    counters every 15 seconds as before, but writes its record every 10
+    minutes and when it stops, about 200 KiB an hour instead of about
+    5.5 MB. Drive health is read every 10 minutes, as often as udisks
+    refreshes it. The writer list says when the record was last written.
+  * Collector: a table of workload groups (class rows, then units,
+    applications, sessions and agent sessions) with memory, tasks, CPU over
+    the interval and a residue that adds up to the kernel's user-space
+    total; not yet shown in the window.
 
- -- Pranav <pranavrajput321@gmail.com>  Thu, 29 Oct 2026 11:47:42 +0800
+ -- Pranav <pranavrajput321@gmail.com>  Thu, 29 Oct 2026 14:03:13 +0800
 
 gnome-system-monitor-rh (50.0+rh.1) noble; urgency=medium
 
