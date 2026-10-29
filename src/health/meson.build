@@ -58,6 +58,32 @@ executable('gsm-smart',
   install_dir: get_option('libexecdir') / meson.project_name(),
 )
 
+# The system SMART reader for USB-attached disks. Run by a systemd timer as
+# root, it takes no arguments and no input of any kind, and links no GLib: the
+# core lives in a separate file so a test can drive it with fakes.
+gsm_smart_reader_core_sources = [
+  'gsm-smart-bridges.c',
+  'gsm-smart-bridges.h',
+  'gsm-smart-reader-core.c',
+  'gsm-smart-reader-core.h',
+]
+
+executable('gsm-smart-reader',
+  ['gsm-smart-reader.c'] + gsm_smart_reader_core_sources,
+  c_args: ['-DGSM_SMART_READER_VERSION="@0@"'.format(meson.project_version())],
+  install: true,
+  install_dir: get_option('libexecdir') / meson.project_name(),
+)
+
+test('smart-reader',
+  executable('test-smart-reader',
+    ['../tests/test-smart-reader.c'] + gsm_smart_reader_core_sources,
+    include_directories: include_directories('.'),
+    dependencies: [glib],
+  ),
+  protocol: 'tap',
+)
+
 # One-shot privileged helper that enables per-app IO accounting. Takes no
 # arguments; writes two systemd drop-ins and reloads. The only thing in the
 # project that touches system configuration, and only when the user asks.
